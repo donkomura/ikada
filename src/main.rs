@@ -1,25 +1,17 @@
-use ikada::server::{Command, Server};
-use std::io;
-use std::sync::mpsc;
-use std::thread;
-use tokio;
+use ikada::server::{Command, Node};
+use tokio::sync::mpsc;
 
 #[tokio::main]
-fn main() -> io::Result<()> {
-    let (tx, rx) = mpsc::channel::<Command>();
+async fn main() -> anyhow::Result<()> {
+    let (tx, rx) = mpsc::channel::<Command>(32);
     let node = Node::new(rx);
 
-    let jh = thread::spawn(move || {
-        node.run();
+    let jh = tokio::spawn(async move {
+        node.run(1111).await.unwrap();
     });
 
-    for _ in 0..3 {
-        tx.send(Command::AppendEntries);
-    }
+    tx.send(Command::AppendEntries).await?;
 
-    thread::sleep(std::time::Duration::from_millis(500));
-    drop(tx);
-
-    jh.join().ok();
+    let _ = tokio::join!(jh);
     Ok(())
 }

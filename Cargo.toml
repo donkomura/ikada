@@ -5,4 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tarpc = "0.37.0"
+anyhow = "1.0.100"
+futures = "0.3"
+tarpc = { version = "0.37", features = ["full"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
