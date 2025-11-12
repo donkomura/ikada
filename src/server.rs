@@ -1,3 +1,4 @@
+use crate::raft::RaftState;
 use crate::rpc::{AppendEntriesRequest, RaftRpc, RaftRpcClient};
 use futures::{future, prelude::*};
 use std::collections::HashMap;
@@ -9,12 +10,14 @@ use tarpc::{server, tokio_serde::formats::Json};
 use tokio::sync::mpsc;
 
 pub enum Command {
-    AppendEntries,
+    AppendEntries(AppendEntriesRequest),
 }
 
 #[derive(Default)]
 pub struct Config {
     servers: Vec<SocketAddr>,
+    heartbeat_interval: tokio::time::Duration,
+    election_timeout: tokio::time::Duration,
 }
 
 pub struct Node {
@@ -23,6 +26,7 @@ pub struct Node {
     rx: mpsc::Receiver<Command>,
     clients: HashMap<SocketAddr, RaftRpcClient>,
     server_addr: SocketAddr,
+    state: RaftState,
 }
 
 async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
@@ -38,11 +42,13 @@ impl Node {
             rx,
             clients: HashMap::default(),
             server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            state: RaftState::default(),
         }
     }
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
         // main thread for test
         // TODO: expand this after we impl timeout
+        let tx = self.tx.clone();
         let main_handle = tokio::spawn(async move { self.main().await });
 
         // RPC thread
@@ -57,7 +63,10 @@ impl Node {
                 .map(server::BaseChannel::with_defaults)
                 .max_channels_per_key(1, |t| t.transport().peer_addr().unwrap().ip())
                 .map(|channel| {
-                    let server = RaftServer(channel.transport().peer_addr().unwrap());
+                    let server = RaftServer {
+                        addr: channel.transport().peer_addr().unwrap(),
+                        tx: tx.clone(),
+                    };
                     channel.execute(server.serve()).for_each(spawn)
                 })
                 .buffer_unordered(10)
@@ -86,8 +95,21 @@ impl Node {
     async fn main(mut self) -> anyhow::Result<()> {
         self.setup().await?;
 
-        // test case is here
-        self.tx.send(Command::AppendEntries).await?;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tx.send(Command::AppendEntries(AppendEntriesRequest {
+                    term: 0,
+                    leader_id: 0,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![],
+                    leader_commit: 0,
+                }))
+                .await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        });
 
         // catch the test cases like the server
         while let Some(c) = self.rx.recv().await {
@@ -98,15 +120,7 @@ impl Node {
     async fn dispatch(&mut self, command: Command) -> anyhow::Result<()> {
         if let Some(client) = self.clients.get(&self.server_addr) {
             match command {
-                Command::AppendEntries => {
-                    let req = AppendEntriesRequest {
-                        term: 0,
-                        leader_id: 0,
-                        prev_log_index: 0,
-                        prev_log_term: 0,
-                        entries: vec![],
-                        leader_commit: 0,
-                    };
+                Command::AppendEntries(req) => {
                     client
                         .append_entries(tarpc::context::current(), req)
                         .await?;
@@ -118,12 +132,18 @@ impl Node {
 }
 
 #[derive(Clone)]
-struct RaftServer(#[allow(dead_code)] std::net::SocketAddr);
+struct RaftServer {
+    addr: SocketAddr,
+    tx: mpsc::Sender<Command>,
+}
+
 impl RaftRpc for RaftServer {
     async fn echo(self, _: tarpc::context::Context, name: String) -> String {
         format!("echo: {name}")
     }
     async fn append_entries(self, _: tarpc::context::Context, req: AppendEntriesRequest) {
         println!("append entries: {req:?}");
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        self.tx.send(Command::AppendEntries(req)).await;
     }
 }
