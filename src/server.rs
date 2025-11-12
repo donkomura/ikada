@@ -1,5 +1,5 @@
-use crate::raft::RaftState;
-use crate::rpc::{AppendEntriesRequest, RaftRpc, RaftRpcClient};
+use crate::raft::{RaftState, Role};
+use crate::rpc::*;
 use futures::{future, prelude::*};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -13,11 +13,10 @@ pub enum Command {
     AppendEntries(AppendEntriesRequest),
 }
 
-#[derive(Default)]
 pub struct Config {
-    servers: Vec<SocketAddr>,
-    heartbeat_interval: tokio::time::Duration,
-    election_timeout: tokio::time::Duration,
+    pub servers: Vec<SocketAddr>,
+    pub heartbeat_interval: tokio::time::Duration,
+    pub election_timeout: tokio::time::Duration,
 }
 
 pub struct Node {
@@ -95,37 +94,44 @@ impl Node {
     async fn main(mut self) -> anyhow::Result<()> {
         self.setup().await?;
 
+        let mut interval = tokio::time::interval(self.config.heartbeat_interval);
         let tx = self.tx.clone();
+
         tokio::spawn(async move {
             loop {
-                tx.send(Command::AppendEntries(AppendEntriesRequest {
-                    term: 0,
-                    leader_id: 0,
-                    prev_log_index: 0,
-                    prev_log_term: 0,
-                    entries: vec![],
-                    leader_commit: 0,
-                }))
-                .await;
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                interval.tick().await;
+
+                // TODO: fix
+                if matches!(self.state.role, Role::Follower) {
+                    tx.send(Command::AppendEntries(AppendEntriesRequest {
+                        term: 0,
+                        leader_id: 0,
+                        prev_log_index: 0,
+                        prev_log_term: 0,
+                        entries: vec![],
+                        leader_commit: 0,
+                    }))
+                    .await;
+                }
             }
         });
 
-        // catch the test cases like the server
         while let Some(c) = self.rx.recv().await {
-            self.dispatch(c).await?;
+            self.handle(c).await?;
         }
         Ok(())
     }
-    async fn dispatch(&mut self, command: Command) -> anyhow::Result<()> {
-        if let Some(client) = self.clients.get(&self.server_addr) {
+    async fn handle(&mut self, command: Command) -> anyhow::Result<()> {
+        assert!(!self.clients.is_empty());
+        let server_addr = self.server_addr;
+        if let Some(client) = self.clients.get(&server_addr) {
             match command {
                 Command::AppendEntries(req) => {
-                    client
-                        .append_entries(tarpc::context::current(), req)
-                        .await?;
+                    println!("get append entries: {req:?}");
                 }
             }
+        } else {
+            return Err(anyhow::anyhow!("server address not found"));
         }
         Ok(())
     }
@@ -141,9 +147,27 @@ impl RaftRpc for RaftServer {
     async fn echo(self, _: tarpc::context::Context, name: String) -> String {
         format!("echo: {name}")
     }
-    async fn append_entries(self, _: tarpc::context::Context, req: AppendEntriesRequest) {
+    async fn append_entries(
+        self,
+        _: tarpc::context::Context,
+        req: AppendEntriesRequest,
+    ) -> AppendEntriesResponse {
         println!("append entries: {req:?}");
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        self.tx.send(Command::AppendEntries(req)).await;
+        AppendEntriesResponse {
+            term: 0,
+            success: true,
+        }
+    }
+
+    async fn request_vote(
+        self,
+        _: tarpc::context::Context,
+        req: RequestVoteRequest,
+    ) -> RequestVoteResponse {
+        println!("request vote: {req:?}");
+        RequestVoteResponse {
+            term: 0,
+            vote_granted: true,
+        }
     }
 }

@@ -18,8 +18,32 @@ pub struct AppendEntriesRequest {
     pub leader_commit: u32,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(crate = "tarpc::serde")]
+pub struct AppendEntriesResponse {
+    pub term: u32,
+    pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(crate = "tarpc::serde")]
+pub struct RequestVoteRequest {
+    pub term: u32,
+    pub candidate_id: u32,
+    pub last_log_index: u32,
+    pub last_log_term: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(crate = "tarpc::serde")]
+pub struct RequestVoteResponse {
+    pub term: u32,
+    pub vote_granted: bool,
+}
+
 #[tarpc::service]
 pub trait RaftRpc {
     async fn echo(name: String) -> String;
-    async fn append_entries(req: AppendEntriesRequest);
+    async fn append_entries(req: AppendEntriesRequest) -> AppendEntriesResponse;
+    async fn request_vote(req: RequestVoteRequest) -> RequestVoteResponse;
 }
