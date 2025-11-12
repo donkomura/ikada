@@ -1,4 +1,4 @@
-use crate::rpc::{RaftRpc, RaftRpcClient};
+use crate::rpc::{AppendEntriesRequest, RaftRpc, RaftRpcClient};
 use futures::{future, prelude::*};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,7 +41,8 @@ impl Node {
         }
     }
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
-        // command processing thread
+        // main thread for test
+        // TODO: expand this after we impl timeout
         let main_handle = tokio::spawn(async move { self.main().await });
 
         // RPC thread
@@ -84,37 +85,31 @@ impl Node {
     }
     async fn main(mut self) -> anyhow::Result<()> {
         self.setup().await?;
+
+        // test case is here
         self.tx.send(Command::AppendEntries).await?;
+
+        // catch the test cases like the server
         while let Some(c) = self.rx.recv().await {
             self.dispatch(c).await?;
         }
         Ok(())
     }
     async fn dispatch(&mut self, command: Command) -> anyhow::Result<()> {
-        match command {
-            Command::AppendEntries => {
-                if let Some(client) = self.clients.get(&self.server_addr) {
-                    let s = "append entries".to_string();
-                    println!("sending message: {}", s.clone());
-                    let echo = async move {
-                        tokio::select! {
-                            r1 = client.echo(tarpc::context::current(), s.clone()) => {
-                                r1
-                            }
-                            r2 = client.echo(tarpc::context::current(), s.clone()) => {
-                                r2
-                            }
-                        }
-                    }
-                    .await;
-                    match echo {
-                        Ok(r) => {
-                            println!("received message: {}", r);
-                        }
-                        Err(e) => {
-                            println!("error: {}", e);
-                        }
-                    }
+        if let Some(client) = self.clients.get(&self.server_addr) {
+            match command {
+                Command::AppendEntries => {
+                    let req = AppendEntriesRequest {
+                        term: 0,
+                        leader_id: 0,
+                        prev_log_index: 0,
+                        prev_log_term: 0,
+                        entries: vec![],
+                        leader_commit: 0,
+                    };
+                    client
+                        .append_entries(tarpc::context::current(), req)
+                        .await?;
                 }
             }
         }
@@ -127,5 +122,8 @@ struct RaftServer(#[allow(dead_code)] std::net::SocketAddr);
 impl RaftRpc for RaftServer {
     async fn echo(self, _: tarpc::context::Context, name: String) -> String {
         format!("echo: {name}")
+    }
+    async fn append_entries(self, _: tarpc::context::Context, req: AppendEntriesRequest) {
+        println!("append entries: {req:?}");
     }
 }
