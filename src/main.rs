@@ -1,16 +1,13 @@
-use ikada::server::{Command, Node};
-use tokio::sync::mpsc;
+use ikada::server::{Config, Node};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (tx, rx) = mpsc::channel::<Command>(32);
-    let node = Node::new(rx);
+    let port = 1111;
+    let node = Node::new(port, Config::default());
 
     let jh = tokio::spawn(async move {
-        node.run(1111).await.unwrap();
+        node.run(port).await.unwrap();
     });
-
-    tx.send(Command::AppendEntries).await?;
 
     let _ = tokio::join!(jh);
     Ok(())

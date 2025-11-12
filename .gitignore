@@ -28,3 +28,6 @@ target
 # Vim
 *.swp
 *.swo
+
+# vscode
+.vscode

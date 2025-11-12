@@ -1,7 +1,6 @@
 use crate::rpc::{RaftRpc, RaftRpcClient};
 use futures::{future, prelude::*};
 use std::collections::HashMap;
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tarpc::client;
 use tarpc::server::Channel;
@@ -13,9 +12,17 @@ pub enum Command {
     AppendEntries,
 }
 
+#[derive(Default)]
+pub struct Config {
+    servers: Vec<SocketAddr>,
+}
+
 pub struct Node {
+    config: Config,
+    tx: mpsc::Sender<Command>,
     rx: mpsc::Receiver<Command>,
     clients: HashMap<SocketAddr, RaftRpcClient>,
+    server_addr: SocketAddr,
 }
 
 async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
@@ -23,17 +30,15 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 }
 
 impl Node {
-    pub fn new(rx: mpsc::Receiver<Command>) -> Self {
+    pub fn new(port: u16, config: Config) -> Self {
+        let (tx, rx) = mpsc::channel::<Command>(32);
         Node {
+            config,
+            tx,
             rx,
-            clients: HashMap::new(),
+            clients: HashMap::default(),
+            server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         }
-    }
-    pub async fn add_client(&mut self, server_addr: SocketAddr) -> io::Result<()> {
-        let transport = tarpc::serde_transport::tcp::connect(server_addr, Json::default).await?;
-        let client = RaftRpcClient::new(client::Config::default(), transport).spawn();
-        self.clients.insert(server_addr, client);
-        Ok(())
     }
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
         // command processing thread
@@ -63,9 +68,23 @@ impl Node {
 
         Ok(())
     }
+    async fn setup(&mut self) -> anyhow::Result<()> {
+        for server in vec![self.server_addr]
+            .into_iter()
+            .chain(self.config.servers.clone())
+        {
+            if self.clients.contains_key(&server) {
+                return Ok(());
+            }
+            let transport = tarpc::serde_transport::tcp::connect(server, Json::default).await?;
+            let client = RaftRpcClient::new(client::Config::default(), transport).spawn();
+            self.clients.insert(server, client);
+        }
+        Ok(())
+    }
     async fn main(mut self) -> anyhow::Result<()> {
-        self.add_client(SocketAddr::from((Ipv4Addr::LOCALHOST, 1111)))
-            .await?;
+        self.setup().await?;
+        self.tx.send(Command::AppendEntries).await?;
         while let Some(c) = self.rx.recv().await {
             self.dispatch(c).await?;
         }
@@ -74,24 +93,23 @@ impl Node {
     async fn dispatch(&mut self, command: Command) -> anyhow::Result<()> {
         match command {
             Command::AppendEntries => {
-                if let Some(client) = self
-                    .clients
-                    .get(&SocketAddr::from((Ipv4Addr::LOCALHOST, 1111)))
-                {
-                    println!("append entries");
+                if let Some(client) = self.clients.get(&self.server_addr) {
+                    let s = "append entries".to_string();
+                    println!("sending message: {}", s.clone());
                     let echo = async move {
-                            tokio::select! {
-                                r1 = client.echo(tarpc::context::current(), "append entries".to_string()) => {
-                                    r1
-                                }
-                                r2 = client.echo(tarpc::context::current(), "append entries".to_string()) => {
-                                    r2
-                                }
+                        tokio::select! {
+                            r1 = client.echo(tarpc::context::current(), s.clone()) => {
+                                r1
                             }
-                        }.await;
+                            r2 = client.echo(tarpc::context::current(), s.clone()) => {
+                                r2
+                            }
+                        }
+                    }
+                    .await;
                     match echo {
                         Ok(r) => {
-                            println!("echo: {}", r);
+                            println!("received message: {}", r);
                         }
                         Err(e) => {
                             println!("error: {}", e);
