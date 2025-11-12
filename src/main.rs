@@ -2,13 +2,15 @@ use ikada::server::{Command, Server};
 use std::io;
 use std::sync::mpsc;
 use std::thread;
+use tokio;
 
+#[tokio::main]
 fn main() -> io::Result<()> {
     let (tx, rx) = mpsc::channel::<Command>();
-    let s = Server::new(rx);
+    let node = Node::new(rx);
 
     let jh = thread::spawn(move || {
-        s.run();
+        node.run();
     });
 
     for _ in 0..3 {
