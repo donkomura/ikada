@@ -188,6 +188,21 @@ impl Node {
         }
         Ok(())
     }
+    async fn main(mut self) -> anyhow::Result<()> {
+        self.setup().await?;
+
+        loop {
+            let role = {
+                let state = self.state.lock().await;
+                state.role
+            };
+            match role {
+                Role::Follower => self.run_follower().await,
+                Role::Candidate => self.run_candidate().await,
+                Role::Leader => self.run_leader().await,
+            }?
+        }
+    }
     async fn run_follower(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.election_timeout;
         let mut interval = tokio::time::interval(timeout / 2);
@@ -229,37 +244,19 @@ impl Node {
             self.broadcast_heartbeat().await?;
         }
     }
-    async fn become_candidate(&mut self) -> anyhow::Result<()> {
-        {
-            let mut state = self.state.lock().await;
-            state.role = Role::Candidate;
-            state.current_term += 1;
-        }
-        Ok(())
-    }
-
-    async fn main(mut self) -> anyhow::Result<()> {
-        self.setup().await?;
-
-        loop {
-            let role = {
-                let state = self.state.lock().await;
-                state.role
-            };
-            match role {
-                Role::Follower => self.run_follower().await,
-                Role::Candidate => self.run_candidate().await,
-                Role::Leader => self.run_leader().await,
-            }?
-        }
-    }
     async fn start_election(&mut self) -> anyhow::Result<()> {
         println!("[node {}] start_election", self.state.lock().await.id);
         self.watch_dog.reset().await;
 
         let mut responses: Vec<RequestVoteResponse> = Vec::new();
 
-        let (current_term, candidate_id, last_log_index, last_log_term) = {
+        let (
+            current_term,
+            candidate_id,
+            last_log_index,
+            last_log_term,
+            voted_for,
+        ) = {
             let state = self.state.lock().await;
             // vote for myself
             responses.push(RequestVoteResponse {
@@ -271,6 +268,7 @@ impl Node {
                 state.id,
                 state.log.len() as u32,
                 state.log.last().map(|e| e.term).unwrap_or(0),
+                state.voted_for,
             )
         };
 
@@ -279,12 +277,20 @@ impl Node {
                 continue;
             }
             if let Some(client) = self.clients.get(server) {
-                {
-                    let state = self.state.lock().await;
-                    println!(
-                        "[node {}] request vote to: {:?} {:?}",
-                        state.id, server, state,
-                    );
+                let req = RequestVoteRequest {
+                    term: current_term,
+                    candidate_id,
+                    last_log_index,
+                    last_log_term,
+                };
+                let is_granted = {
+                    // TODO : check the candidate's log is up to date
+                    voted_for.is_none() || (voted_for.unwrap() == candidate_id)
+                };
+
+                if !is_granted {
+                    self.become_follower().await?;
+                    return Ok(());
                 }
                 responses.push(
                     client
@@ -317,15 +323,6 @@ impl Node {
         // 投票が過半数か
         let vote_granted = responses.iter().filter(|r| r.vote_granted).count()
             > self.config.servers.len() / 2;
-        let should_reject = {
-            let state = self.state.lock().await;
-            state.voted_for.is_none() || (state.voted_for.unwrap() == state.id)
-        };
-
-        if should_reject {
-            self.become_follower().await?;
-            return Ok(());
-        }
 
         if vote_granted {
             println!(
@@ -352,8 +349,13 @@ impl Node {
         state.voted_for = None;
         Ok(())
     }
+    async fn become_candidate(&mut self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        state.role = Role::Candidate;
+        state.current_term += 1;
+        Ok(())
+    }
     async fn broadcast_heartbeat(&mut self) -> anyhow::Result<bool> {
-        let mut cnt = 0u32;
         let (term, leader_id) = {
             let state = self.state.lock().await;
             (state.current_term, state.id)
@@ -375,34 +377,38 @@ impl Node {
                 let res = client
                     .append_entries(tarpc::context::current(), req.clone())
                     .await?;
-                if self
-                    .handle_heartbeat(*server, req.clone(), res.clone())
-                    .await?
-                {
-                    cnt += 1;
-                }
+                self.handle_heartbeat(*server, req.clone(), res.clone())
+                    .await?;
             }
         }
 
-        Ok(cnt > self.config.servers.len() as u32 / 2)
+        Ok(true)
     }
     async fn handle_heartbeat(
         &mut self,
         addr: SocketAddr,
         req: AppendEntriesRequest,
         res: AppendEntriesResponse,
-    ) -> anyhow::Result<bool> {
-        let mut state = self.state.lock().await;
-        if res.term > state.current_term {
-            state.current_term = res.term;
-            state.role = Role::Follower;
-            state.voted_for = None;
-            return Ok(false);
+    ) -> anyhow::Result<()> {
+        let check_term = {
+            let mut state = self.state.lock().await;
+            if res.term > state.current_term {
+                state.current_term = res.term;
+                true
+            } else {
+                false
+            }
+        };
+
+        if check_term {
+            self.become_follower().await?;
+            return Ok(());
         }
 
+        let state = self.state.lock().await;
         if matches!(state.role, Role::Leader) && state.current_term != res.term
         {
-            return Ok(false);
+            return Ok(());
         }
 
         if !res.success {
@@ -410,7 +416,7 @@ impl Node {
             todo!()
         }
         println!("[node {}] got heartbeat from {addr}: {res:?}", state.id);
-        Ok(true)
+        Ok(())
     }
 }
 
