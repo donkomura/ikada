@@ -11,7 +11,9 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 use tokio::{
+    signal,
     sync::{Mutex, Notify, mpsc, oneshot},
+    task::JoinSet,
     time::Instant,
 };
 
@@ -98,76 +100,116 @@ impl Node {
     }
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
         // main thread for test
-        let (tx, mut rx) = mpsc::channel::<Command>(32);
-        let state_clone = Arc::clone(&self.state);
+        let (tx, rx) = mpsc::channel::<Command>(32);
+        let state = Arc::clone(&self.state);
+        let mut workers = JoinSet::new();
+        workers.spawn(self.main());
+        workers.spawn(Self::cmd_handler(state, rx));
+        Self::rpc_server(tx, port).await?;
 
-        let main_handle = tokio::spawn(async move { self.main().await });
+        tokio::select! {
+            res = Self::shutdown_signal() => {
+                workers.abort_all();
+                res?;
+            }
+            Some(res) = workers.join_next() => {
+                res??;
+            }
+        };
 
-        let cmd_handle = tokio::spawn(async move {
-            while let Some(command) = rx.recv().await {
-                match command {
-                    Command::AppendEntries(req, tx) => {
-                        // TODO
-                        tx.send(AppendEntriesResponse {
-                            term: req.term,
-                            success: true,
-                        })
-                        .expect("failed to send append entries response");
-                    }
-                    Command::RequestVote(req, tx) => {
-                        let vote_granted = {
-                            let mut state = state_clone.lock().await;
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+
+        Ok(())
+    }
+
+    async fn shutdown_signal() -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            let mut terminate =
+                signal::unix::signal(signal::unix::SignalKind::terminate())?;
+
+            tokio::select! {
+                res = signal::ctrl_c() => {
+                    res?;
+                },
+                _ = terminate.recv() => {},
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            signal::ctrl_c().await?;
+        }
+
+        Ok(())
+    }
+    async fn rpc_server(
+        tx: mpsc::Sender<Command>,
+        port: u16,
+    ) -> anyhow::Result<()> {
+        let addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let mut listener =
+            tarpc::serde_transport::tcp::listen(&addr, Json::default)
+                .await
+                .expect("failed to start RPC server");
+        listener.config_mut().max_frame_length(usize::MAX);
+        listener
+            .filter_map(|r| future::ready(r.ok()))
+            .map(server::BaseChannel::with_defaults)
+            .max_channels_per_key(1, |t| {
+                t.transport().peer_addr().unwrap().ip()
+            })
+            .map(|channel| {
+                let server = RaftServer { tx: tx.clone() };
+                channel.execute(server.serve()).for_each(spawn)
+            })
+            .buffer_unordered(10)
+            .for_each(|_| async {})
+            .await;
+        Ok(())
+    }
+    async fn cmd_handler(
+        state: Arc<Mutex<RaftState>>,
+        mut rx: mpsc::Receiver<Command>,
+    ) -> anyhow::Result<()> {
+        while let Some(command) = rx.recv().await {
+            match command {
+                Command::AppendEntries(req, tx) => {
+                    // TODO
+                    tx.send(AppendEntriesResponse {
+                        term: req.term,
+                        success: true,
+                    })
+                    .expect("failed to send append entries response");
+                }
+                Command::RequestVote(req, tx) => {
+                    let vote_granted = {
+                        let mut state = state.lock().await;
+                        state.voted_for = Some(req.candidate_id);
+                        println!(
+                            "[node {}] Command::RequestVote: {:?}",
+                            state.id, state
+                        );
+
+                        // !(term < currentTerm)
+                        if req.term >= state.current_term {
                             state.voted_for = Some(req.candidate_id);
-                            println!(
-                                "[node {}] Command::RequestVote: {:?}",
-                                state.id, state
-                            );
+                            true
+                        } else {
+                            state.voted_for.is_none()
+                                || state.voted_for.unwrap() == req.candidate_id
+                        }
+                    };
 
-                            // !(term < currentTerm)
-                            if req.term >= state.current_term {
-                                state.voted_for = Some(req.candidate_id);
-                                true
-                            } else {
-                                state.voted_for.is_none()
-                                    || state.voted_for.unwrap()
-                                        == req.candidate_id
-                            }
-                        };
-
-                        tx.send(RequestVoteResponse {
-                            term: req.term,
-                            vote_granted,
-                        })
-                        .expect("failed to send request vote response");
-                    }
+                    tx.send(RequestVoteResponse {
+                        term: req.term,
+                        vote_granted,
+                    })
+                    .expect("failed to send request vote response");
                 }
             }
-        });
-
-        // RPC thread
-        let rpc_handle = tokio::spawn(async move {
-            let addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-            let mut listener =
-                tarpc::serde_transport::tcp::listen(&addr, Json::default)
-                    .await
-                    .expect("failed to start RPC server");
-            listener.config_mut().max_frame_length(usize::MAX);
-            listener
-                .filter_map(|r| future::ready(r.ok()))
-                .map(server::BaseChannel::with_defaults)
-                .max_channels_per_key(1, |t| {
-                    t.transport().peer_addr().unwrap().ip()
-                })
-                .map(|channel| {
-                    let server = RaftServer { tx: tx.clone() };
-                    channel.execute(server.serve()).for_each(spawn)
-                })
-                .buffer_unordered(10)
-                .for_each(|_| async {})
-                .await;
-        });
-        tokio::try_join!(main_handle, rpc_handle, cmd_handle)?;
-
+        }
         Ok(())
     }
     async fn setup(&mut self) -> anyhow::Result<()> {
@@ -330,7 +372,6 @@ impl Node {
                 self.state.lock().await.id
             );
 
-            // kick heartbeat immediately
             self.watch_dog.reset().await;
             self.become_leader().await?;
         }
