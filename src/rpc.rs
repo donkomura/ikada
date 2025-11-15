@@ -44,6 +44,7 @@ pub struct RequestVoteResponse {
 #[tarpc::service]
 pub trait RaftRpc {
     async fn echo(name: String) -> String;
-    async fn append_entries(req: AppendEntriesRequest) -> AppendEntriesResponse;
+    async fn append_entries(req: AppendEntriesRequest)
+    -> AppendEntriesResponse;
     async fn request_vote(req: RequestVoteRequest) -> RequestVoteResponse;
 }

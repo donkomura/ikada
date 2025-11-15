@@ -14,7 +14,7 @@ pub enum Role {
     Leader,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct RaftState {
     // Persistent state on all services
     pub current_term: u32,
@@ -32,4 +32,22 @@ pub struct RaftState {
     pub role: Role,
     pub leader_id: Option<u32>,
     pub id: u32,
+}
+
+impl Default for RaftState {
+    fn default() -> Self {
+        Self {
+            current_term: 1,
+            role: Role::Follower,
+
+            voted_for: None,
+            log: Vec::new(),
+            commit_index: 0,
+            last_applied: 0,
+            next_index: HashMap::new(),
+            match_index: HashMap::new(),
+            leader_id: None,
+            id: 0,
+        }
+    }
 }
