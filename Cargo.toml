@@ -7,5 +7,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 futures = "0.3"
+opentelemetry = "0.31.0"
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
+opentelemetry_sdk = "0.31.0"
 tarpc = { version = "0.37", features = ["full"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1.41"
+tracing-opentelemetry = "0.32.0"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

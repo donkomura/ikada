@@ -16,6 +16,7 @@ use tokio::{
     task::JoinSet,
     time::Instant,
 };
+use tracing::Instrument;
 
 pub enum Command {
     AppendEntries(AppendEntriesRequest, oneshot::Sender<AppendEntriesResponse>),
@@ -187,10 +188,7 @@ impl Node {
                     let vote_granted = {
                         let mut state = state.lock().await;
                         state.voted_for = Some(req.candidate_id);
-                        println!(
-                            "[node {}] Command::RequestVote: {:?}",
-                            state.id, state
-                        );
+                        tracing::info!(id=?state.id, request.body=?req, "Command::RequestVote");
 
                         // !(term < currentTerm)
                         if req.term >= state.current_term {
@@ -287,7 +285,6 @@ impl Node {
         }
     }
     async fn start_election(&mut self) -> anyhow::Result<()> {
-        println!("[node {}] start_election", self.state.lock().await.id);
         self.watch_dog.reset().await;
 
         let mut responses: Vec<RequestVoteResponse> = Vec::new();
@@ -300,6 +297,7 @@ impl Node {
             voted_for,
         ) = {
             let state = self.state.lock().await;
+            tracing::info!(id=?state.id, state=?state, "start_election");
             // vote for myself
             responses.push(RequestVoteResponse {
                 term: state.current_term,
@@ -331,20 +329,16 @@ impl Node {
                 };
 
                 if !is_granted {
+                    tracing::info!(
+                        id = candidate_id,
+                        "vote not granted, become follower"
+                    );
                     self.become_follower().await?;
                     return Ok(());
                 }
                 responses.push(
                     client
-                        .request_vote(
-                            tarpc::context::current(),
-                            RequestVoteRequest {
-                                term: current_term,
-                                candidate_id,
-                                last_log_index,
-                                last_log_term,
-                            },
-                        )
+                        .request_vote(tarpc::context::current(), req.clone())
                         .await?,
                 );
             }
@@ -358,18 +352,18 @@ impl Node {
         &mut self,
         responses: Vec<RequestVoteResponse>,
     ) -> anyhow::Result<()> {
-        println!(
-            "[node {}] responses: {responses:?}",
-            self.state.lock().await.id
-        );
+        let id = self.state.lock().await.id;
+        tracing::info!(id=id, responses=?responses, "election handled");
         // 投票が過半数か
         let vote_granted = responses.iter().filter(|r| r.vote_granted).count()
             > self.config.servers.len() / 2;
 
         if vote_granted {
-            println!(
-                "[node {}] vote_granted, become leader: {vote_granted}",
-                self.state.lock().await.id
+            tracing::info!(
+                id = id,
+                voted_count =
+                    responses.iter().filter(|r| r.vote_granted).count(),
+                "vote granted, become leader"
             );
 
             self.watch_dog.reset().await;
@@ -417,6 +411,9 @@ impl Node {
                 };
                 let res = client
                     .append_entries(tarpc::context::current(), req.clone())
+                    .instrument(tracing::info_span!(
+                        "append entries to {server}"
+                    ))
                     .await?;
                 self.handle_heartbeat(*server, req.clone(), res.clone())
                     .await?;
@@ -425,6 +422,7 @@ impl Node {
 
         Ok(true)
     }
+    #[tracing::instrument(skip(self))]
     async fn handle_heartbeat(
         &mut self,
         addr: SocketAddr,
@@ -434,6 +432,7 @@ impl Node {
         let check_term = {
             let mut state = self.state.lock().await;
             if res.term > state.current_term {
+                tracing::info!(id=?state.id, "become follower because of term mismatch");
                 state.current_term = res.term;
                 true
             } else {
@@ -456,7 +455,7 @@ impl Node {
             // TODO: update
             todo!()
         }
-        println!("[node {}] got heartbeat from {addr}: {res:?}", state.id);
+        tracing::info!(id=?state.id, response.body=?res, "got heartbeat");
         Ok(())
     }
 }

@@ -3,9 +3,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::time::Duration;
 
 use ikada::server::{Config, Node};
+use ikada::trace::init_tracing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let tracer_provider = init_tracing("ikada")?;
+
     let port = 1111;
     let servers = vec![
         SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port)),
@@ -50,5 +53,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let _ = tokio::join!(jh, jh2, jh3);
+
+    tracer_provider.shutdown()?;
     Ok(())
 }
