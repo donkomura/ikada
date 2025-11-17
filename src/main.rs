@@ -21,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
             servers: servers.clone(),
             heartbeat_interval: Duration::from_millis(1000),
             election_timeout: Duration::from_millis(2000),
+            rpc_timeout: std::time::Duration::from_millis(5000),
         },
     );
     let node2 = Node::new(
@@ -29,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
             servers: servers.clone(),
             heartbeat_interval: Duration::from_millis(1500),
             election_timeout: Duration::from_millis(3000),
+            rpc_timeout: std::time::Duration::from_millis(5000),
         },
     );
     let node3 = Node::new(
@@ -37,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
             servers: servers.clone(),
             heartbeat_interval: Duration::from_millis(2000),
             election_timeout: Duration::from_millis(4000),
+            rpc_timeout: Duration::from_millis(5000),
         },
     );
 

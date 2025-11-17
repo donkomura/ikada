@@ -4,7 +4,7 @@ use futures::{future, prelude::*};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tarpc::{
     client,
     server::{self, Channel, incoming::Incoming},
@@ -14,7 +14,6 @@ use tokio::{
     signal,
     sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinSet,
-    time::Instant,
 };
 use tracing::Instrument;
 
@@ -32,6 +31,7 @@ pub struct Config {
     pub servers: Vec<SocketAddr>,
     pub heartbeat_interval: tokio::time::Duration,
     pub election_timeout: tokio::time::Duration,
+    pub rpc_timeout: Duration,
 }
 
 pub struct Node {
@@ -336,11 +336,9 @@ impl Node {
                     self.become_follower().await?;
                     return Ok(());
                 }
-                responses.push(
-                    client
-                        .request_vote(tarpc::context::current(), req.clone())
-                        .await?,
-                );
+                let mut ctx = tarpc::context::current();
+                ctx.deadline = Instant::now() + self.config.rpc_timeout;
+                responses.push(client.request_vote(ctx, req.clone()).await?);
             }
         }
         self.handle_election(responses).await?;
@@ -409,8 +407,10 @@ impl Node {
                     entries: Vec::new(),
                     leader_commit: 0,
                 };
+                let mut ctx = tarpc::context::current();
+                ctx.deadline = Instant::now() + self.config.rpc_timeout;
                 let res = client
-                    .append_entries(tarpc::context::current(), req.clone())
+                    .append_entries(ctx, req.clone())
                     .instrument(tracing::info_span!(
                         "append entries to {server}"
                     ))
