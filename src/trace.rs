@@ -11,12 +11,6 @@ pub fn init_tracing(
                     .with_service_name(service_name)
                     .build(),
             )
-            .with_batch_exporter(
-                opentelemetry_otlp::SpanExporter::builder()
-                    .with_tonic()
-                    .build()
-                    .unwrap(),
-            )
             .build();
     opentelemetry::global::set_tracer_provider(tracer_provider.clone());
     let tracer = tracer_provider.tracer(service_name);
