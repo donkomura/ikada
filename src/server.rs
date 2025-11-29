@@ -11,7 +11,6 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 use tokio::{
-    signal,
     sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinSet,
 };
@@ -108,15 +107,9 @@ impl Node {
         workers.spawn(Self::cmd_handler(state, rx));
         Self::rpc_server(tx, port).await?;
 
-        tokio::select! {
-            res = Self::shutdown_signal() => {
-                workers.abort_all();
-                res?;
-            }
-            Some(res) = workers.join_next() => {
-                res??;
-            }
-        };
+        if let Some(res) = workers.join_next().await {
+            res??;
+        }
 
         workers.abort_all();
         while workers.join_next().await.is_some() {}
@@ -124,27 +117,6 @@ impl Node {
         Ok(())
     }
 
-    async fn shutdown_signal() -> anyhow::Result<()> {
-        #[cfg(unix)]
-        {
-            let mut terminate =
-                signal::unix::signal(signal::unix::SignalKind::terminate())?;
-
-            tokio::select! {
-                res = signal::ctrl_c() => {
-                    res?;
-                },
-                _ = terminate.recv() => {},
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            signal::ctrl_c().await?;
-        }
-
-        Ok(())
-    }
     async fn rpc_server(
         tx: mpsc::Sender<Command>,
         port: u16,
