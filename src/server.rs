@@ -26,6 +26,7 @@ pub enum Response {
     RequestVote(Option<RequestVoteResponse>),
 }
 
+#[derive(Default)]
 pub struct Config {
     pub servers: Vec<SocketAddr>,
     pub heartbeat_interval: tokio::time::Duration,
@@ -220,7 +221,7 @@ impl Node {
         let mut interval = tokio::time::interval(timeout / 2);
         loop {
             if !matches!(self.state.lock().await.role, Role::Follower) {
-                return Ok(());
+                break;
             }
             tokio::select! {
                 _ = interval.tick() => {}
@@ -229,38 +230,34 @@ impl Node {
                 }
             }
         }
+        tracing::info!("begin the election");
+        Ok(())
     }
     async fn run_candidate(&mut self) -> anyhow::Result<()> {
-        let timeout = self.config.election_timeout;
-        let mut interval = tokio::time::interval(timeout / 100);
         loop {
             if !matches!(self.state.lock().await.role, Role::Candidate) {
-                return Ok(());
+                break;
             }
-            tokio::select! {
-                _ = interval.tick() => {}
-                _ = self.watch_dog.wait_timeout(timeout) => {
-                    self.start_election().await?;
-                }
-            }
+            self.watch_dog.reset().await;
+            // TODO: check timeout and retry
+            self.start_election().await?;
         }
+        Ok(())
     }
     async fn run_leader(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.heartbeat_interval;
         let mut interval = tokio::time::interval(timeout / 2);
         loop {
             if !matches!(self.state.lock().await.role, Role::Leader) {
-                return Ok(());
+                break;
             }
             interval.tick().await;
             self.broadcast_heartbeat().await?;
         }
+        Ok(())
     }
     async fn start_election(&mut self) -> anyhow::Result<()> {
-        self.watch_dog.reset().await;
-
         let mut responses: Vec<RequestVoteResponse> = Vec::new();
-
         let (
             current_term,
             candidate_id,
@@ -459,5 +456,47 @@ impl RaftRpc for RaftServer {
         let (tx, rx) = oneshot::channel::<RequestVoteResponse>();
         self.tx.send(Command::RequestVote(req, tx)).await.unwrap();
         rx.await.unwrap()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn check_leader_state_after_become_leader() -> anyhow::Result<()> {
+        let mut node = Node::new(10101, Config::default());
+        node.become_leader().await?;
+        let state = node.state.lock().await;
+        assert_eq!(state.role, Role::Leader);
+        assert_eq!(state.leader_id, Some(state.id));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn check_leader_state_after_become_candidate() -> anyhow::Result<()> {
+        let mut node = Node::new(10101, Config::default());
+        let term = node.state.lock().await.current_term;
+        node.become_candidate().await?;
+        let state = node.state.lock().await;
+        assert_eq!(state.role, Role::Candidate);
+        assert_eq!(state.current_term, term + 1);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn check_leader_state_after_become_follower() -> anyhow::Result<()> {
+        let mut node = Node::new(10101, Config::default());
+        node.become_follower().await?;
+        let state = node.state.lock().await;
+        assert_eq!(state.role, Role::Follower);
+        Ok(())
+    }
+    #[tokio::test(start_paused = true)]
+    async fn election_must_be_done_with_not_candidate() -> anyhow::Result<()> {
+        let mut node = Node::new(10101, Config::default());
+        // TODO: setup node manualy
+        node.become_candidate().await?;
+        node.run_candidate().await?;
+        assert_ne!(node.state.lock().await.role, Role::Candidate);
+        Ok(())
     }
 }

@@ -6,7 +6,7 @@ pub struct Entry {
     pub command: String,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum Role {
     #[default]
     Follower,
