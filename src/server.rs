@@ -2,6 +2,7 @@ use crate::raft::{RaftState, Role};
 use crate::rpc::*;
 use futures::{future, prelude::*};
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -239,8 +240,13 @@ impl Node {
                 break;
             }
             self.watch_dog.reset().await;
-            // TODO: check timeout and retry
-            self.start_election().await?;
+            match self.start_election().await {
+                Ok(()) => { break; }
+                Err(err) if err.downcast_ref() == Some(&io::ErrorKind::TimedOut) => {
+                        tracing::info!("retry the election");
+                },
+                _ => {}
+            }
         }
         Ok(())
     }
