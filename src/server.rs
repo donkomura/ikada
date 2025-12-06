@@ -231,7 +231,6 @@ impl Node {
                 }
             }
         }
-        tracing::info!("begin the election");
         Ok(())
     }
     async fn run_candidate(&mut self) -> anyhow::Result<()> {
@@ -243,9 +242,11 @@ impl Node {
             match self.start_election().await {
                 Ok(()) => { break; }
                 Err(err) if err.downcast_ref() == Some(&io::ErrorKind::TimedOut) => {
-                        tracing::info!("retry the election");
+                    tracing::info!("retry the election");
                 },
-                _ => {}
+                Err(err) => {
+                    return Err(err);
+                }
             }
         }
         Ok(())
