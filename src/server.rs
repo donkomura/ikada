@@ -44,14 +44,14 @@ pub struct Node {
 }
 
 pub struct WatchDog {
-    last_seen: Mutex<Instant>,
+    last_seen: Mutex<tokio::time::Instant>,
     notify: Notify,
 }
 
 impl Default for WatchDog {
     fn default() -> Self {
         Self {
-            last_seen: Mutex::new(Instant::now()),
+            last_seen: Mutex::new(tokio::time::Instant::now()),
             notify: Notify::new(),
         }
     }
@@ -59,11 +59,11 @@ impl Default for WatchDog {
 
 impl WatchDog {
     async fn reset(&self) {
-        *self.last_seen.lock().await = Instant::now();
+        *self.last_seen.lock().await = tokio::time::Instant::now();
         self.notify.notify_one();
     }
     async fn elasped(&self) -> Duration {
-        Instant::now() - *self.last_seen.lock().await
+        tokio::time::Instant::now() - *self.last_seen.lock().await
     }
     async fn wait_timeout(&self, timeout: Duration) {
         loop {
@@ -503,6 +503,41 @@ mod test {
         node.become_candidate().await?;
         node.run_candidate().await?;
         assert_ne!(node.state.lock().await.role, Role::Candidate);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_follower_becomes_candidate_after_election_timeout() -> anyhow::Result<()> {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let config = Config {
+            servers: vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10101),
+            ],
+            heartbeat_interval: Duration::from_millis(1000),
+            election_timeout: Duration::from_millis(2000),
+            rpc_timeout: Duration::from_millis(500),
+        };
+        let mut node = Node::new(10101, config);
+
+        {
+            let state = node.state.lock().await;
+            assert_eq!(state.role, Role::Follower);
+        }
+
+        let state_clone = Arc::clone(&node.state);
+        tokio::spawn(async move {
+            let _ = node.run_follower().await;
+        });
+
+        tokio::time::advance(Duration::from_millis(2100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        {
+            let state = state_clone.lock().await;
+            assert_eq!(state.role, Role::Candidate);
+        }
+
         Ok(())
     }
 }
