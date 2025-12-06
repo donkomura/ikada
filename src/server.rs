@@ -2,6 +2,7 @@ use crate::raft::{RaftState, Role};
 use crate::rpc::*;
 use futures::{future, prelude::*};
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +12,6 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 use tokio::{
-    signal,
     sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinSet,
 };
@@ -27,6 +27,7 @@ pub enum Response {
     RequestVote(Option<RequestVoteResponse>),
 }
 
+#[derive(Default)]
 pub struct Config {
     pub servers: Vec<SocketAddr>,
     pub heartbeat_interval: tokio::time::Duration,
@@ -43,14 +44,14 @@ pub struct Node {
 }
 
 pub struct WatchDog {
-    last_seen: Mutex<Instant>,
+    last_seen: Mutex<tokio::time::Instant>,
     notify: Notify,
 }
 
 impl Default for WatchDog {
     fn default() -> Self {
         Self {
-            last_seen: Mutex::new(Instant::now()),
+            last_seen: Mutex::new(tokio::time::Instant::now()),
             notify: Notify::new(),
         }
     }
@@ -58,11 +59,11 @@ impl Default for WatchDog {
 
 impl WatchDog {
     async fn reset(&self) {
-        *self.last_seen.lock().await = Instant::now();
+        *self.last_seen.lock().await = tokio::time::Instant::now();
         self.notify.notify_one();
     }
     async fn elasped(&self) -> Duration {
-        Instant::now() - *self.last_seen.lock().await
+        tokio::time::Instant::now() - *self.last_seen.lock().await
     }
     async fn wait_timeout(&self, timeout: Duration) {
         loop {
@@ -108,15 +109,9 @@ impl Node {
         workers.spawn(Self::cmd_handler(state, rx));
         Self::rpc_server(tx, port).await?;
 
-        tokio::select! {
-            res = Self::shutdown_signal() => {
-                workers.abort_all();
-                res?;
-            }
-            Some(res) = workers.join_next() => {
-                res??;
-            }
-        };
+        if let Some(res) = workers.join_next().await {
+            res??;
+        }
 
         workers.abort_all();
         while workers.join_next().await.is_some() {}
@@ -124,27 +119,6 @@ impl Node {
         Ok(())
     }
 
-    async fn shutdown_signal() -> anyhow::Result<()> {
-        #[cfg(unix)]
-        {
-            let mut terminate =
-                signal::unix::signal(signal::unix::SignalKind::terminate())?;
-
-            tokio::select! {
-                res = signal::ctrl_c() => {
-                    res?;
-                },
-                _ = terminate.recv() => {},
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            signal::ctrl_c().await?;
-        }
-
-        Ok(())
-    }
     async fn rpc_server(
         tx: mpsc::Sender<Command>,
         port: u16,
@@ -248,7 +222,7 @@ impl Node {
         let mut interval = tokio::time::interval(timeout / 2);
         loop {
             if !matches!(self.state.lock().await.role, Role::Follower) {
-                return Ok(());
+                break;
             }
             tokio::select! {
                 _ = interval.tick() => {}
@@ -257,38 +231,40 @@ impl Node {
                 }
             }
         }
+        Ok(())
     }
     async fn run_candidate(&mut self) -> anyhow::Result<()> {
-        let timeout = self.config.election_timeout;
-        let mut interval = tokio::time::interval(timeout / 100);
         loop {
             if !matches!(self.state.lock().await.role, Role::Candidate) {
-                return Ok(());
+                break;
             }
-            tokio::select! {
-                _ = interval.tick() => {}
-                _ = self.watch_dog.wait_timeout(timeout) => {
-                    self.start_election().await?;
+            self.watch_dog.reset().await;
+            match self.start_election().await {
+                Ok(()) => { break; }
+                Err(err) if err.downcast_ref() == Some(&io::ErrorKind::TimedOut) => {
+                    tracing::info!("retry the election");
+                },
+                Err(err) => {
+                    return Err(err);
                 }
             }
         }
+        Ok(())
     }
     async fn run_leader(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.heartbeat_interval;
         let mut interval = tokio::time::interval(timeout / 2);
         loop {
             if !matches!(self.state.lock().await.role, Role::Leader) {
-                return Ok(());
+                break;
             }
             interval.tick().await;
             self.broadcast_heartbeat().await?;
         }
+        Ok(())
     }
     async fn start_election(&mut self) -> anyhow::Result<()> {
-        self.watch_dog.reset().await;
-
         let mut responses: Vec<RequestVoteResponse> = Vec::new();
-
         let (
             current_term,
             candidate_id,
@@ -487,5 +463,79 @@ impl RaftRpc for RaftServer {
         let (tx, rx) = oneshot::channel::<RequestVoteResponse>();
         self.tx.send(Command::RequestVote(req, tx)).await.unwrap();
         rx.await.unwrap()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn check_leader_state_after_become_leader() -> anyhow::Result<()> {
+        let mut node = Node::new(10101, Config::default());
+        node.become_leader().await?;
+        let state = node.state.lock().await;
+        assert_eq!(state.role, Role::Leader);
+        assert_eq!(state.leader_id, Some(state.id));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn check_leader_state_after_become_candidate() -> anyhow::Result<()> {
+        let mut node = Node::new(10101, Config::default());
+        let term = node.state.lock().await.current_term;
+        node.become_candidate().await?;
+        let state = node.state.lock().await;
+        assert_eq!(state.role, Role::Candidate);
+        assert_eq!(state.current_term, term + 1);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn check_leader_state_after_become_follower() -> anyhow::Result<()> {
+        let mut node = Node::new(10101, Config::default());
+        node.become_follower().await?;
+        let state = node.state.lock().await;
+        assert_eq!(state.role, Role::Follower);
+        Ok(())
+    }
+    #[tokio::test(start_paused = true)]
+    async fn election_must_be_done_with_not_candidate() -> anyhow::Result<()> {
+        let mut node = Node::new(10101, Config::default());
+        node.become_candidate().await?;
+        node.run_candidate().await?;
+        assert_ne!(node.state.lock().await.role, Role::Candidate);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_follower_becomes_candidate_after_election_timeout() -> anyhow::Result<()> {
+        let config = Config {
+            election_timeout: Duration::from_millis(2000),
+            ..Default::default()
+        };
+        let mut node = Node::new(10101, config);
+        let result = tokio::spawn(async move {
+            node.run_follower().await
+        });
+        tokio::time::advance(Duration::from_millis(2100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(result.await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_candidate_calls_start_election() -> anyhow::Result<()> {
+        let config = Config {
+            rpc_timeout: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let mut node = Node::new(10101, config);
+        node.become_candidate().await?;
+        let result = tokio::spawn(async move {
+            node.run_candidate().await
+        });
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(result.await.is_ok());
+        Ok(())
     }
 }
