@@ -15,7 +15,9 @@ impl WatchDog {
 
     pub async fn reset(&self, timeout: Duration) {
         let mut deadline = self.deadline.lock().await;
-        deadline.as_mut().reset(tokio::time::Instant::now() + timeout);
+        deadline
+            .as_mut()
+            .reset(tokio::time::Instant::now() + timeout);
     }
 
     pub async fn wait(&self) {
@@ -58,7 +60,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_watchdog_reset_with_different_timeout() -> anyhow::Result<()> {
+    async fn test_watchdog_reset_with_different_timeout() -> anyhow::Result<()>
+    {
         let watchdog = Arc::new(WatchDog::new(Duration::from_millis(1000)));
         let watchdog_clone = Arc::clone(&watchdog);
 

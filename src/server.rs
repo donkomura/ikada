@@ -121,30 +121,52 @@ impl Node {
                 Command::AppendEntries(req, tx) => {
                     let _ = heartbeat_tx.send(());
 
+                    let (current_term, success) = {
+                        let mut state = state.lock().await;
+
+                        // RPC受信時のterm比較: req.term > currentTermの場合
+                        if req.term > state.current_term {
+                            state.current_term = req.term;
+                            state.role = Role::Follower;
+                            state.voted_for = None;
+                        }
+
+                        (state.current_term, true)
+                    };
+
                     tx.send(AppendEntriesResponse {
-                        term: req.term,
-                        success: true,
+                        term: current_term,
+                        success,
                     })
                     .expect("failed to send append entries response");
                 }
                 Command::RequestVote(req, tx) => {
-                    let vote_granted = {
+                    let (current_term, vote_granted) = {
                         let mut state = state.lock().await;
-                        state.voted_for = Some(req.candidate_id);
+
+                        // RPC受信時のterm比較: req.term > currentTermの場合
+                        if req.term > state.current_term {
+                            state.current_term = req.term;
+                            state.role = Role::Follower;
+                            state.voted_for = None;
+                        }
+
                         tracing::info!(id=?state.id, request.body=?req, "Command::RequestVote");
 
                         // !(term < currentTerm)
-                        if req.term >= state.current_term {
+                        let vote_granted = if req.term >= state.current_term {
                             state.voted_for = Some(req.candidate_id);
                             true
                         } else {
                             state.voted_for.is_none()
                                 || state.voted_for.unwrap() == req.candidate_id
-                        }
+                        };
+
+                        (state.current_term, vote_granted)
                     };
 
                     tx.send(RequestVoteResponse {
-                        term: req.term,
+                        term: current_term,
                         vote_granted,
                     })
                     .expect("failed to send request vote response");
@@ -210,10 +232,14 @@ impl Node {
                 break;
             }
             match self.start_election().await {
-                Ok(()) => { break; }
-                Err(err) if err.downcast_ref() == Some(&io::ErrorKind::TimedOut) => {
+                Ok(()) => {
+                    break;
+                }
+                Err(err)
+                    if err.downcast_ref() == Some(&io::ErrorKind::TimedOut) =>
+                {
                     tracing::info!("retry the election");
-                },
+                }
                 Err(err) => {
                     return Err(err);
                 }
@@ -478,15 +504,14 @@ mod test {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_follower_becomes_candidate_after_election_timeout() -> anyhow::Result<()> {
+    async fn test_follower_becomes_candidate_after_election_timeout()
+    -> anyhow::Result<()> {
         let config = Config {
             election_timeout: Duration::from_millis(2000),
             ..Default::default()
         };
         let mut node = Node::new(10101, config);
-        let result = tokio::spawn(async move {
-            node.run_follower().await
-        });
+        let result = tokio::spawn(async move { node.run_follower().await });
         // election timeoutを超える時間（2100ms）進める
         tokio::time::advance(Duration::from_millis(2100)).await;
         // スケジューラに制御を渡してwatchdogのタイムアウトを発火させる
@@ -503,9 +528,7 @@ mod test {
         };
         let mut node = Node::new(10101, config);
         node.become_candidate().await?;
-        let result = tokio::spawn(async move {
-            node.run_candidate().await
-        });
+        let result = tokio::spawn(async move { node.run_candidate().await });
         // 100ms進めてstart_electionが呼ばれる時間を与える
         tokio::time::advance(Duration::from_millis(100)).await;
         // スケジューラに制御を渡してタスクを実行させる
@@ -523,9 +546,7 @@ mod test {
         let mut node = Node::new(10101, config);
 
         let heartbeat_tx = node.heartbeat_tx.clone();
-        let result = tokio::spawn(async move {
-            node.run_follower().await
-        });
+        let result = tokio::spawn(async move { node.run_follower().await });
 
         // 1回目: 800ms経過後にheartbeat
         tokio::time::advance(Duration::from_millis(800)).await;
@@ -555,6 +576,84 @@ mod test {
         tokio::time::advance(Duration::from_millis(1100)).await;
         tokio::task::yield_now().await;
         assert!(result.is_finished());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_with_higher_term_converts_to_follower()
+    -> anyhow::Result<()> {
+        let state = Arc::new(Mutex::new(RaftState {
+            id: 1,
+            current_term: 50,
+            role: Role::Leader,
+            ..Default::default()
+        }));
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
+        let (heartbeat_tx, _heartbeat_rx) = mpsc::unbounded_channel();
+        let state_clone = Arc::clone(&state);
+
+        tokio::spawn(async move {
+            Node::cmd_handler(state_clone, cmd_rx, heartbeat_tx).await
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let req = AppendEntriesRequest {
+            term: 100,
+            leader_id: 99999,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        };
+
+        cmd_tx.send(Command::AppendEntries(req, resp_tx)).await?;
+
+        let _response = resp_rx.await?;
+
+        // termが更新され、followerに転向しているべき
+        let final_state = state.lock().await;
+        assert_eq!(final_state.current_term, 100);
+        assert_eq!(final_state.role, Role::Follower);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_vote_with_higher_term_converts_to_follower()
+    -> anyhow::Result<()> {
+        let state = Arc::new(Mutex::new(RaftState {
+            id: 1,
+            current_term: 50,
+            role: Role::Leader,
+            ..Default::default()
+        }));
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
+        let (heartbeat_tx, _heartbeat_rx) = mpsc::unbounded_channel();
+        let state_clone = Arc::clone(&state);
+
+        tokio::spawn(async move {
+            Node::cmd_handler(state_clone, cmd_rx, heartbeat_tx).await
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let req = RequestVoteRequest {
+            term: 100,
+            candidate_id: 99999,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+
+        cmd_tx.send(Command::RequestVote(req, resp_tx)).await?;
+
+        let _response = resp_rx.await?;
+
+        // termが更新され、followerに転向しているべき
+        let final_state = state.lock().await;
+        assert_eq!(final_state.current_term, 100);
+        assert_eq!(final_state.role, Role::Follower);
 
         Ok(())
     }
