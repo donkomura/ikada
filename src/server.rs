@@ -4,6 +4,7 @@ use futures::{future, prelude::*};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tarpc::{
@@ -12,7 +13,7 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 use tokio::{
-    sync::{Mutex, Notify, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     task::JoinSet,
 };
 use tracing::Instrument;
@@ -41,46 +42,29 @@ pub struct Node {
     server_addr: SocketAddr,
     state: Arc<Mutex<RaftState>>,
     watch_dog: WatchDog,
+    heartbeat_rx: mpsc::UnboundedReceiver<()>,
+    heartbeat_tx: mpsc::UnboundedSender<()>,
 }
 
 pub struct WatchDog {
-    last_seen: Mutex<tokio::time::Instant>,
-    notify: Notify,
-}
-
-impl Default for WatchDog {
-    fn default() -> Self {
-        Self {
-            last_seen: Mutex::new(tokio::time::Instant::now()),
-            notify: Notify::new(),
-        }
-    }
+    deadline: Mutex<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl WatchDog {
-    async fn reset(&self) {
-        *self.last_seen.lock().await = tokio::time::Instant::now();
-        self.notify.notify_one();
-    }
-    async fn elasped(&self) -> Duration {
-        tokio::time::Instant::now() - *self.last_seen.lock().await
-    }
-    async fn wait_timeout(&self, timeout: Duration) {
-        loop {
-            let elapsed = self.elasped().await;
-            if elapsed >= timeout {
-                return;
-            }
-            let remaining = timeout - elapsed;
-            tokio::select! {
-                _ = tokio::time::sleep(remaining) => {
-                    return;
-                }
-                _ = self.notify.notified() => {
-                    continue;
-                }
-            }
+    fn new(timeout: Duration) -> Self {
+        Self {
+            deadline: Mutex::new(Box::pin(tokio::time::sleep(timeout))),
         }
+    }
+
+    async fn reset(&self, timeout: Duration) {
+        let mut deadline = self.deadline.lock().await;
+        deadline.as_mut().reset(tokio::time::Instant::now() + timeout);
+    }
+
+    async fn wait(&self) {
+        let mut deadline = self.deadline.lock().await;
+        deadline.as_mut().await;
     }
 }
 async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
@@ -89,7 +73,9 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 
 impl Node {
     pub fn new(port: u16, config: Config) -> Self {
+        let (heartbeat_tx, heartbeat_rx) = mpsc::unbounded_channel();
         Node {
+            watch_dog: WatchDog::new(config.election_timeout),
             config,
             clients: HashMap::default(),
             server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
@@ -97,16 +83,18 @@ impl Node {
                 id: port as u32,
                 ..Default::default()
             })),
-            watch_dog: WatchDog::default(),
+            heartbeat_rx,
+            heartbeat_tx,
         }
     }
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
         // main thread for test
         let (tx, rx) = mpsc::channel::<Command>(32);
         let state = Arc::clone(&self.state);
+        let heartbeat_tx = self.heartbeat_tx.clone();
         let mut workers = JoinSet::new();
         workers.spawn(self.main());
-        workers.spawn(Self::cmd_handler(state, rx));
+        workers.spawn(Self::cmd_handler(state, rx, heartbeat_tx));
         Self::rpc_server(tx, port).await?;
 
         if let Some(res) = workers.join_next().await {
@@ -147,11 +135,13 @@ impl Node {
     async fn cmd_handler(
         state: Arc<Mutex<RaftState>>,
         mut rx: mpsc::Receiver<Command>,
+        heartbeat_tx: mpsc::UnboundedSender<()>,
     ) -> anyhow::Result<()> {
         while let Some(command) = rx.recv().await {
             match command {
                 Command::AppendEntries(req, tx) => {
-                    // TODO
+                    let _ = heartbeat_tx.send(());
+
                     tx.send(AppendEntriesResponse {
                         term: req.term,
                         success: true,
@@ -219,15 +209,17 @@ impl Node {
     }
     async fn run_follower(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.election_timeout;
-        let mut interval = tokio::time::interval(timeout / 2);
         loop {
             if !matches!(self.state.lock().await.role, Role::Follower) {
                 break;
             }
             tokio::select! {
-                _ = interval.tick() => {}
-                _ = self.watch_dog.wait_timeout(timeout) => {
+                Some(_) = self.heartbeat_rx.recv() => {
+                    self.watch_dog.reset(timeout).await;
+                }
+                _ = self.watch_dog.wait() => {
                     self.become_candidate().await?;
+                    break;
                 }
             }
         }
@@ -238,7 +230,6 @@ impl Node {
             if !matches!(self.state.lock().await.role, Role::Candidate) {
                 break;
             }
-            self.watch_dog.reset().await;
             match self.start_election().await {
                 Ok(()) => { break; }
                 Err(err) if err.downcast_ref() == Some(&io::ErrorKind::TimedOut) => {
@@ -340,7 +331,8 @@ impl Node {
                 "vote granted, become leader"
             );
 
-            self.watch_dog.reset().await;
+            let timeout = self.config.election_timeout;
+            self.watch_dog.reset(timeout).await;
             self.become_leader().await?;
         }
 
@@ -516,8 +508,10 @@ mod test {
         let result = tokio::spawn(async move {
             node.run_follower().await
         });
+        // election timeoutを超える時間（2100ms）進める
         tokio::time::advance(Duration::from_millis(2100)).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // スケジューラに制御を渡してwatchdogのタイムアウトを発火させる
+        tokio::task::yield_now().await;
         assert!(result.await.is_ok());
         Ok(())
     }
@@ -533,9 +527,125 @@ mod test {
         let result = tokio::spawn(async move {
             node.run_candidate().await
         });
+        // 100ms進めてstart_electionが呼ばれる時間を与える
         tokio::time::advance(Duration::from_millis(100)).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // スケジューラに制御を渡してタスクを実行させる
+        tokio::task::yield_now().await;
         assert!(result.await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_watchdog_timeout() -> anyhow::Result<()> {
+        let watchdog = WatchDog::new(Duration::from_millis(1000));
+
+        let timeout_task = tokio::spawn(async move {
+            watchdog.wait().await;
+        });
+
+        // 仮想時間を500ms進める
+        tokio::time::advance(Duration::from_millis(500)).await;
+        // スケジューラに制御を渡して期限切れタスクを実行させる
+        tokio::task::yield_now().await;
+        assert!(!timeout_task.is_finished());
+
+        // さらに498ms進める（合計998ms）
+        tokio::time::advance(Duration::from_millis(498)).await;
+        tokio::task::yield_now().await;
+        assert!(!timeout_task.is_finished());
+
+        // さらに3ms進める（合計1001ms）でタイムアウト
+        tokio::time::advance(Duration::from_millis(3)).await;
+        tokio::task::yield_now().await;
+        assert!(timeout_task.is_finished());
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_follower_multiple_heartbeat_resets() -> anyhow::Result<()> {
+        let config = Config {
+            election_timeout: Duration::from_millis(1000),
+            ..Default::default()
+        };
+        let mut node = Node::new(10101, config);
+
+        let heartbeat_tx = node.heartbeat_tx.clone();
+        let result = tokio::spawn(async move {
+            node.run_follower().await
+        });
+
+        // 1回目: 800ms経過後にheartbeat
+        tokio::time::advance(Duration::from_millis(800)).await;
+        tokio::task::yield_now().await;
+        assert!(!result.is_finished());
+
+        heartbeat_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+
+        // 2回目: さらに800ms経過後にheartbeat（リセットから800ms）
+        tokio::time::advance(Duration::from_millis(800)).await;
+        tokio::task::yield_now().await;
+        assert!(!result.is_finished());
+
+        heartbeat_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+
+        // 3回目: さらに800ms経過後にheartbeat（リセットから800ms）
+        tokio::time::advance(Duration::from_millis(800)).await;
+        tokio::task::yield_now().await;
+        assert!(!result.is_finished());
+
+        heartbeat_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+
+        // heartbeat停止: 1100ms経過でタイムアウト
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        tokio::task::yield_now().await;
+        assert!(result.is_finished());
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_watchdog_reset_with_different_timeout() -> anyhow::Result<()> {
+        let watchdog = Arc::new(WatchDog::new(Duration::from_millis(1000)));
+        let watchdog_clone = Arc::clone(&watchdog);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let timeout_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => {
+                        // 異なるタイムアウト値（500ms）でリセット
+                        watchdog_clone.reset(Duration::from_millis(500)).await;
+                    }
+                    _ = watchdog_clone.wait() => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // 初期タイムアウト: 1000ms
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert!(!timeout_task.is_finished());
+
+        // 500msの新しいタイムアウトでリセット
+        tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+
+        // 498ms経過（まだタイムアウトしない）
+        tokio::time::advance(Duration::from_millis(498)).await;
+        tokio::task::yield_now().await;
+        assert!(!timeout_task.is_finished());
+
+        // さらに3ms経過（合計501ms）でタイムアウト
+        tokio::time::advance(Duration::from_millis(3)).await;
+        tokio::task::yield_now().await;
+        assert!(timeout_task.is_finished());
+
         Ok(())
     }
 }
