@@ -499,7 +499,6 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn election_must_be_done_with_not_candidate() -> anyhow::Result<()> {
         let mut node = Node::new(10101, Config::default());
-        // TODO: setup node manualy
         node.become_candidate().await?;
         node.run_candidate().await?;
         assert_ne!(node.state.lock().await.role, Role::Candidate);
@@ -513,16 +512,12 @@ mod test {
             ..Default::default()
         };
         let mut node = Node::new(10101, config);
-
         let result = tokio::spawn(async move {
             node.run_follower().await
         });
-
         tokio::time::advance(Duration::from_millis(2100)).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
-
         assert!(result.await.is_ok());
-
         Ok(())
     }
 
@@ -533,18 +528,13 @@ mod test {
             ..Default::default()
         };
         let mut node = Node::new(10101, config);
-
         node.become_candidate().await?;
-
         let result = tokio::spawn(async move {
             node.run_candidate().await
         });
-
         tokio::time::advance(Duration::from_millis(100)).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
-
         assert!(result.await.is_ok());
-
         Ok(())
     }
 }
