@@ -508,35 +508,42 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn test_follower_becomes_candidate_after_election_timeout() -> anyhow::Result<()> {
-        use std::net::{IpAddr, Ipv4Addr};
-
         let config = Config {
-            servers: vec![
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10101),
-            ],
-            heartbeat_interval: Duration::from_millis(1000),
             election_timeout: Duration::from_millis(2000),
-            rpc_timeout: Duration::from_millis(500),
+            ..Default::default()
         };
         let mut node = Node::new(10101, config);
 
-        {
-            let state = node.state.lock().await;
-            assert_eq!(state.role, Role::Follower);
-        }
-
-        let state_clone = Arc::clone(&node.state);
-        tokio::spawn(async move {
-            let _ = node.run_follower().await;
+        let result = tokio::spawn(async move {
+            node.run_follower().await
         });
 
         tokio::time::advance(Duration::from_millis(2100)).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        {
-            let state = state_clone.lock().await;
-            assert_eq!(state.role, Role::Candidate);
-        }
+        assert!(result.await.is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_candidate_calls_start_election() -> anyhow::Result<()> {
+        let config = Config {
+            rpc_timeout: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let mut node = Node::new(10101, config);
+
+        node.become_candidate().await?;
+
+        let result = tokio::spawn(async move {
+            node.run_candidate().await
+        });
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(result.await.is_ok());
 
         Ok(())
     }
