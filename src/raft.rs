@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
-pub struct Entry {
+pub struct Entry<T> {
     pub term: u32,
-    pub command: String,
+    pub command: T,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -15,31 +16,30 @@ pub enum Role {
 }
 
 #[derive(Debug)]
-pub struct RaftState {
+pub struct RaftState<T> {
     // Persistent state on all services
     pub current_term: u32,
     pub voted_for: Option<u32>,
-    pub log: Vec<Entry>,
+    pub log: Vec<Entry<T>>,
 
     // Volatile state on all servers
     pub commit_index: u32,
     pub last_applied: u32,
 
     // Volatile state on leader
-    pub next_index: HashMap<u32, u32>,
-    pub match_index: HashMap<u32, u32>,
+    pub next_index: HashMap<SocketAddr, u32>,
+    pub match_index: HashMap<SocketAddr, u32>,
 
     pub role: Role,
     pub leader_id: Option<u32>,
     pub id: u32,
 }
 
-impl Default for RaftState {
-    fn default() -> Self {
+impl<T> RaftState<T> {
+    pub fn new(id: u32) -> Self {
         Self {
             current_term: 1,
             role: Role::Follower,
-
             voted_for: None,
             log: Vec::new(),
             commit_index: 0,
@@ -47,7 +47,16 @@ impl Default for RaftState {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             leader_id: None,
-            id: 0,
+            id,
         }
+    }
+    pub fn apply(&mut self, _command: &T) -> anyhow::Result<()> {
+        Ok(())
+    }
+    pub fn get_last_log_idx(&self) -> u32 {
+        self.log.len() as u32
+    }
+    pub fn get_last_log_term(&self) -> u32 {
+        self.log.last().map(|e| e.term).unwrap_or(0) as u32
     }
 }
