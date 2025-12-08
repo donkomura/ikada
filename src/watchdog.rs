@@ -7,9 +7,9 @@ pub struct WatchDog {
 }
 
 impl WatchDog {
-    pub fn new(timeout: Duration) -> Self {
+    pub fn new() -> Self {
         Self {
-            deadline: Mutex::new(Box::pin(tokio::time::sleep(timeout))),
+            deadline: Mutex::new(Box::pin(tokio::time::sleep(Duration::ZERO))),
         }
     }
 
@@ -34,11 +34,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_watchdog_timeout() -> anyhow::Result<()> {
-        let watchdog = WatchDog::new(Duration::from_millis(1000));
+        let watchdog = WatchDog::new();
 
         let timeout_task = tokio::spawn(async move {
             watchdog.wait().await;
+            watchdog.reset(Duration::from_millis(1000)).await;
+            watchdog.wait().await;
         });
+
+        // 最初のwait()は即座に完了する
+        tokio::task::yield_now().await;
+        assert!(!timeout_task.is_finished());
 
         // 仮想時間を500ms進める
         tokio::time::advance(Duration::from_millis(500)).await;
@@ -62,11 +68,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_watchdog_reset_with_different_timeout() -> anyhow::Result<()>
     {
-        let watchdog = Arc::new(WatchDog::new(Duration::from_millis(1000)));
+        let watchdog = Arc::new(WatchDog::new());
         let watchdog_clone = Arc::clone(&watchdog);
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let timeout_task = tokio::spawn(async move {
+            // 最初のwait()は即座に完了
+            watchdog_clone.wait().await;
+            watchdog_clone.reset(Duration::from_millis(1000)).await;
+
             loop {
                 tokio::select! {
                     _ = rx.recv() => {
@@ -79,6 +89,9 @@ mod tests {
                 }
             }
         });
+
+        // 最初のwait()が完了するまで待つ
+        tokio::task::yield_now().await;
 
         // 初期タイムアウト: 1000ms
         tokio::time::advance(Duration::from_millis(999)).await;
