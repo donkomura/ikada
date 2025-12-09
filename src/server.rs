@@ -164,11 +164,25 @@ impl Node {
             tracing::info!(id=?state.id, request.body=?req, "Command::RequestVote");
 
             let vote_granted = if req.term < state.current_term {
+                tracing::warn!(
+                    id=?state.id,
+                    candidate_id=req.candidate_id,
+                    req_term=req.term,
+                    current_term=state.current_term,
+                    "RequestVote rejected: candidate term is older"
+                );
                 false
             } else if state.voted_for.is_some() && state.voted_for.unwrap() != req.candidate_id {
+                tracing::warn!(
+                    id=?state.id,
+                    candidate_id=req.candidate_id,
+                    voted_for=?state.voted_for,
+                    "RequestVote rejected: already voted for another candidate"
+                );
                 false
             } else {
-                let last_log_term = state.get_last_log_term();
+                let last_log_entry = state.get_last_log_entry();
+                let last_log_term = last_log_entry.map(|e| e.term).unwrap_or(0);
                 let last_log_idx = state.get_last_log_idx();
 
                 let log_is_up_to_date = if req.last_log_term != last_log_term {
@@ -181,6 +195,15 @@ impl Node {
                     state.voted_for = Some(req.candidate_id);
                     true
                 } else {
+                    tracing::warn!(
+                        id=?state.id,
+                        candidate_id=req.candidate_id,
+                        req_last_log_term=req.last_log_term,
+                        req_last_log_index=req.last_log_index,
+                        last_log_term=last_log_term,
+                        last_log_idx=last_log_idx,
+                        "RequestVote rejected: candidate's log is not up-to-date"
+                    );
                     false
                 }
             };
@@ -893,6 +916,62 @@ mod test {
 
         let final_state = state.lock().await;
         assert_eq!(final_state.voted_for, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_vote_log_index_comparison_with_same_term() -> anyhow::Result<()> {
+        // ケース1: 同じterm、同じindex → 投票される
+        let mut state1 = RaftState::new(1);
+        state1.current_term = 10;
+        state1.log.push(raft::Entry { term: 5, command: Order {} });
+        state1.log.push(raft::Entry { term: 5, command: Order {} });
+        state1.log.push(raft::Entry { term: 5, command: Order {} });
+        let state1 = Arc::new(Mutex::new(state1));
+        let req1 = RequestVoteRequest {
+            term: 10,
+            candidate_id: 2,
+            last_log_index: 3,
+            last_log_term: 5,
+        };
+        let response1 = Node::request_vote(&req1, state1.clone()).await;
+        assert_eq!(response1.vote_granted, true, "Same term and same index should grant vote");
+        assert_eq!(state1.lock().await.voted_for, Some(2));
+
+        // ケース2: 同じterm、候補者のindexが長い → 投票される
+        let mut state2 = RaftState::new(1);
+        state2.current_term = 10;
+        state2.log.push(raft::Entry { term: 5, command: Order {} });
+        state2.log.push(raft::Entry { term: 5, command: Order {} });
+        state2.log.push(raft::Entry { term: 5, command: Order {} });
+        let state2 = Arc::new(Mutex::new(state2));
+        let req2 = RequestVoteRequest {
+            term: 10,
+            candidate_id: 3,
+            last_log_index: 5,
+            last_log_term: 5,
+        };
+        let response2 = Node::request_vote(&req2, state2.clone()).await;
+        assert_eq!(response2.vote_granted, true, "Same term and longer index should grant vote");
+        assert_eq!(state2.lock().await.voted_for, Some(3));
+
+        // ケース3: 同じterm、候補者のindexが短い → 拒否される
+        let mut state3 = RaftState::new(1);
+        state3.current_term = 10;
+        state3.log.push(raft::Entry { term: 5, command: Order {} });
+        state3.log.push(raft::Entry { term: 5, command: Order {} });
+        state3.log.push(raft::Entry { term: 5, command: Order {} });
+        let state3 = Arc::new(Mutex::new(state3));
+        let req3 = RequestVoteRequest {
+            term: 10,
+            candidate_id: 4,
+            last_log_index: 2,
+            last_log_term: 5,
+        };
+        let response3 = Node::request_vote(&req3, state3.clone()).await;
+        assert_eq!(response3.vote_granted, false, "Same term and shorter index should reject vote");
+        assert_eq!(state3.lock().await.voted_for, None);
 
         Ok(())
     }
