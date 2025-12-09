@@ -6,11 +6,17 @@ pub struct WatchDog {
     deadline: Mutex<Pin<Box<tokio::time::Sleep>>>,
 }
 
-impl WatchDog {
-    pub fn new() -> Self {
+impl Default for WatchDog {
+    fn default() -> Self {
         Self {
             deadline: Mutex::new(Box::pin(tokio::time::sleep(Duration::ZERO))),
         }
+    }
+}
+
+impl WatchDog {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub async fn reset(&self, timeout: Duration) {

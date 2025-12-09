@@ -36,12 +36,11 @@ pub struct Config {
 }
 
 #[derive(Debug)]
-pub struct Order {
-}
+pub struct Order {}
 
 pub struct Chan {
-    heartbeat_tx: mpsc::UnboundedSender<(u32,u32)>,
-    heartbeat_rx: mpsc::UnboundedReceiver<(u32,u32)>,
+    heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
+    heartbeat_rx: mpsc::UnboundedReceiver<(u32, u32)>,
     client_tx: mpsc::Sender<Order>,
     client_rx: mpsc::Receiver<Order>,
 }
@@ -126,66 +125,102 @@ impl Node {
             .await;
         Ok(())
     }
+    async fn append_entries(
+        req: &AppendEntriesRequest,
+        state: Arc<Mutex<RaftState<Order>>>,
+    ) -> AppendEntriesResponse {
+        let (current_term, success) = {
+            let mut state = state.lock().await;
+            let mut success = true;
+
+            if req.term > state.current_term {
+                state.current_term = req.term;
+                state.role = Role::Follower;
+                state.voted_for = None;
+                success = false;
+            }
+
+            (state.current_term, success)
+        };
+
+        AppendEntriesResponse {
+            term: current_term,
+            success,
+        }
+    }
+    async fn request_vote(
+        req: &RequestVoteRequest,
+        state: Arc<Mutex<RaftState<Order>>>,
+    ) -> RequestVoteResponse {
+        let (current_term, vote_granted) = {
+            let mut state = state.lock().await;
+
+            if req.term > state.current_term {
+                state.current_term = req.term;
+                state.role = Role::Follower;
+                state.voted_for = None;
+            }
+
+            tracing::info!(id=?state.id, request.body=?req, "Command::RequestVote");
+
+            let vote_granted = if req.term < state.current_term {
+                false
+            } else if state.voted_for.is_some() && state.voted_for.unwrap() != req.candidate_id {
+                false
+            } else {
+                let last_log_term = state.get_last_log_term();
+                let last_log_idx = state.get_last_log_idx();
+
+                let log_is_up_to_date = if req.last_log_term != last_log_term {
+                    req.last_log_term > last_log_term
+                } else {
+                    req.last_log_index >= last_log_idx
+                };
+
+                if log_is_up_to_date {
+                    state.voted_for = Some(req.candidate_id);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            (state.current_term, vote_granted)
+        };
+
+        RequestVoteResponse {
+            term: current_term,
+            vote_granted,
+        }
+    }
     async fn rpc_handler(
         state: Arc<Mutex<RaftState<Order>>>,
         mut rx: mpsc::Receiver<Command>,
-        heartbeat_tx: mpsc::UnboundedSender<(u32,u32)>,
+        heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
     ) -> anyhow::Result<()> {
         while let Some(command) = rx.recv().await {
             match command {
                 Command::AppendEntries(req, tx) => {
-                    let (id, current_term, success) = {
-                        let mut state = state.lock().await;
-
-                        if req.term > state.current_term {
-                            state.current_term = req.term;
-                            state.role = Role::Follower;
-                            state.voted_for = None;
-                        }
-
-                        (state.id, state.current_term, true)
-                    };
-
-                    tx.send(AppendEntriesResponse {
-                        term: current_term,
-                        success,
-                    })
-                    .expect("failed to send append entries response");
-                    // TODO: handle this erorr
-                    //   called `Result::unwrap()` on an `Err` value: SendError { .. }
-                    //   WARN ikada::server: Failed to send request vote: the connection to the server was already shutdown
-                    heartbeat_tx.send((id, current_term)).expect("failed to send append notification");
+                    let resp =
+                        Self::append_entries(&req, Arc::clone(&state)).await;
+                        let (id, current_term) = {
+                            let state = state.lock().await;
+                            (state.id, state.current_term)
+                        };
+                        tx.send(resp).expect(
+                            "failed to send append entries response",
+                        );
+                        heartbeat_tx
+                            .send((id, current_term))
+                            .expect("failed to send append notification");
                 }
                 Command::RequestVote(req, tx) => {
-                    let (current_term, vote_granted) = {
-                        let mut state = state.lock().await;
-
-                        if req.term > state.current_term {
-                            state.current_term = req.term;
-                            state.role = Role::Follower;
-                            state.voted_for = None;
-                        }
-
-                        tracing::info!(id=?state.id, request.body=?req, "Command::RequestVote");
-
-                        // !(term < currentTerm)
-                        let vote_granted = if req.term >= state.current_term {
-                            state.voted_for = Some(req.candidate_id);
-                            true
-                        } else {
-                            state.voted_for.is_none()
-                                || state.voted_for.unwrap() == req.candidate_id
-                        };
-
-                        (state.current_term, vote_granted)
-                    };
-
-                    tx.send(RequestVoteResponse {
-                        term: current_term,
-                        vote_granted,
-                    })
-                    .expect("failed to send request vote response");
-                }
+                    let resp =
+                        Self::request_vote(&req, Arc::clone(&state)).await;
+                    tx.send(resp).expect(
+                        "failed to send append entries response",
+                    );
+               }
             }
         }
         Ok(())
@@ -225,7 +260,7 @@ impl Node {
     }
     async fn run_follower(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.election_timeout;
-        let watchdog = WatchDog::new();
+        let watchdog = WatchDog::default();
 
         // 最初に実行されないように wait して timeout を設定する
         watchdog.wait().await;
@@ -250,7 +285,7 @@ impl Node {
     }
     async fn run_candidate(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.election_timeout;
-        let watchdog = WatchDog::new();
+        let watchdog = WatchDog::default();
         loop {
             if !matches!(self.state.lock().await.role, Role::Candidate) {
                 break;
@@ -275,7 +310,7 @@ impl Node {
     }
     async fn run_leader(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.heartbeat_interval;
-        let watchdog = WatchDog::new();
+        let watchdog = WatchDog::default();
         loop {
             if !matches!(self.state.lock().await.role, Role::Leader) {
                 break;
@@ -337,7 +372,11 @@ impl Node {
             return Ok(());
         }
 
-        let peers: Vec<_> = self.peers.iter().map(|(addr, client)| (*addr, client.clone())).collect();
+        let peers: Vec<_> = self
+            .peers
+            .iter()
+            .map(|(addr, client)| (*addr, client.clone()))
+            .collect();
         let rpc_timeout = self.config.rpc_timeout;
 
         tracing::info!(
@@ -355,7 +394,12 @@ impl Node {
                 last_log_index,
                 last_log_term,
             };
-            tasks.spawn(Self::send_request_vote(addr, client, req, rpc_timeout));
+            tasks.spawn(Self::send_request_vote(
+                addr,
+                client,
+                req,
+                rpc_timeout,
+            ));
         }
 
         while let Some(result) = tasks.join_next().await {
@@ -430,7 +474,8 @@ impl Node {
         let mut ctx = tarpc::context::current();
         ctx.deadline = Instant::now() + rpc_timeout;
 
-        client.request_vote(ctx, req.clone())
+        client
+            .request_vote(ctx, req.clone())
             .instrument(tracing::info_span!(
                 "request vote from candidate {}",
                 req.candidate_id
@@ -453,19 +498,30 @@ impl Node {
             let last_index = state.get_last_log_idx();
             (state.current_term, state.id, last_index, last_index + 1)
         };
-        let peers: Vec<_> = self.peers.iter().map(|(addr, client)| (*addr, client.clone())).collect();
+        let peers: Vec<_> = self
+            .peers
+            .iter()
+            .map(|(addr, client)| (*addr, client.clone()))
+            .collect();
         let rpc_timeout = self.config.rpc_timeout;
 
         // TODO: optimize algorithm: should be gossip?
         let mut tasks = JoinSet::new();
         for (server, client) in peers {
-            tasks.spawn(Self::send_heartbeat(server, client, term, leader_id, rpc_timeout));
+            tasks.spawn(Self::send_heartbeat(
+                server,
+                client,
+                term,
+                leader_id,
+                rpc_timeout,
+            ));
         }
 
         while let Some(result) = tasks.join_next().await {
             match result? {
                 Ok((server, res)) => {
-                    self.handle_heartbeat(server, res, match_index, last_index).await?;
+                    self.handle_heartbeat(server, res, match_index, last_index)
+                        .await?;
                 }
                 Err(e) => {
                     tracing::warn!("Failed to send heartbeat: {:?}", e);
@@ -494,9 +550,7 @@ impl Node {
         ctx.deadline = Instant::now() + rpc_timeout;
         let res = client
             .append_entries(ctx, req.clone())
-            .instrument(tracing::info_span!(
-                "append entries to {server}"
-            ))
+            .instrument(tracing::info_span!("append entries to {server}"))
             .await?;
         Ok((server, res))
     }
@@ -528,8 +582,7 @@ impl Node {
             let state = self.state.lock().await;
             (state.id, state.role, state.current_term)
         };
-        if matches!(role, Role::Leader) && current_term != res.term
-        {
+        if matches!(role, Role::Leader) && current_term != res.term {
             return Ok(());
         }
 
@@ -538,12 +591,19 @@ impl Node {
             if res.success {
                 // TODO: commit all logs before last_index
                 state.match_index.insert(addr, last_index);
-                state.next_index.insert(addr, last_index+1);
+                state.next_index.insert(addr, last_index + 1);
             } else {
                 tracing::warn!(id=?id, response.body=?res, "AppendEntries was rejected: old entries");
-                let new_match_index = state.match_index.get(&addr).copied().unwrap_or(last_index).saturating_sub(1);
+                let new_match_index = state
+                    .match_index
+                    .get(&addr)
+                    .copied()
+                    .unwrap_or(last_index)
+                    .saturating_sub(1);
                 state.match_index.insert(addr, new_match_index);
-                state.next_index.insert(addr, new_match_index.saturating_sub(1));
+                state
+                    .next_index
+                    .insert(addr, new_match_index.saturating_sub(1));
             }
         }
         // TODO: res.nextIdx <= lastIdx then should retry
@@ -804,6 +864,35 @@ mod test {
         let final_state = state.lock().await;
         assert_eq!(final_state.current_term, 100);
         assert_eq!(final_state.role, Role::Follower);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_vote_rejected_by_older_log_term() -> anyhow::Result<()> {
+        let mut initial_state = RaftState::new(1);
+        initial_state.current_term = 10;
+        initial_state.log.push(raft::Entry {
+            term: 5,
+            command: Order {},
+        });
+        let state = Arc::new(Mutex::new(initial_state));
+
+        // a request which have a old term log
+        let req = RequestVoteRequest {
+            term: 10,
+            candidate_id: 2,
+            last_log_index: 1,
+            last_log_term: 3,
+        };
+
+        let response = Node::request_vote(&req, state.clone()).await;
+
+        assert_eq!(response.vote_granted, false);
+        assert_eq!(response.term, 10);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.voted_for, None);
 
         Ok(())
     }

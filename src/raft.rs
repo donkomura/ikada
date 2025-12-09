@@ -57,6 +57,9 @@ impl<T> RaftState<T> {
         self.log.len() as u32
     }
     pub fn get_last_log_term(&self) -> u32 {
-        self.log.last().map(|e| e.term).unwrap_or(0) as u32
+        self.log.last().map(|e| e.term).unwrap_or(0)
+    }
+    pub fn get_last_voted_term(&self) -> u32 {
+        0u32
     }
 }
