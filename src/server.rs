@@ -160,7 +160,6 @@ impl Node {
                     let (current_term, vote_granted) = {
                         let mut state = state.lock().await;
 
-                        // RPC受信時のterm比較: req.term > currentTermの場合
                         if req.term > state.current_term {
                             state.current_term = req.term;
                             state.role = Role::Follower;
@@ -341,16 +340,22 @@ impl Node {
         let peers: Vec<_> = self.peers.iter().map(|(addr, client)| (*addr, client.clone())).collect();
         let rpc_timeout = self.config.rpc_timeout;
 
+        tracing::info!(
+            candidate_id = candidate_id,
+            peer_count = peers.len(),
+            "sending request_vote to peers"
+        );
+
         // TODO: should we send in gossip protocol?
         let mut tasks = JoinSet::new();
-        for (_, client) in peers {
+        for (addr, client) in peers {
             let req = RequestVoteRequest {
                 term: current_term,
                 candidate_id,
                 last_log_index,
                 last_log_term,
             };
-            tasks.spawn(Self::send_request_vote(client, req, rpc_timeout));
+            tasks.spawn(Self::send_request_vote(addr, client, req, rpc_timeout));
         }
 
         while let Some(result) = tasks.join_next().await {
@@ -359,9 +364,12 @@ impl Node {
                     responses.push(res);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to send request vote: {:?}", e);
-                    // should retry
-                    return Err(e);
+                    tracing::warn!(
+                        candidate_id = candidate_id,
+                        error = ?e,
+                        "Failed to send request vote"
+                    );
+                    continue;
                 }
             }
         }
@@ -414,20 +422,29 @@ impl Node {
         Ok(())
     }
     async fn send_request_vote(
+        peer_addr: SocketAddr,
         client: RaftRpcClient,
         req: RequestVoteRequest,
         rpc_timeout: Duration,
     ) -> anyhow::Result<RequestVoteResponse> {
         let mut ctx = tarpc::context::current();
         ctx.deadline = Instant::now() + rpc_timeout;
-        let res = client
-            .request_vote(ctx, req.clone())
+
+        client.request_vote(ctx, req.clone())
             .instrument(tracing::info_span!(
                 "request vote from candidate {}",
                 req.candidate_id
             ))
-            .await?;
-        Ok(res)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    candidate_id = req.candidate_id,
+                    peer_addr = ?peer_addr,
+                    error = ?e,
+                    "request_vote RPC failed to peer"
+                );
+                e.into()
+            })
     }
     /// replicate logs to each peer
     async fn broadcast_heartbeat(&mut self) -> anyhow::Result<bool> {
@@ -452,17 +469,6 @@ impl Node {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to send heartbeat: {:?}", e);
-                    match e.downcast_ref() {
-                        Some(&tarpc::client::RpcError::DeadlineExceeded) => {
-                            tracing::warn!("Append Entries RPC was timedout");
-                        },
-                        Some(&tarpc::client::RpcError::Shutdown) => {
-                            tracing::warn!("SHUTDOWN");
-                        }
-                        _ => {
-                            return Err(e);
-                        }
-                    }
                 }
             }
         }
@@ -666,7 +672,7 @@ mod test {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send(()).unwrap();
+        heartbeat_tx.send((1, 1)).unwrap();
         tokio::task::yield_now().await;
 
         // 2回目: さらに800ms経過後にheartbeat（リセットから800ms）
@@ -674,7 +680,7 @@ mod test {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send(()).unwrap();
+        heartbeat_tx.send((1, 1)).unwrap();
         tokio::task::yield_now().await;
 
         // 3回目: さらに800ms経過後にheartbeat（リセットから800ms）
@@ -682,7 +688,7 @@ mod test {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send(()).unwrap();
+        heartbeat_tx.send((1, 1)).unwrap();
         tokio::task::yield_now().await;
 
         // heartbeat停止: 1100ms経過でタイムアウト
@@ -709,7 +715,7 @@ mod test {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send(()).unwrap();
+        heartbeat_tx.send((1, 1)).unwrap();
         tokio::task::yield_now().await;
 
         // 2回目: さらに800ms経過後にheartbeat（リセットから800ms）
@@ -717,7 +723,7 @@ mod test {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send(()).unwrap();
+        heartbeat_tx.send((1, 1)).unwrap();
         tokio::task::yield_now().await;
 
         // heartbeat停止: 1100ms経過でタイムアウト
