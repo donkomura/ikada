@@ -271,8 +271,8 @@ impl Node {
                 );
                 false
             } else {
-                let last_log_entry = state.get_last_log_entry();
-                let last_log_term = last_log_entry.map(|e| e.term).unwrap_or(0);
+                // check the log is latest
+                let last_log_term = state.get_last_log_term();
                 let last_log_idx = state.get_last_log_idx();
 
                 let log_is_up_to_date = if req.last_log_term != last_log_term {
