@@ -6,6 +6,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+bytes = "1.11.0"
 futures = "0.3"
 opentelemetry = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }

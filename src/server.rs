@@ -1,6 +1,7 @@
 use crate::raft::{self, RaftState, Role};
 use crate::rpc::*;
 use crate::watchdog::WatchDog;
+use bytes;
 use futures::{future, prelude::*};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -35,20 +36,19 @@ pub struct Config {
     pub rpc_timeout: Duration,
 }
 
-#[derive(Debug)]
-pub struct Order {}
+type Data = bytes::Bytes;
 
 pub struct Chan {
     heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
     heartbeat_rx: mpsc::UnboundedReceiver<(u32, u32)>,
-    client_tx: mpsc::Sender<Order>,
-    client_rx: mpsc::Receiver<Order>,
+    client_tx: mpsc::Sender<Data>,
+    client_rx: mpsc::Receiver<Data>,
 }
 
 impl Default for Chan {
     fn default() -> Self {
         let (heartbeat_tx, heartbeat_rx) = mpsc::unbounded_channel();
-        let (client_tx, client_rx) = mpsc::channel::<Order>(32);
+        let (client_tx, client_rx) = mpsc::channel::<Data>(32);
         Self {
             heartbeat_tx,
             heartbeat_rx,
@@ -62,7 +62,7 @@ pub struct Node {
     config: Config,
     peers: HashMap<SocketAddr, RaftRpcClient>,
     server_addr: SocketAddr,
-    state: Arc<Mutex<RaftState<Order>>>,
+    state: Arc<Mutex<RaftState<Data>>>,
     c: Chan,
 }
 
@@ -127,7 +127,7 @@ impl Node {
     }
     async fn append_entries(
         req: &AppendEntriesRequest,
-        state: Arc<Mutex<RaftState<Order>>>,
+        state: Arc<Mutex<RaftState<Data>>>,
     ) -> AppendEntriesResponse {
         let (current_term, success) = {
             let mut state = state.lock().await;
@@ -150,7 +150,7 @@ impl Node {
     }
     async fn request_vote(
         req: &RequestVoteRequest,
-        state: Arc<Mutex<RaftState<Order>>>,
+        state: Arc<Mutex<RaftState<Data>>>,
     ) -> RequestVoteResponse {
         let (current_term, vote_granted) = {
             let mut state = state.lock().await;
@@ -172,7 +172,9 @@ impl Node {
                     "RequestVote rejected: candidate term is older"
                 );
                 false
-            } else if state.voted_for.is_some() && state.voted_for.unwrap() != req.candidate_id {
+            } else if state.voted_for.is_some()
+                && state.voted_for.unwrap() != req.candidate_id
+            {
                 tracing::warn!(
                     id=?state.id,
                     candidate_id=req.candidate_id,
@@ -217,7 +219,7 @@ impl Node {
         }
     }
     async fn rpc_handler(
-        state: Arc<Mutex<RaftState<Order>>>,
+        state: Arc<Mutex<RaftState<Data>>>,
         mut rx: mpsc::Receiver<Command>,
         heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
     ) -> anyhow::Result<()> {
@@ -226,24 +228,27 @@ impl Node {
                 Command::AppendEntries(req, tx) => {
                     let resp =
                         Self::append_entries(&req, Arc::clone(&state)).await;
-                        let (id, current_term) = {
-                            let state = state.lock().await;
-                            (state.id, state.current_term)
-                        };
-                        tx.send(resp).expect(
-                            "failed to send append entries response",
-                        );
-                        heartbeat_tx
-                            .send((id, current_term))
-                            .expect("failed to send append notification");
+                    let (id, current_term) = {
+                        let state = state.lock().await;
+                        (state.id, state.current_term)
+                    };
+                    tx.send(resp)
+                        .expect("failed to send append entries response");
+
+                    // if we get the heartbeat from leader,
+                    // we need to:
+                    //   change the state from candidate to follower
+                    //   reset the election timer
+                    heartbeat_tx
+                        .send((id, current_term))
+                        .expect("failed to send append notification");
                 }
                 Command::RequestVote(req, tx) => {
                     let resp =
                         Self::request_vote(&req, Arc::clone(&state)).await;
-                    tx.send(resp).expect(
-                        "failed to send append entries response",
-                    );
-               }
+                    tx.send(resp)
+                        .expect("failed to send append entries response");
+                }
             }
         }
         Ok(())
@@ -317,8 +322,9 @@ impl Node {
                 Some((id, term)) = self.c.heartbeat_rx.recv() => {
                     let current_term = self.state.lock().await.current_term;
                     if term >= current_term {
-                        // the headbeat is accepted
+                        // the headbeat is accepted in candidate state
                         // requester is a new leader
+                        // and this node become a follower
                         self.state.lock().await.leader_id = Some(id);
                         self.become_follower().await?;
                     }
@@ -450,8 +456,20 @@ impl Node {
         &mut self,
         responses: Vec<RequestVoteResponse>,
     ) -> anyhow::Result<()> {
-        let id = self.state.lock().await.id;
+        let (id, current_term) = {
+            let state = self.state.lock().await;
+            (state.id, state.current_term)
+        };
         tracing::info!(id=id, responses=?responses, "election handled");
+
+        let new_terms: Vec<_> = responses.iter().filter(|r| r.term > current_term).collect();
+        if !new_terms.is_empty() {
+            tracing::info!(id=&id, term=&current_term, "newer term was discovered");
+            self.state.lock().await.current_term = new_terms.first().unwrap().term;
+            self.become_follower().await?;
+            return Ok(());
+        }
+
         // 投票が過半数か (peers + 自分自身)
         let total_nodes = self.peers.len() + 1;
         let vote_granted = responses.iter().filter(|r| r.vote_granted).count()
@@ -892,12 +910,13 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_request_vote_rejected_by_older_log_term() -> anyhow::Result<()> {
+    async fn test_request_vote_rejected_by_older_log_term() -> anyhow::Result<()>
+    {
         let mut initial_state = RaftState::new(1);
         initial_state.current_term = 10;
         initial_state.log.push(raft::Entry {
             term: 5,
-            command: Order {},
+            command: Data {},
         });
         let state = Arc::new(Mutex::new(initial_state));
 
@@ -921,13 +940,23 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_request_vote_log_index_comparison_with_same_term() -> anyhow::Result<()> {
+    async fn test_request_vote_log_index_comparison_with_same_term()
+    -> anyhow::Result<()> {
         // ケース1: 同じterm、同じindex → 投票される
         let mut state1 = RaftState::new(1);
         state1.current_term = 10;
-        state1.log.push(raft::Entry { term: 5, command: Order {} });
-        state1.log.push(raft::Entry { term: 5, command: Order {} });
-        state1.log.push(raft::Entry { term: 5, command: Order {} });
+        state1.log.push(raft::Entry {
+            term: 5,
+            command: Data {},
+        });
+        state1.log.push(raft::Entry {
+            term: 5,
+            command: Data {},
+        });
+        state1.log.push(raft::Entry {
+            term: 5,
+            command: Data {},
+        });
         let state1 = Arc::new(Mutex::new(state1));
         let req1 = RequestVoteRequest {
             term: 10,
@@ -936,15 +965,27 @@ mod test {
             last_log_term: 5,
         };
         let response1 = Node::request_vote(&req1, state1.clone()).await;
-        assert_eq!(response1.vote_granted, true, "Same term and same index should grant vote");
+        assert_eq!(
+            response1.vote_granted, true,
+            "Same term and same index should grant vote"
+        );
         assert_eq!(state1.lock().await.voted_for, Some(2));
 
         // ケース2: 同じterm、候補者のindexが長い → 投票される
         let mut state2 = RaftState::new(1);
         state2.current_term = 10;
-        state2.log.push(raft::Entry { term: 5, command: Order {} });
-        state2.log.push(raft::Entry { term: 5, command: Order {} });
-        state2.log.push(raft::Entry { term: 5, command: Order {} });
+        state2.log.push(raft::Entry {
+            term: 5,
+            command: Data {},
+        });
+        state2.log.push(raft::Entry {
+            term: 5,
+            command: Data {},
+        });
+        state2.log.push(raft::Entry {
+            term: 5,
+            command: Data {},
+        });
         let state2 = Arc::new(Mutex::new(state2));
         let req2 = RequestVoteRequest {
             term: 10,
@@ -953,15 +994,27 @@ mod test {
             last_log_term: 5,
         };
         let response2 = Node::request_vote(&req2, state2.clone()).await;
-        assert_eq!(response2.vote_granted, true, "Same term and longer index should grant vote");
+        assert_eq!(
+            response2.vote_granted, true,
+            "Same term and longer index should grant vote"
+        );
         assert_eq!(state2.lock().await.voted_for, Some(3));
 
         // ケース3: 同じterm、候補者のindexが短い → 拒否される
         let mut state3 = RaftState::new(1);
         state3.current_term = 10;
-        state3.log.push(raft::Entry { term: 5, command: Order {} });
-        state3.log.push(raft::Entry { term: 5, command: Order {} });
-        state3.log.push(raft::Entry { term: 5, command: Order {} });
+        state3.log.push(raft::Entry {
+            term: 5,
+            command: Data {},
+        });
+        state3.log.push(raft::Entry {
+            term: 5,
+            command: Data {},
+        });
+        state3.log.push(raft::Entry {
+            term: 5,
+            command: Data {},
+        });
         let state3 = Arc::new(Mutex::new(state3));
         let req3 = RequestVoteRequest {
             term: 10,
@@ -970,7 +1023,10 @@ mod test {
             last_log_term: 5,
         };
         let response3 = Node::request_vote(&req3, state3.clone()).await;
-        assert_eq!(response3.vote_granted, false, "Same term and shorter index should reject vote");
+        assert_eq!(
+            response3.vote_granted, false,
+            "Same term and shorter index should reject vote"
+        );
         assert_eq!(state3.lock().await.voted_for, None);
 
         Ok(())

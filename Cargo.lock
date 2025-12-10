@@ -492,6 +492,7 @@ name = "ikada"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
