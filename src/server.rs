@@ -129,23 +129,111 @@ impl Node {
         req: &AppendEntriesRequest,
         state: Arc<Mutex<RaftState<Data>>>,
     ) -> AppendEntriesResponse {
-        let (current_term, success) = {
-            let mut state = state.lock().await;
-            let mut success = true;
+        let mut state = state.lock().await;
+        if req.term < state.current_term {
+            tracing::warn!(
+                id=?state.id,
+                req_term=req.term,
+                current_term=state.current_term,
+                "AppendEntries rejected: request term is older than current term"
+            );
+            return AppendEntriesResponse {
+                term: state.current_term,
+                success: false,
+            };
+        }
 
-            if req.term > state.current_term {
-                state.current_term = req.term;
-                state.role = Role::Follower;
-                state.voted_for = None;
-                success = false;
+        if req.term > state.current_term {
+            state.current_term = req.term;
+            state.role = Role::Follower;
+            state.voted_for = None;
+        }
+
+        if req.prev_log_index > 0 {
+            if req.prev_log_index > state.get_last_log_idx() {
+                tracing::warn!(
+                    id=?state.id,
+                    prev_log_index=req.prev_log_index,
+                    last_log_idx=state.get_last_log_idx(),
+                    "AppendEntries rejected: prev_log_index exceeds log length"
+                );
+                return AppendEntriesResponse {
+                    term: state.current_term,
+                    success: false,
+                };
             }
 
-            (state.current_term, success)
-        };
+            let prev_log_entry = &state.log[(req.prev_log_index - 1) as usize];
+            if prev_log_entry.term != req.prev_log_term {
+                tracing::warn!(
+                    id=?state.id,
+                    prev_log_index=req.prev_log_index,
+                    prev_log_term=req.prev_log_term,
+                    actual_term=prev_log_entry.term,
+                    "AppendEntries rejected: prev_log_term mismatch"
+                );
+                return AppendEntriesResponse {
+                    term: state.current_term,
+                    success: false,
+                };
+            }
+        }
+
+        // If an existing entry conflicts with a new one (same index but different terms),
+        // delete the existing entry and all that follow it (§5.3)
+        for (i, rpc_entry) in req.entries.iter().enumerate() {
+            let log_index = req.prev_log_index + 1 + i as u32;
+
+            // Check if this index exists in the log
+            if log_index <= state.get_last_log_idx() {
+                let existing_term = state.log[(log_index - 1) as usize].term;
+
+                // If terms don't match, there's a conflict
+                if existing_term != rpc_entry.term {
+                    // Delete the conflicting entry and all that follow
+                    state.log.truncate((log_index - 1) as usize);
+                    tracing::info!(
+                        id=?state.id,
+                        conflict_index=log_index,
+                        old_term=existing_term,
+                        new_term=rpc_entry.term,
+                        "Truncated log due to conflict"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Append any new entries not already in the log (§5.3)
+        let start_index = req.prev_log_index + 1;
+        for (i, rpc_entry) in req.entries.iter().enumerate() {
+            let log_index = start_index + i as u32;
+
+            // Only append if this entry doesn't exist yet
+            if log_index > state.get_last_log_idx() {
+                let entry = raft::Entry {
+                    term: rpc_entry.term,
+                    command: bytes::Bytes::from(rpc_entry.command.clone()),
+                };
+                state.log.push(entry);
+            }
+        }
+
+        // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+        if req.leader_commit > state.commit_index {
+            state.commit_index =
+                req.leader_commit.min(state.get_last_log_idx());
+            tracing::debug!(
+                id=?state.id,
+                new_commit_index=state.commit_index,
+                leader_commit=req.leader_commit,
+                "Updated commit_index"
+            );
+        }
 
         AppendEntriesResponse {
-            term: current_term,
-            success,
+            term: state.current_term,
+            success: true,
         }
     }
     async fn request_vote(
@@ -462,10 +550,16 @@ impl Node {
         };
         tracing::info!(id=id, responses=?responses, "election handled");
 
-        let new_terms: Vec<_> = responses.iter().filter(|r| r.term > current_term).collect();
+        let new_terms: Vec<_> =
+            responses.iter().filter(|r| r.term > current_term).collect();
         if !new_terms.is_empty() {
-            tracing::info!(id=&id, term=&current_term, "newer term was discovered");
-            self.state.lock().await.current_term = new_terms.first().unwrap().term;
+            tracing::info!(
+                id = &id,
+                term = &current_term,
+                "newer term was discovered"
+            );
+            self.state.lock().await.current_term =
+                new_terms.first().unwrap().term;
             self.become_follower().await?;
             return Ok(());
         }
@@ -916,7 +1010,7 @@ mod test {
         initial_state.current_term = 10;
         initial_state.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         let state = Arc::new(Mutex::new(initial_state));
 
@@ -947,15 +1041,15 @@ mod test {
         state1.current_term = 10;
         state1.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         state1.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         state1.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         let state1 = Arc::new(Mutex::new(state1));
         let req1 = RequestVoteRequest {
@@ -976,15 +1070,15 @@ mod test {
         state2.current_term = 10;
         state2.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         state2.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         state2.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         let state2 = Arc::new(Mutex::new(state2));
         let req2 = RequestVoteRequest {
@@ -1005,15 +1099,15 @@ mod test {
         state3.current_term = 10;
         state3.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         state3.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         state3.log.push(raft::Entry {
             term: 5,
-            command: Data {},
+            command: Data::new(),
         });
         let state3 = Arc::new(Mutex::new(state3));
         let req3 = RequestVoteRequest {
@@ -1028,6 +1122,132 @@ mod test {
             "Same term and shorter index should reject vote"
         );
         assert_eq!(state3.lock().await.voted_for, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_conflict_resolution() -> anyhow::Result<()> {
+        // フォロワーの初期ログ: [entry1(term=1), entry2(term=1), entry3(term=2), entry4(term=2)]
+        let mut follower_state = RaftState::new(1);
+        follower_state.current_term = 3;
+        follower_state.log.push(raft::Entry {
+            term: 1,
+            command: Data::from(&b"cmd1"[..]),
+        });
+        follower_state.log.push(raft::Entry {
+            term: 1,
+            command: Data::from(&b"cmd2"[..]),
+        });
+        follower_state.log.push(raft::Entry {
+            term: 2,
+            command: Data::from(&b"cmd3_old"[..]),
+        });
+        follower_state.log.push(raft::Entry {
+            term: 2,
+            command: Data::from(&b"cmd4_old"[..]),
+        });
+        let state = Arc::new(Mutex::new(follower_state));
+
+        // リーダーからのリクエスト: prev_log_term: 1, prev_logprev_log_index=2, entries=[entry3(term=3), entry4(term=3), entry5(term=3)]
+        let req = AppendEntriesRequest {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 2,
+            prev_log_term: 1,
+            entries: vec![
+                LogEntry {
+                    term: 3,
+                    command: b"cmd3_new".to_vec(),
+                },
+                LogEntry {
+                    term: 3,
+                    command: b"cmd4_new".to_vec(),
+                },
+                LogEntry {
+                    term: 3,
+                    command: b"cmd5_new".to_vec(),
+                },
+            ],
+            leader_commit: 0,
+        };
+
+        let response = Node::append_entries(&req, state.clone()).await;
+
+        // レスポンスは成功
+        assert_eq!(response.success, true);
+        assert_eq!(response.term, 3);
+
+        // ログの検証
+        let final_state = state.lock().await;
+        assert_eq!(final_state.log.len(), 5, "Log should have 5 entries");
+
+        // 最初の2つは変更なし
+        assert_eq!(final_state.log[0].term, 1);
+        assert_eq!(final_state.log[0].command.as_ref(), b"cmd1");
+        assert_eq!(final_state.log[1].term, 1);
+        assert_eq!(final_state.log[1].command.as_ref(), b"cmd2");
+
+        // 競合したエントリは新しいもので置き換えられている
+        assert_eq!(final_state.log[2].term, 3);
+        assert_eq!(final_state.log[2].command.as_ref(), b"cmd3_new");
+        assert_eq!(final_state.log[3].term, 3);
+        assert_eq!(final_state.log[3].command.as_ref(), b"cmd4_new");
+
+        // 新しいエントリが追加されている
+        assert_eq!(final_state.log[4].term, 3);
+        assert_eq!(final_state.log[4].command.as_ref(), b"cmd5_new");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_no_conflict_append_only() -> anyhow::Result<()>
+    {
+        // フォロワーの初期ログ: [entry1(term=1), entry2(term=1)]
+        let mut follower_state = RaftState::new(1);
+        follower_state.current_term = 2;
+        follower_state.log.push(raft::Entry {
+            term: 1,
+            command: Data::from(&b"cmd1"[..]),
+        });
+        follower_state.log.push(raft::Entry {
+            term: 1,
+            command: Data::from(&b"cmd2"[..]),
+        });
+        let state = Arc::new(Mutex::new(follower_state));
+
+        // リーダーからのリクエスト: prev_log_term: 1, prev_log_index=2, entries=[entry3(term=2), entry4(term=2)]
+        let req = AppendEntriesRequest {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 2,
+            prev_log_term: 1,
+            entries: vec![
+                LogEntry {
+                    term: 2,
+                    command: b"cmd3".to_vec(),
+                },
+                LogEntry {
+                    term: 2,
+                    command: b"cmd4".to_vec(),
+                },
+            ],
+            leader_commit: 0,
+        };
+
+        let response = Node::append_entries(&req, state.clone()).await;
+
+        // レスポンスは成功
+        assert_eq!(response.success, true);
+
+        // ログの検証: 新しいエントリが追加されている
+        let final_state = state.lock().await;
+        assert_eq!(final_state.log.len(), 4);
+        assert_eq!(final_state.log[2].term, 2);
+        assert_eq!(final_state.log[2].command.as_ref(), b"cmd3");
+        assert_eq!(final_state.log[3].term, 2);
+        assert_eq!(final_state.log[3].command.as_ref(), b"cmd4");
 
         Ok(())
     }
