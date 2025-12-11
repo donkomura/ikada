@@ -341,7 +341,17 @@ impl Node {
         }
         Ok(())
     }
+    async fn connect_to_peer(&mut self, addr: SocketAddr) -> anyhow::Result<()> {
+        let transport = tarpc::serde_transport::tcp::connect(addr, Json::default).await?;
+        let client = RaftRpcClient::new(client::Config::default(), transport).spawn();
+        self.peers.insert(addr, client);
+        Ok(())
+    }
+
     async fn setup(&mut self) -> anyhow::Result<()> {
+        let node_id = self.state.lock().await.id;
+
+        // Initial connection
         for server in self.config.servers.clone() {
             if server == self.server_addr {
                 continue;
@@ -349,14 +359,43 @@ impl Node {
             if self.peers.contains_key(&server) {
                 continue;
             }
-            let transport =
-                tarpc::serde_transport::tcp::connect(server, Json::default)
-                    .await?;
-            let client =
-                RaftRpcClient::new(client::Config::default(), transport)
-                    .spawn();
-            self.peers.insert(server, client);
+            tracing::info!("Node {} attempting to connect to peer {:?}", node_id, server);
+            self.connect_to_peer(server).await?;
+            tracing::info!("Node {} successfully connected to peer {:?}", node_id, server);
         }
+
+        // Verify connections
+        tracing::info!("Node {} verifying connections to {} peers", node_id, self.peers.len());
+        let mut failed_peers = Vec::new();
+
+        for (addr, client) in self.peers.clone() {
+            let mut ctx = tarpc::context::current();
+            ctx.deadline = Instant::now() + Duration::from_secs(2);
+            match client.echo(ctx, "connection_check".to_string()).await {
+                Ok(_resp) => {
+                    tracing::info!("Node {} connection to {:?} verified", node_id, addr);
+                }
+                Err(e) => {
+                    tracing::error!("Node {} connection to {:?} verification failed: {:?}", node_id, addr, e);
+                    failed_peers.push(addr);
+                }
+            }
+        }
+
+        // Reconnect to failed peers
+        for addr in failed_peers {
+            tracing::info!("Node {} attempting to reconnect to {:?}", node_id, addr);
+            match self.connect_to_peer(addr).await {
+                Ok(_) => {
+                    tracing::info!("Node {} successfully reconnected to {:?}", node_id, addr);
+                }
+                Err(e) => {
+                    tracing::error!("Node {} failed to reconnect to {:?}: {:?}", node_id, addr, e);
+                }
+            }
+        }
+
+        tracing::info!("Node {} setup completed, {} peer connections established", node_id, self.peers.len());
         Ok(())
     }
     async fn main(mut self) -> anyhow::Result<()> {
