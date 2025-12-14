@@ -234,14 +234,12 @@ impl Node {
         }
 
         // Persist if log was modified
-        if log_modified {
-            if let Err(e) = state.persist().await {
-                tracing::error!(id=?state.id, error=?e, "Failed to persist state after log modification");
-                return AppendEntriesResponse {
-                    term: state.current_term,
-                    success: false,
-                };
-            }
+        if log_modified && let Err(e) = state.persist().await {
+            tracing::error!(id=?state.id, error=?e, "Failed to persist state after log modification");
+            return AppendEntriesResponse {
+                term: state.current_term,
+                success: false,
+            };
         }
 
         // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -760,35 +758,59 @@ impl Node {
     }
     /// replicate logs to each peer
     async fn broadcast_heartbeat(&mut self) -> anyhow::Result<bool> {
-        let (term, leader_id, match_index, last_index) = {
+        let (leader_term, leader_id, leader_commit) = {
             let state = self.state.lock().await;
-            let last_index = state.get_last_log_idx();
-            (state.current_term, state.id, last_index, last_index + 1)
+            (
+                state.current_term,
+                state.leader_id.unwrap(),
+                state.commit_index,
+            )
         };
-        let peers: Vec<_> = self
+        let mut requests = Vec::new();
+        for (addr, client) in self
             .peers
             .iter()
-            .map(|(addr, client)| (*addr, client.clone()))
-            .collect();
+            .map(|(addr, client)| (addr, client.clone()))
+        {
+            let state = self.state.lock().await;
+            let next_idx = state.next_index.get(addr).copied().unwrap_or(1);
+            let (prev_log_idx, prev_log_term) = if next_idx > 1 {
+                (next_idx - 1, state.log[(next_idx - 2) as usize].term)
+            } else {
+                (0, 0)
+            };
+            let entries: Vec<LogEntry> = state
+                .log
+                .iter()
+                .skip((next_idx - 1) as usize) // send logs after next_idx
+                .map(|e| LogEntry {
+                    term: e.term,
+                    command: e.command.to_vec(),
+                })
+                .collect();
+            let sent_up_to_index = prev_log_idx + entries.len() as u32;
+            requests.push((addr, client, prev_log_idx, prev_log_term, entries, sent_up_to_index));
+        }
         let rpc_timeout = self.config.rpc_timeout;
 
         // TODO: optimize algorithm: should be gossip?
         let mut tasks = JoinSet::new();
-        for (server, client) in peers {
-            tasks.spawn(Self::send_heartbeat(
-                server,
-                client,
-                term,
+        for (addr, client, prev_log_index, prev_log_term, entries, sent_up_to_index) in requests {
+            let req = AppendEntriesRequest {
+                term: leader_term,
                 leader_id,
-                rpc_timeout,
-            ));
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            };
+            tasks.spawn(Self::send_heartbeat(*addr, client, req, sent_up_to_index, rpc_timeout));
         }
 
         while let Some(result) = tasks.join_next().await {
             match result? {
-                Ok((server, res)) => {
-                    self.handle_heartbeat(server, res, match_index, last_index)
-                        .await?;
+                Ok((server, res, sent_up_to_index)) => {
+                    self.handle_heartbeat(server, res, sent_up_to_index).await?;
                 }
                 Err(e) => {
                     tracing::warn!("Failed to send heartbeat: {:?}", e);
@@ -801,25 +823,17 @@ impl Node {
     async fn send_heartbeat(
         server: SocketAddr,
         client: RaftRpcClient,
-        term: u32,
-        leader_id: u32,
+        req: AppendEntriesRequest,
+        sent_up_to_index: u32,
         rpc_timeout: Duration,
-    ) -> anyhow::Result<(SocketAddr, AppendEntriesResponse)> {
-        let req = AppendEntriesRequest {
-            term,
-            leader_id,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: Vec::new(),
-            leader_commit: 0,
-        };
+    ) -> anyhow::Result<(SocketAddr, AppendEntriesResponse, u32)> {
         let mut ctx = tarpc::context::current();
         ctx.deadline = Instant::now() + rpc_timeout;
         let res = client
             .append_entries(ctx, req.clone())
             .instrument(tracing::info_span!("append entries to {server}"))
             .await?;
-        Ok((server, res))
+        Ok((server, res, sent_up_to_index))
     }
     fn new_commit_index(
         current_commit_index: u32,
@@ -888,8 +902,7 @@ impl Node {
         &mut self,
         addr: SocketAddr,
         res: AppendEntriesResponse,
-        match_index: u32,
-        last_index: u32,
+        sent_up_to_index: u32,
     ) -> anyhow::Result<()> {
         let check_term = {
             let state = self.state.lock().await;
@@ -918,27 +931,34 @@ impl Node {
         {
             let mut state = self.state.lock().await;
             if res.success {
-                state.match_index.insert(addr, last_index);
-                state.next_index.insert(addr, last_index + 1);
+                // リクエストが成功したら index を更新する
+                // prev_log_index + log_len で計算される
+                state.match_index.insert(addr, sent_up_to_index);
+                state.next_index.insert(addr, sent_up_to_index + 1);
+
+                tracing::debug!(
+                    id=?id,
+                    peer=?addr,
+                    match_index=sent_up_to_index,
+                    next_index=sent_up_to_index + 1,
+                    "AppendEntries succeeded"
+                );
             } else {
-                tracing::warn!(id=?id, response.body=?res, "AppendEntries was rejected: old entries");
-                let new_match_index = state
-                    .match_index
-                    .get(&addr)
-                    .copied()
-                    .unwrap_or(last_index)
-                    .saturating_sub(1);
-                state.match_index.insert(addr, new_match_index);
-                state
-                    .next_index
-                    .insert(addr, new_match_index.saturating_sub(1));
+                let current_next_idx = state.next_index.get(&addr).copied().unwrap_or(1);
+                let new_next_idx = current_next_idx.saturating_sub(1).max(1);
+                state.next_index.insert(addr, new_next_idx);
+
+                tracing::warn!(
+                    id=?id,
+                    peer=?addr,
+                    old_next_index=current_next_idx,
+                    new_next_index=new_next_idx,
+                    "AppendEntries rejected, decrementing next_index"
+                );
             }
         }
 
-        // Update commit_index based on match_index
         self.update_commit_index().await?;
-        // TODO: res.nextIdx <= lastIdx then should retry
-        tracing::info!(id=?id, response.body=?res, "got heartbeat");
         Ok(())
     }
 }
