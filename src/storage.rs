@@ -5,7 +5,9 @@ use tokio::sync::Mutex;
 
 #[async_trait::async_trait]
 pub trait Storage<T>: Send + Sync + std::fmt::Debug
-    where T: Send + Sync + Clone {
+where
+    T: Send + Sync + Clone,
+{
     async fn save(&mut self, state: &PersistentState<T>) -> Result<()>;
     async fn load(&self) -> Result<Option<PersistentState<T>>>;
 }
@@ -20,17 +22,19 @@ impl<T: Send + Sync> std::fmt::Debug for MemStorage<T> {
     }
 }
 
-impl<T: Send + Sync> Default for MemStorage <T> {
+impl<T: Send + Sync> Default for MemStorage<T> {
     fn default() -> Self {
         Self {
-            data: Arc::new(Mutex::new(None))
+            data: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl<T> Storage<T> for MemStorage<T>
-    where T: Send + Sync + Clone {
+where
+    T: Send + Sync + Clone,
+{
     async fn save(&mut self, state: &PersistentState<T>) -> Result<()> {
         let mut d = self.data.lock().await;
         *d = Some(state.clone());
@@ -41,4 +45,3 @@ impl<T> Storage<T> for MemStorage<T>
         Ok(d.clone())
     }
 }
-

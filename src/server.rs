@@ -41,6 +41,7 @@ type Data = bytes::Bytes;
 pub struct Chan {
     heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
     heartbeat_rx: mpsc::UnboundedReceiver<(u32, u32)>,
+    #[allow(dead_code)]
     client_tx: mpsc::Sender<Data>,
     client_rx: mpsc::Receiver<Data>,
 }
@@ -379,9 +380,14 @@ impl Node {
         }
         Ok(())
     }
-    async fn connect_to_peer(&mut self, addr: SocketAddr) -> anyhow::Result<()> {
-        let transport = tarpc::serde_transport::tcp::connect(addr, Json::default).await?;
-        let client = RaftRpcClient::new(client::Config::default(), transport).spawn();
+    async fn connect_to_peer(
+        &mut self,
+        addr: SocketAddr,
+    ) -> anyhow::Result<()> {
+        let transport =
+            tarpc::serde_transport::tcp::connect(addr, Json::default).await?;
+        let client =
+            RaftRpcClient::new(client::Config::default(), transport).spawn();
         self.peers.insert(addr, client);
         Ok(())
     }
@@ -397,13 +403,25 @@ impl Node {
             if self.peers.contains_key(&server) {
                 continue;
             }
-            tracing::info!("Node {} attempting to connect to peer {:?}", node_id, server);
+            tracing::info!(
+                "Node {} attempting to connect to peer {:?}",
+                node_id,
+                server
+            );
             self.connect_to_peer(server).await?;
-            tracing::info!("Node {} successfully connected to peer {:?}", node_id, server);
+            tracing::info!(
+                "Node {} successfully connected to peer {:?}",
+                node_id,
+                server
+            );
         }
 
         // Verify connections
-        tracing::info!("Node {} verifying connections to {} peers", node_id, self.peers.len());
+        tracing::info!(
+            "Node {} verifying connections to {} peers",
+            node_id,
+            self.peers.len()
+        );
         let mut failed_peers = Vec::new();
 
         for (addr, client) in self.peers.clone() {
@@ -411,10 +429,19 @@ impl Node {
             ctx.deadline = Instant::now() + Duration::from_secs(2);
             match client.echo(ctx, "connection_check".to_string()).await {
                 Ok(_resp) => {
-                    tracing::info!("Node {} connection to {:?} verified", node_id, addr);
+                    tracing::info!(
+                        "Node {} connection to {:?} verified",
+                        node_id,
+                        addr
+                    );
                 }
                 Err(e) => {
-                    tracing::error!("Node {} connection to {:?} verification failed: {:?}", node_id, addr, e);
+                    tracing::error!(
+                        "Node {} connection to {:?} verification failed: {:?}",
+                        node_id,
+                        addr,
+                        e
+                    );
                     failed_peers.push(addr);
                 }
             }
@@ -422,18 +449,35 @@ impl Node {
 
         // Reconnect to failed peers
         for addr in failed_peers {
-            tracing::info!("Node {} attempting to reconnect to {:?}", node_id, addr);
+            tracing::info!(
+                "Node {} attempting to reconnect to {:?}",
+                node_id,
+                addr
+            );
             match self.connect_to_peer(addr).await {
                 Ok(_) => {
-                    tracing::info!("Node {} successfully reconnected to {:?}", node_id, addr);
+                    tracing::info!(
+                        "Node {} successfully reconnected to {:?}",
+                        node_id,
+                        addr
+                    );
                 }
                 Err(e) => {
-                    tracing::error!("Node {} failed to reconnect to {:?}: {:?}", node_id, addr, e);
+                    tracing::error!(
+                        "Node {} failed to reconnect to {:?}: {:?}",
+                        node_id,
+                        addr,
+                        e
+                    );
                 }
             }
         }
 
-        tracing::info!("Node {} setup completed, {} peer connections established", node_id, self.peers.len());
+        tracing::info!(
+            "Node {} setup completed, {} peer connections established",
+            node_id,
+            self.peers.len()
+        );
         Ok(())
     }
     async fn main(mut self) -> anyhow::Result<()> {
@@ -666,6 +710,12 @@ impl Node {
         let mut state = self.state.lock().await;
         state.role = Role::Leader;
         state.leader_id = Some(state.id);
+
+        let last_log_idx = state.get_last_log_idx();
+        for peer_addr in self.peers.keys() {
+            state.next_index.insert(*peer_addr, last_log_idx + 1);
+            state.match_index.insert(*peer_addr, 0);
+        }
         Ok(())
     }
     async fn become_follower(&mut self) -> anyhow::Result<()> {
@@ -771,6 +821,68 @@ impl Node {
             .await?;
         Ok((server, res))
     }
+    fn new_commit_index(
+        current_commit_index: u32,
+        current_term: u32,
+        log: &[raft::Entry<Data>],
+        match_index: &HashMap<SocketAddr, u32>,
+        peer_count: usize,
+    ) -> u32 {
+        let log_len = log.len() as u32;
+        let total_nodes = peer_count + 1;
+
+        let mut new_commit_index = current_commit_index;
+        for n in (current_commit_index + 1)..=log_len {
+            if log[(n - 1) as usize].term != current_term {
+                continue;
+            }
+            let mut count = 1; // Leader always has the entry
+            for match_idx in match_index.values() {
+                if *match_idx >= n {
+                    count += 1;
+                }
+            }
+            if count > total_nodes / 2 {
+                new_commit_index = n;
+            }
+        }
+        new_commit_index
+    }
+
+    /// Update commit_index based on match_index according to Raft Figure 2:
+    /// "If there exists an N such that N > commitIndex, a majority of
+    /// matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N"
+    async fn update_commit_index(&mut self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+
+        // Only leaders can update commit_index this way
+        if !matches!(state.role, Role::Leader) {
+            return Ok(());
+        }
+
+        let current_commit_index = state.commit_index;
+        let new_commit_index = Self::new_commit_index(
+            state.commit_index,
+            state.current_term,
+            &state.log,
+            &state.match_index,
+            self.peers.len(),
+        );
+
+        // Update commit_index if we found a higher value
+        if new_commit_index > current_commit_index {
+            state.commit_index = new_commit_index;
+            tracing::info!(
+                id=?state.id,
+                old_commit_index=current_commit_index,
+                new_commit_index=new_commit_index,
+                "Updated commit_index: entry replicated on majority"
+            );
+        }
+
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self))]
     async fn handle_heartbeat(
         &mut self,
@@ -806,7 +918,6 @@ impl Node {
         {
             let mut state = self.state.lock().await;
             if res.success {
-                // TODO: commit all logs before last_index
                 state.match_index.insert(addr, last_index);
                 state.next_index.insert(addr, last_index + 1);
             } else {
@@ -823,6 +934,9 @@ impl Node {
                     .insert(addr, new_match_index.saturating_sub(1));
             }
         }
+
+        // Update commit_index based on match_index
+        self.update_commit_index().await?;
         // TODO: res.nextIdx <= lastIdx then should retry
         tracing::info!(id=?id, response.body=?res, "got heartbeat");
         Ok(())
@@ -872,6 +986,7 @@ mod test {
         assert_eq!(state.leader_id, Some(state.id));
         Ok(())
     }
+
     #[tokio::test]
     async fn check_leader_state_after_become_candidate() -> anyhow::Result<()> {
         let mut node = Node::new(10101, Config::default());
@@ -1011,10 +1126,15 @@ mod test {
         Ok(())
     }
 
+    fn create_test_storage<T: Send + Sync + Clone + 'static>()
+    -> Box<dyn crate::storage::Storage<T>> {
+        Box::new(crate::storage::MemStorage::default())
+    }
+
     #[tokio::test]
     async fn test_append_entries_with_higher_term_converts_to_follower()
     -> anyhow::Result<()> {
-        let mut initial_state = RaftState::new(1);
+        let mut initial_state = RaftState::new(1, create_test_storage());
         initial_state.current_term = 50;
         initial_state.role = Role::Leader;
         let state = Arc::new(Mutex::new(initial_state));
@@ -1052,7 +1172,7 @@ mod test {
     #[tokio::test]
     async fn test_request_vote_with_higher_term_converts_to_follower()
     -> anyhow::Result<()> {
-        let mut initial_state = RaftState::new(1);
+        let mut initial_state = RaftState::new(1, create_test_storage());
         initial_state.current_term = 50;
         initial_state.role = Role::Leader;
         let state = Arc::new(Mutex::new(initial_state));
@@ -1088,7 +1208,7 @@ mod test {
     #[tokio::test]
     async fn test_request_vote_rejected_by_older_log_term() -> anyhow::Result<()>
     {
-        let mut initial_state = RaftState::new(1);
+        let mut initial_state = RaftState::new(1, create_test_storage());
         initial_state.current_term = 10;
         initial_state.log.push(raft::Entry {
             term: 5,
@@ -1106,7 +1226,7 @@ mod test {
 
         let response = Node::request_vote(&req, state.clone()).await;
 
-        assert_eq!(response.vote_granted, false);
+        assert!(!response.vote_granted);
         assert_eq!(response.term, 10);
 
         let final_state = state.lock().await;
@@ -1119,7 +1239,7 @@ mod test {
     async fn test_request_vote_log_index_comparison_with_same_term()
     -> anyhow::Result<()> {
         // ケース1: 同じterm、同じindex → 投票される
-        let mut state1 = RaftState::new(1);
+        let mut state1 = RaftState::new(1, create_test_storage());
         state1.current_term = 10;
         state1.log.push(raft::Entry {
             term: 5,
@@ -1141,14 +1261,14 @@ mod test {
             last_log_term: 5,
         };
         let response1 = Node::request_vote(&req1, state1.clone()).await;
-        assert_eq!(
-            response1.vote_granted, true,
+        assert!(
+            response1.vote_granted,
             "Same term and same index should grant vote"
         );
         assert_eq!(state1.lock().await.voted_for, Some(2));
 
         // ケース2: 同じterm、候補者のindexが長い → 投票される
-        let mut state2 = RaftState::new(1);
+        let mut state2 = RaftState::new(1, create_test_storage());
         state2.current_term = 10;
         state2.log.push(raft::Entry {
             term: 5,
@@ -1170,14 +1290,14 @@ mod test {
             last_log_term: 5,
         };
         let response2 = Node::request_vote(&req2, state2.clone()).await;
-        assert_eq!(
-            response2.vote_granted, true,
+        assert!(
+            response2.vote_granted,
             "Same term and longer index should grant vote"
         );
         assert_eq!(state2.lock().await.voted_for, Some(3));
 
         // ケース3: 同じterm、候補者のindexが短い → 拒否される
-        let mut state3 = RaftState::new(1);
+        let mut state3 = RaftState::new(1, create_test_storage());
         state3.current_term = 10;
         state3.log.push(raft::Entry {
             term: 5,
@@ -1199,8 +1319,8 @@ mod test {
             last_log_term: 5,
         };
         let response3 = Node::request_vote(&req3, state3.clone()).await;
-        assert_eq!(
-            response3.vote_granted, false,
+        assert!(
+            !response3.vote_granted,
             "Same term and shorter index should reject vote"
         );
         assert_eq!(state3.lock().await.voted_for, None);
@@ -1211,7 +1331,7 @@ mod test {
     #[tokio::test]
     async fn test_append_entries_conflict_resolution() -> anyhow::Result<()> {
         // フォロワーの初期ログ: [entry1(term=1), entry2(term=1), entry3(term=2), entry4(term=2)]
-        let mut follower_state = RaftState::new(1);
+        let mut follower_state = RaftState::new(1, create_test_storage());
         follower_state.current_term = 3;
         follower_state.log.push(raft::Entry {
             term: 1,
@@ -1257,7 +1377,7 @@ mod test {
         let response = Node::append_entries(&req, state.clone()).await;
 
         // レスポンスは成功
-        assert_eq!(response.success, true);
+        assert!(response.success);
         assert_eq!(response.term, 3);
 
         // ログの検証
@@ -1287,7 +1407,7 @@ mod test {
     async fn test_append_entries_no_conflict_append_only() -> anyhow::Result<()>
     {
         // フォロワーの初期ログ: [entry1(term=1), entry2(term=1)]
-        let mut follower_state = RaftState::new(1);
+        let mut follower_state = RaftState::new(1, create_test_storage());
         follower_state.current_term = 2;
         follower_state.log.push(raft::Entry {
             term: 1,
@@ -1321,7 +1441,7 @@ mod test {
         let response = Node::append_entries(&req, state.clone()).await;
 
         // レスポンスは成功
-        assert_eq!(response.success, true);
+        assert!(response.success);
 
         // ログの検証: 新しいエントリが追加されている
         let final_state = state.lock().await;
@@ -1330,6 +1450,71 @@ mod test {
         assert_eq!(final_state.log[2].command.as_ref(), b"cmd3");
         assert_eq!(final_state.log[3].term, 2);
         assert_eq!(final_state.log[3].command.as_ref(), b"cmd4");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_commit_only_current_term_entries() -> anyhow::Result<()> {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let node = Node::new(10101, Config::default());
+
+        // 3ノードクラスタを想定（リーダー + 2ピア）
+        let peer1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10102);
+        let peer2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10103);
+
+        // ログエントリを追加: 古いterm と 現在のterm
+        {
+            let mut state = node.state.lock().await;
+            state.role = Role::Leader;
+            state.current_term = 5;
+            state.commit_index = 0;
+
+            // 古いterm=3のエントリ
+            state.log.push(raft::Entry {
+                term: 3,
+                command: bytes::Bytes::from("old_term_cmd1"),
+            });
+            state.log.push(raft::Entry {
+                term: 3,
+                command: bytes::Bytes::from("old_term_cmd2"),
+            });
+
+            // 現在のterm=5のエントリ
+            state.log.push(raft::Entry {
+                term: 5,
+                command: bytes::Bytes::from("current_term_cmd1"),
+            });
+            state.log.push(raft::Entry {
+                term: 5,
+                command: bytes::Bytes::from("current_term_cmd2"),
+            });
+
+            // match_indexを設定: すべてのエントリが過半数に複製されている
+            state.match_index.insert(peer1, 4);
+            state.match_index.insert(peer2, 4);
+        }
+
+        // new_commit_index()を直接テスト
+        let new_commit_index = {
+            let state = node.state.lock().await;
+            Node::new_commit_index(
+                state.commit_index,
+                state.current_term,
+                &state.log,
+                &state.match_index,
+                2, // peer_count = 2
+            )
+        };
+
+        // 期待値: term=3のエントリ（index 1,2）はスキップされ、
+        // term=5のエントリ（index 3,4）のみがコミット対象
+        // → commit_index = 4
+        assert_eq!(
+            new_commit_index, 4,
+            "Should only commit current term entries (term=5), not old term entries (term=3)"
+        );
 
         Ok(())
     }
