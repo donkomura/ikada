@@ -72,11 +72,14 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 
 impl Node {
     pub fn new(port: u16, config: Config) -> Self {
+        use crate::storage::MemStorage;
+        // TODO: move storage out of the node
+        let storage = Box::new(MemStorage::default());
         Node {
             config,
             peers: HashMap::default(),
             server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-            state: Arc::new(Mutex::new(RaftState::new(port as u32))),
+            state: Arc::new(Mutex::new(RaftState::new(port as u32, storage))),
             c: Chan::default(),
         }
     }
@@ -147,6 +150,13 @@ impl Node {
             state.current_term = req.term;
             state.role = Role::Follower;
             state.voted_for = None;
+            if let Err(e) = state.persist().await {
+                tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update");
+                return AppendEntriesResponse {
+                    term: state.current_term,
+                    success: false,
+                };
+            }
         }
 
         if req.prev_log_index > 0 {
@@ -181,6 +191,7 @@ impl Node {
 
         // If an existing entry conflicts with a new one (same index but different terms),
         // delete the existing entry and all that follow it (§5.3)
+        let mut log_modified = false;
         for (i, rpc_entry) in req.entries.iter().enumerate() {
             let log_index = req.prev_log_index + 1 + i as u32;
 
@@ -192,6 +203,7 @@ impl Node {
                 if existing_term != rpc_entry.term {
                     // Delete the conflicting entry and all that follow
                     state.log.truncate((log_index - 1) as usize);
+                    log_modified = true;
                     tracing::info!(
                         id=?state.id,
                         conflict_index=log_index,
@@ -216,6 +228,18 @@ impl Node {
                     command: bytes::Bytes::from(rpc_entry.command.clone()),
                 };
                 state.log.push(entry);
+                log_modified = true;
+            }
+        }
+
+        // Persist if log was modified
+        if log_modified {
+            if let Err(e) = state.persist().await {
+                tracing::error!(id=?state.id, error=?e, "Failed to persist state after log modification");
+                return AppendEntriesResponse {
+                    term: state.current_term,
+                    success: false,
+                };
             }
         }
 
@@ -247,6 +271,13 @@ impl Node {
                 state.current_term = req.term;
                 state.role = Role::Follower;
                 state.voted_for = None;
+                if let Err(e) = state.persist().await {
+                    tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update in RequestVote");
+                    return RequestVoteResponse {
+                        term: state.current_term,
+                        vote_granted: false,
+                    };
+                }
             }
 
             tracing::info!(id=?state.id, request.body=?req, "Command::RequestVote");
@@ -283,6 +314,13 @@ impl Node {
 
                 if log_is_up_to_date {
                     state.voted_for = Some(req.candidate_id);
+                    if let Err(e) = state.persist().await {
+                        tracing::error!(id=?state.id, error=?e, "Failed to persist state after voting");
+                        return RequestVoteResponse {
+                            term: state.current_term,
+                            vote_granted: false,
+                        };
+                    }
                     true
                 } else {
                     tracing::warn!(
@@ -480,6 +518,9 @@ impl Node {
                         term,
                         command: order,
                     });
+                    if let Err(e) = state.persist().await {
+                        tracing::error!(id=?state.id, error=?e, "Failed to persist state after appending log entry");
+                    }
                 },
                 _ = watchdog.wait() => {
                     self.broadcast_heartbeat().await?;
@@ -637,6 +678,8 @@ impl Node {
         let mut state = self.state.lock().await;
         state.role = Role::Candidate;
         state.current_term += 1;
+        state.voted_for = Some(state.id); // Vote for self
+        state.persist().await?;
         Ok(())
     }
     async fn send_request_vote(

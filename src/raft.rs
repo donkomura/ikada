@@ -1,10 +1,18 @@
+use crate::storage::Storage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
-pub struct Entry<T> {
+pub struct Entry<T: Send + Sync> {
     pub term: u32,
     pub command: T,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistentState<T: Send + Sync> {
+    pub current_term: u32,
+    pub voted_for: Option<u32>,
+    pub log: Vec<Entry<T>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -16,7 +24,7 @@ pub enum Role {
 }
 
 #[derive(Debug)]
-pub struct RaftState<T> {
+pub struct RaftState<T: Send + Sync> {
     // Persistent state on all services
     pub current_term: u32,
     pub voted_for: Option<u32>,
@@ -33,10 +41,12 @@ pub struct RaftState<T> {
     pub role: Role,
     pub leader_id: Option<u32>,
     pub id: u32,
+
+    storage: Box<dyn Storage<T>>,
 }
 
-impl<T> RaftState<T> {
-    pub fn new(id: u32) -> Self {
+impl<T: Send + Sync + Clone> RaftState<T> {
+    pub fn new(id: u32, storage: Box<dyn Storage<T>>) -> Self {
         Self {
             current_term: 1,
             role: Role::Follower,
@@ -48,7 +58,17 @@ impl<T> RaftState<T> {
             match_index: HashMap::new(),
             leader_id: None,
             id,
+            storage,
         }
+    }
+    pub async fn persist(&mut self) -> anyhow::Result<()> {
+        let data = PersistentState {
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+            log: self.log.clone(),
+        };
+        self.storage.save(&data).await?;
+        Ok(())
     }
     pub fn apply(&mut self, _command: &T) -> anyhow::Result<()> {
         Ok(())
