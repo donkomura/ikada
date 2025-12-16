@@ -1,3 +1,4 @@
+use crate::statemachine::StateMachine;
 use crate::storage::Storage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -24,7 +25,7 @@ pub enum Role {
 }
 
 #[derive(Debug)]
-pub struct RaftState<T: Send + Sync> {
+pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     // Persistent state on all services
     pub current_term: u32,
     pub voted_for: Option<u32>,
@@ -43,10 +44,11 @@ pub struct RaftState<T: Send + Sync> {
     pub id: u32,
 
     storage: Box<dyn Storage<T>>,
+    sm: SM,
 }
 
-impl<T: Send + Sync + Clone> RaftState<T> {
-    pub fn new(id: u32, storage: Box<dyn Storage<T>>) -> Self {
+impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
+    pub fn new(id: u32, storage: Box<dyn Storage<T>>, sm: SM) -> Self {
         Self {
             current_term: 1,
             role: Role::Follower,
@@ -59,6 +61,7 @@ impl<T: Send + Sync + Clone> RaftState<T> {
             leader_id: None,
             id,
             storage,
+            sm,
         }
     }
     pub async fn persist(&mut self) -> anyhow::Result<()> {
@@ -70,8 +73,17 @@ impl<T: Send + Sync + Clone> RaftState<T> {
         self.storage.save(&data).await?;
         Ok(())
     }
-    pub fn apply(&mut self, _command: &T) -> anyhow::Result<()> {
-        Ok(())
+    pub async fn apply_committed(
+        &mut self,
+    ) -> anyhow::Result<Vec<SM::Response>> {
+        let mut responses = Vec::new();
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            let entry = &self.log[(self.last_applied - 1) as usize];
+            let response = self.sm.apply(&entry.command).await?;
+            responses.push(response);
+        }
+        Ok(responses)
     }
     pub fn get_last_log_idx(&self) -> u32 {
         self.log.len() as u32

@@ -1,7 +1,7 @@
 use crate::raft::{self, RaftState, Role};
 use crate::rpc::*;
+use crate::statemachine::StateMachine;
 use crate::watchdog::WatchDog;
-use bytes;
 use futures::{future, prelude::*};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -36,20 +36,18 @@ pub struct Config {
     pub rpc_timeout: Duration,
 }
 
-type Data = bytes::Bytes;
-
-pub struct Chan {
+pub struct Chan<T> {
     heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
     heartbeat_rx: mpsc::UnboundedReceiver<(u32, u32)>,
     #[allow(dead_code)]
-    client_tx: mpsc::Sender<Data>,
-    client_rx: mpsc::Receiver<Data>,
+    client_tx: mpsc::Sender<T>,
+    client_rx: mpsc::Receiver<T>,
 }
 
-impl Default for Chan {
-    fn default() -> Self {
+impl<T> Chan<T> {
+    fn new() -> Self {
         let (heartbeat_tx, heartbeat_rx) = mpsc::unbounded_channel();
-        let (client_tx, client_rx) = mpsc::channel::<Data>(32);
+        let (client_tx, client_rx) = mpsc::channel::<T>(32);
         Self {
             heartbeat_tx,
             heartbeat_rx,
@@ -59,20 +57,30 @@ impl Default for Chan {
     }
 }
 
-pub struct Node {
+pub struct Node<T: Send + Sync, SM: StateMachine<Command = T>> {
     config: Config,
     peers: HashMap<SocketAddr, RaftRpcClient>,
     server_addr: SocketAddr,
-    state: Arc<Mutex<RaftState<Data>>>,
-    c: Chan,
+    state: Arc<Mutex<RaftState<T, SM>>>,
+    c: Chan<T>,
 }
 
 async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
-impl Node {
-    pub fn new(port: u16, config: Config) -> Self {
+impl<T, SM> Node<T, SM>
+where
+    T: Send
+        + Sync
+        + Clone
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + 'static,
+    SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
+{
+    pub fn new(port: u16, config: Config, sm: SM) -> Self {
         use crate::storage::MemStorage;
         // TODO: move storage out of the node
         let storage = Box::new(MemStorage::default());
@@ -80,8 +88,12 @@ impl Node {
             config,
             peers: HashMap::default(),
             server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-            state: Arc::new(Mutex::new(RaftState::new(port as u32, storage))),
-            c: Chan::default(),
+            state: Arc::new(Mutex::new(RaftState::new(
+                port as u32,
+                storage,
+                sm,
+            ))),
+            c: Chan::new(),
         }
     }
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
@@ -131,8 +143,8 @@ impl Node {
     }
     async fn append_entries(
         req: &AppendEntriesRequest,
-        state: Arc<Mutex<RaftState<Data>>>,
-    ) -> AppendEntriesResponse {
+        state: Arc<Mutex<RaftState<T, SM>>>,
+    ) -> anyhow::Result<AppendEntriesResponse> {
         let mut state = state.lock().await;
         if req.term < state.current_term {
             tracing::warn!(
@@ -141,10 +153,10 @@ impl Node {
                 current_term=state.current_term,
                 "AppendEntries rejected: request term is older than current term"
             );
-            return AppendEntriesResponse {
+            return Ok(AppendEntriesResponse {
                 term: state.current_term,
                 success: false,
-            };
+            });
         }
 
         if req.term > state.current_term {
@@ -153,10 +165,10 @@ impl Node {
             state.voted_for = None;
             if let Err(e) = state.persist().await {
                 tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update");
-                return AppendEntriesResponse {
+                return Ok(AppendEntriesResponse {
                     term: state.current_term,
                     success: false,
-                };
+                });
             }
         }
 
@@ -168,10 +180,10 @@ impl Node {
                     last_log_idx=state.get_last_log_idx(),
                     "AppendEntries rejected: prev_log_index exceeds log length"
                 );
-                return AppendEntriesResponse {
+                return Ok(AppendEntriesResponse {
                     term: state.current_term,
                     success: false,
-                };
+                });
             }
 
             let prev_log_entry = &state.log[(req.prev_log_index - 1) as usize];
@@ -183,10 +195,10 @@ impl Node {
                     actual_term=prev_log_entry.term,
                     "AppendEntries rejected: prev_log_term mismatch"
                 );
-                return AppendEntriesResponse {
+                return Ok(AppendEntriesResponse {
                     term: state.current_term,
                     success: false,
-                };
+                });
             }
         }
 
@@ -224,9 +236,19 @@ impl Node {
 
             // Only append if this entry doesn't exist yet
             if log_index > state.get_last_log_idx() {
+                let command = match bincode::deserialize(&rpc_entry.command) {
+                    Ok(cmd) => cmd,
+                    Err(e) => {
+                        tracing::error!(id=?state.id, error=?e, "Failed to deserialize command");
+                        return Ok(AppendEntriesResponse {
+                            term: state.current_term,
+                            success: false,
+                        });
+                    }
+                };
                 let entry = raft::Entry {
                     term: rpc_entry.term,
-                    command: bytes::Bytes::from(rpc_entry.command.clone()),
+                    command,
                 };
                 state.log.push(entry);
                 log_modified = true;
@@ -236,10 +258,10 @@ impl Node {
         // Persist if log was modified
         if log_modified && let Err(e) = state.persist().await {
             tracing::error!(id=?state.id, error=?e, "Failed to persist state after log modification");
-            return AppendEntriesResponse {
+            return Ok(AppendEntriesResponse {
                 term: state.current_term,
                 success: false,
-            };
+            });
         }
 
         // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
@@ -252,16 +274,20 @@ impl Node {
                 leader_commit=req.leader_commit,
                 "Updated commit_index"
             );
+
+            if state.commit_index > state.last_applied {
+                state.apply_committed().await?;
+            }
         }
 
-        AppendEntriesResponse {
+        Ok(AppendEntriesResponse {
             term: state.current_term,
             success: true,
-        }
+        })
     }
     async fn request_vote(
         req: &RequestVoteRequest,
-        state: Arc<Mutex<RaftState<Data>>>,
+        state: Arc<Mutex<RaftState<T, SM>>>,
     ) -> RequestVoteResponse {
         let (current_term, vote_granted) = {
             let mut state = state.lock().await;
@@ -344,7 +370,7 @@ impl Node {
         }
     }
     async fn rpc_handler(
-        state: Arc<Mutex<RaftState<Data>>>,
+        state: Arc<Mutex<RaftState<T, SM>>>,
         mut rx: mpsc::Receiver<Command>,
         heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
     ) -> anyhow::Result<()> {
@@ -352,7 +378,7 @@ impl Node {
             match command {
                 Command::AppendEntries(req, tx) => {
                     let resp =
-                        Self::append_entries(&req, Arc::clone(&state)).await;
+                        Self::append_entries(&req, Arc::clone(&state)).await?;
                     let (id, current_term) = {
                         let state = state.lock().await;
                         (state.id, state.current_term)
@@ -393,24 +419,71 @@ impl Node {
     async fn setup(&mut self) -> anyhow::Result<()> {
         let node_id = self.state.lock().await.id;
 
-        // Initial connection
-        for server in self.config.servers.clone() {
-            if server == self.server_addr {
-                continue;
+        // Initial connection - retry until all peers are connected
+        let peers_to_connect: Vec<_> = self
+            .config
+            .servers
+            .iter()
+            .filter(|&&server| server != self.server_addr)
+            .copied()
+            .collect();
+
+        let mut retry_count = 0;
+        let max_retries = 30; // Maximum 30 retries (about 3 seconds)
+
+        while self.peers.len() < peers_to_connect.len()
+            && retry_count < max_retries
+        {
+            for &server in &peers_to_connect {
+                if self.peers.contains_key(&server) {
+                    continue;
+                }
+
+                tracing::info!(
+                    "Node {} attempting to connect to peer {:?} (attempt {}/{})",
+                    node_id,
+                    server,
+                    retry_count + 1,
+                    max_retries
+                );
+
+                match self.connect_to_peer(server).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            "Node {} successfully connected to peer {:?}",
+                            node_id,
+                            server
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Node {} connection to {:?} failed: {:?}",
+                            node_id,
+                            server,
+                            e
+                        );
+                    }
+                }
             }
-            if self.peers.contains_key(&server) {
-                continue;
+
+            if self.peers.len() < peers_to_connect.len() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                retry_count += 1;
             }
-            tracing::info!(
-                "Node {} attempting to connect to peer {:?}",
+        }
+
+        if self.peers.len() < peers_to_connect.len() {
+            tracing::error!(
+                "Node {} failed to connect to all peers. Connected: {}/{}",
                 node_id,
-                server
+                self.peers.len(),
+                peers_to_connect.len()
             );
-            self.connect_to_peer(server).await?;
+        } else {
             tracing::info!(
-                "Node {} successfully connected to peer {:?}",
+                "Node {} successfully connected to all {} peers",
                 node_id,
-                server
+                self.peers.len()
             );
         }
 
@@ -554,7 +627,6 @@ impl Node {
             tokio::select! {
                 Some(order) = self.c.client_rx.recv() => {
                     let mut state = self.state.lock().await;
-                    state.apply(&order)?;
                     let term = state.current_term;
                     state.log.push(raft::Entry {
                         term,
@@ -566,6 +638,10 @@ impl Node {
                 },
                 _ = watchdog.wait() => {
                     self.broadcast_heartbeat().await?;
+                    let mut state = self.state.lock().await;
+                    if state.commit_index > state.last_applied {
+                        state.apply_committed().await?;
+                    }
                     watchdog.reset(timeout).await;
                 }
             }
@@ -783,19 +859,38 @@ impl Node {
                 .log
                 .iter()
                 .skip((next_idx - 1) as usize) // send logs after next_idx
-                .map(|e| LogEntry {
-                    term: e.term,
-                    command: e.command.to_vec(),
+                .map(|e| {
+                    let command =
+                        bincode::serialize(&e.command).unwrap_or_default();
+                    LogEntry {
+                        term: e.term,
+                        command,
+                    }
                 })
                 .collect();
             let sent_up_to_index = prev_log_idx + entries.len() as u32;
-            requests.push((addr, client, prev_log_idx, prev_log_term, entries, sent_up_to_index));
+            requests.push((
+                addr,
+                client,
+                prev_log_idx,
+                prev_log_term,
+                entries,
+                sent_up_to_index,
+            ));
         }
         let rpc_timeout = self.config.rpc_timeout;
 
         // TODO: optimize algorithm: should be gossip?
         let mut tasks = JoinSet::new();
-        for (addr, client, prev_log_index, prev_log_term, entries, sent_up_to_index) in requests {
+        for (
+            addr,
+            client,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            sent_up_to_index,
+        ) in requests
+        {
             let req = AppendEntriesRequest {
                 term: leader_term,
                 leader_id,
@@ -804,13 +899,20 @@ impl Node {
                 entries,
                 leader_commit,
             };
-            tasks.spawn(Self::send_heartbeat(*addr, client, req, sent_up_to_index, rpc_timeout));
+            tasks.spawn(Self::send_heartbeat(
+                *addr,
+                client,
+                req,
+                sent_up_to_index,
+                rpc_timeout,
+            ));
         }
 
         while let Some(result) = tasks.join_next().await {
             match result? {
                 Ok((server, res, sent_up_to_index)) => {
-                    self.handle_heartbeat(server, res, sent_up_to_index).await?;
+                    self.handle_heartbeat(server, res, sent_up_to_index)
+                        .await?;
                 }
                 Err(e) => {
                     tracing::warn!("Failed to send heartbeat: {:?}", e);
@@ -838,7 +940,7 @@ impl Node {
     fn new_commit_index(
         current_commit_index: u32,
         current_term: u32,
-        log: &[raft::Entry<Data>],
+        log: &[raft::Entry<T>],
         match_index: &HashMap<SocketAddr, u32>,
         peer_count: usize,
     ) -> u32 {
@@ -944,7 +1046,8 @@ impl Node {
                     "AppendEntries succeeded"
                 );
             } else {
-                let current_next_idx = state.next_index.get(&addr).copied().unwrap_or(1);
+                let current_next_idx =
+                    state.next_index.get(&addr).copied().unwrap_or(1);
                 let new_next_idx = current_next_idx.saturating_sub(1).max(1);
                 state.next_index.insert(addr, new_next_idx);
 
@@ -999,7 +1102,8 @@ mod test {
 
     #[tokio::test]
     async fn check_leader_state_after_become_leader() -> anyhow::Result<()> {
-        let mut node = Node::new(10101, Config::default());
+        let mut node =
+            Node::new(10101, Config::default(), create_test_state_machine());
         node.become_leader().await?;
         let state = node.state.lock().await;
         assert_eq!(state.role, Role::Leader);
@@ -1009,7 +1113,8 @@ mod test {
 
     #[tokio::test]
     async fn check_leader_state_after_become_candidate() -> anyhow::Result<()> {
-        let mut node = Node::new(10101, Config::default());
+        let mut node =
+            Node::new(10101, Config::default(), create_test_state_machine());
         let term = node.state.lock().await.current_term;
         node.become_candidate().await?;
         let state = node.state.lock().await;
@@ -1019,7 +1124,8 @@ mod test {
     }
     #[tokio::test]
     async fn check_leader_state_after_become_follower() -> anyhow::Result<()> {
-        let mut node = Node::new(10101, Config::default());
+        let mut node =
+            Node::new(10101, Config::default(), create_test_state_machine());
         node.become_follower().await?;
         let state = node.state.lock().await;
         assert_eq!(state.role, Role::Follower);
@@ -1027,7 +1133,8 @@ mod test {
     }
     #[tokio::test(start_paused = true)]
     async fn election_must_be_done_with_not_candidate() -> anyhow::Result<()> {
-        let mut node = Node::new(10101, Config::default());
+        let mut node =
+            Node::new(10101, Config::default(), create_test_state_machine());
         node.become_candidate().await?;
         node.run_candidate().await?;
         assert_ne!(node.state.lock().await.role, Role::Candidate);
@@ -1041,7 +1148,7 @@ mod test {
             election_timeout: Duration::from_millis(2000),
             ..Default::default()
         };
-        let mut node = Node::new(10101, config);
+        let mut node = Node::new(10101, config, create_test_state_machine());
         let result = tokio::spawn(async move { node.run_follower().await });
         // election timeoutを超える時間（2100ms）進める
         tokio::time::advance(Duration::from_millis(2100)).await;
@@ -1057,7 +1164,7 @@ mod test {
             rpc_timeout: Duration::from_millis(500),
             ..Default::default()
         };
-        let mut node = Node::new(10101, config);
+        let mut node = Node::new(10101, config, create_test_state_machine());
         node.become_candidate().await?;
         let result = tokio::spawn(async move { node.run_candidate().await });
         // 100ms進めてstart_electionが呼ばれる時間を与える
@@ -1074,7 +1181,7 @@ mod test {
             election_timeout: Duration::from_millis(1000),
             ..Default::default()
         };
-        let mut node = Node::new(10101, config);
+        let mut node = Node::new(10101, config, create_test_state_machine());
 
         let heartbeat_tx = node.c.heartbeat_tx.clone();
         let result = tokio::spawn(async move { node.run_follower().await });
@@ -1117,7 +1224,7 @@ mod test {
             election_timeout: Duration::from_millis(1000),
             ..Default::default()
         };
-        let mut node = Node::new(10101, config);
+        let mut node = Node::new(10101, config, create_test_state_machine());
 
         let heartbeat_tx = node.c.heartbeat_tx.clone();
         let result = tokio::spawn(async move { node.run_follower().await });
@@ -1151,10 +1258,18 @@ mod test {
         Box::new(crate::storage::MemStorage::default())
     }
 
+    fn create_test_state_machine() -> crate::statemachine::NoOpStateMachine {
+        crate::statemachine::NoOpStateMachine::default()
+    }
+
     #[tokio::test]
     async fn test_append_entries_with_higher_term_converts_to_follower()
     -> anyhow::Result<()> {
-        let mut initial_state = RaftState::new(1, create_test_storage());
+        let mut initial_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
         initial_state.current_term = 50;
         initial_state.role = Role::Leader;
         let state = Arc::new(Mutex::new(initial_state));
@@ -1192,7 +1307,11 @@ mod test {
     #[tokio::test]
     async fn test_request_vote_with_higher_term_converts_to_follower()
     -> anyhow::Result<()> {
-        let mut initial_state = RaftState::new(1, create_test_storage());
+        let mut initial_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
         initial_state.current_term = 50;
         initial_state.role = Role::Leader;
         let state = Arc::new(Mutex::new(initial_state));
@@ -1228,11 +1347,15 @@ mod test {
     #[tokio::test]
     async fn test_request_vote_rejected_by_older_log_term() -> anyhow::Result<()>
     {
-        let mut initial_state = RaftState::new(1, create_test_storage());
+        let mut initial_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
         initial_state.current_term = 10;
         initial_state.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         let state = Arc::new(Mutex::new(initial_state));
 
@@ -1259,19 +1382,23 @@ mod test {
     async fn test_request_vote_log_index_comparison_with_same_term()
     -> anyhow::Result<()> {
         // ケース1: 同じterm、同じindex → 投票される
-        let mut state1 = RaftState::new(1, create_test_storage());
+        let mut state1 = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
         state1.current_term = 10;
         state1.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         state1.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         state1.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         let state1 = Arc::new(Mutex::new(state1));
         let req1 = RequestVoteRequest {
@@ -1288,19 +1415,23 @@ mod test {
         assert_eq!(state1.lock().await.voted_for, Some(2));
 
         // ケース2: 同じterm、候補者のindexが長い → 投票される
-        let mut state2 = RaftState::new(1, create_test_storage());
+        let mut state2 = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
         state2.current_term = 10;
         state2.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         state2.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         state2.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         let state2 = Arc::new(Mutex::new(state2));
         let req2 = RequestVoteRequest {
@@ -1317,19 +1448,23 @@ mod test {
         assert_eq!(state2.lock().await.voted_for, Some(3));
 
         // ケース3: 同じterm、候補者のindexが短い → 拒否される
-        let mut state3 = RaftState::new(1, create_test_storage());
+        let mut state3 = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
         state3.current_term = 10;
         state3.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         state3.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         state3.log.push(raft::Entry {
             term: 5,
-            command: Data::new(),
+            command: bytes::Bytes::new(),
         });
         let state3 = Arc::new(Mutex::new(state3));
         let req3 = RequestVoteRequest {
@@ -1351,23 +1486,27 @@ mod test {
     #[tokio::test]
     async fn test_append_entries_conflict_resolution() -> anyhow::Result<()> {
         // フォロワーの初期ログ: [entry1(term=1), entry2(term=1), entry3(term=2), entry4(term=2)]
-        let mut follower_state = RaftState::new(1, create_test_storage());
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
         follower_state.current_term = 3;
         follower_state.log.push(raft::Entry {
             term: 1,
-            command: Data::from(&b"cmd1"[..]),
+            command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.log.push(raft::Entry {
             term: 1,
-            command: Data::from(&b"cmd2"[..]),
+            command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         follower_state.log.push(raft::Entry {
             term: 2,
-            command: Data::from(&b"cmd3_old"[..]),
+            command: bytes::Bytes::from(&b"cmd3_old"[..]),
         });
         follower_state.log.push(raft::Entry {
             term: 2,
-            command: Data::from(&b"cmd4_old"[..]),
+            command: bytes::Bytes::from(&b"cmd4_old"[..]),
         });
         let state = Arc::new(Mutex::new(follower_state));
 
@@ -1380,21 +1519,30 @@ mod test {
             entries: vec![
                 LogEntry {
                     term: 3,
-                    command: b"cmd3_new".to_vec(),
+                    command: bincode::serialize(&bytes::Bytes::from(
+                        &b"cmd3_new"[..],
+                    ))
+                    .unwrap(),
                 },
                 LogEntry {
                     term: 3,
-                    command: b"cmd4_new".to_vec(),
+                    command: bincode::serialize(&bytes::Bytes::from(
+                        &b"cmd4_new"[..],
+                    ))
+                    .unwrap(),
                 },
                 LogEntry {
                     term: 3,
-                    command: b"cmd5_new".to_vec(),
+                    command: bincode::serialize(&bytes::Bytes::from(
+                        &b"cmd5_new"[..],
+                    ))
+                    .unwrap(),
                 },
             ],
             leader_commit: 0,
         };
 
-        let response = Node::append_entries(&req, state.clone()).await;
+        let response = Node::append_entries(&req, state.clone()).await?;
 
         // レスポンスは成功
         assert!(response.success);
@@ -1427,15 +1575,19 @@ mod test {
     async fn test_append_entries_no_conflict_append_only() -> anyhow::Result<()>
     {
         // フォロワーの初期ログ: [entry1(term=1), entry2(term=1)]
-        let mut follower_state = RaftState::new(1, create_test_storage());
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
         follower_state.current_term = 2;
         follower_state.log.push(raft::Entry {
             term: 1,
-            command: Data::from(&b"cmd1"[..]),
+            command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.log.push(raft::Entry {
             term: 1,
-            command: Data::from(&b"cmd2"[..]),
+            command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         let state = Arc::new(Mutex::new(follower_state));
 
@@ -1448,17 +1600,23 @@ mod test {
             entries: vec![
                 LogEntry {
                     term: 2,
-                    command: b"cmd3".to_vec(),
+                    command: bincode::serialize(&bytes::Bytes::from(
+                        &b"cmd3"[..],
+                    ))
+                    .unwrap(),
                 },
                 LogEntry {
                     term: 2,
-                    command: b"cmd4".to_vec(),
+                    command: bincode::serialize(&bytes::Bytes::from(
+                        &b"cmd4"[..],
+                    ))
+                    .unwrap(),
                 },
             ],
             leader_commit: 0,
         };
 
-        let response = Node::append_entries(&req, state.clone()).await;
+        let response = Node::append_entries(&req, state.clone()).await?;
 
         // レスポンスは成功
         assert!(response.success);
@@ -1478,7 +1636,8 @@ mod test {
     async fn test_commit_only_current_term_entries() -> anyhow::Result<()> {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        let node = Node::new(10101, Config::default());
+        let node =
+            Node::new(10101, Config::default(), create_test_state_machine());
 
         // 3ノードクラスタを想定（リーダー + 2ピア）
         let peer1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10102);
@@ -1519,7 +1678,7 @@ mod test {
         // new_commit_index()を直接テスト
         let new_commit_index = {
             let state = node.state.lock().await;
-            Node::new_commit_index(
+            Node::<bytes::Bytes, crate::statemachine::NoOpStateMachine>::new_commit_index(
                 state.commit_index,
                 state.current_term,
                 &state.log,

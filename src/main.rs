@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::time::Duration;
 
 use ikada::server::{Config, Node};
+use ikada::statemachine::KVStateMachine;
 use ikada::trace::init_tracing;
 
 #[tokio::main]
@@ -23,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
             election_timeout: Duration::from_millis(2000),
             rpc_timeout: std::time::Duration::from_millis(5000),
         },
+        KVStateMachine::default(),
     );
     let node2 = Node::new(
         port + 1,
@@ -32,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
             election_timeout: Duration::from_millis(3000),
             rpc_timeout: std::time::Duration::from_millis(5000),
         },
+        KVStateMachine::default(),
     );
     let node3 = Node::new(
         port + 2,
@@ -41,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
             election_timeout: Duration::from_millis(4000),
             rpc_timeout: Duration::from_millis(5000),
         },
+        KVStateMachine::default(),
     );
 
     let jh = tokio::spawn(async move {
