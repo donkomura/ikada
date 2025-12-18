@@ -82,18 +82,44 @@ where
 {
     pub fn new(port: u16, config: Config, sm: SM) -> Self {
         use crate::storage::MemStorage;
-        // TODO: move storage out of the node
         let storage = Box::new(MemStorage::default());
+        let id = port as u32;
+
         Node {
             config,
             peers: HashMap::default(),
             server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-            state: Arc::new(Mutex::new(RaftState::new(
-                port as u32,
-                storage,
-                sm,
-            ))),
+            state: Arc::new(Mutex::new(RaftState::new(id, storage, sm))),
             c: Chan::new(),
+        }
+    }
+
+    pub async fn restore(&mut self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        let id = state.id;
+
+        match state.load_persisted().await {
+            Ok(Some(persisted)) => {
+                tracing::info!(
+                    id = id,
+                    term = persisted.current_term,
+                    log_len = persisted.log.len(),
+                    "Restoring state from storage"
+                );
+                state.restore_from(persisted);
+                Ok(())
+            }
+            Ok(None) => {
+                tracing::info!(
+                    id = id,
+                    "No persisted state found, starting fresh"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(id = id, error = ?e, "Failed to load persisted state, starting fresh");
+                Ok(())
+            }
         }
     }
     pub async fn run(self, port: u16) -> anyhow::Result<()> {
@@ -673,10 +699,8 @@ where
             )
         };
 
-        let is_granted = {
-            // TODO : check the candidate's log is up to date
-            voted_for.is_none() || (voted_for.unwrap() == candidate_id)
-        };
+        let is_granted =
+            { voted_for.is_none() || (voted_for.unwrap() == candidate_id) };
 
         if !is_granted {
             tracing::info!(

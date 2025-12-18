@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port + 1)),
         SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port + 2)),
     ];
-    let node1 = Node::new(
+    let mut node1 = Node::new(
         port,
         Config {
             servers: servers.clone(),
@@ -26,7 +26,9 @@ async fn main() -> anyhow::Result<()> {
         },
         KVStateMachine::default(),
     );
-    let node2 = Node::new(
+    node1.restore().await?;
+
+    let mut node2 = Node::new(
         port + 1,
         Config {
             servers: servers.clone(),
@@ -36,7 +38,9 @@ async fn main() -> anyhow::Result<()> {
         },
         KVStateMachine::default(),
     );
-    let node3 = Node::new(
+    node2.restore().await?;
+
+    let mut node3 = Node::new(
         port + 2,
         Config {
             servers: servers.clone(),
@@ -46,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         },
         KVStateMachine::default(),
     );
+    node3.restore().await?;
 
     let jh = tokio::spawn(async move {
         node1.run(port).await.unwrap();

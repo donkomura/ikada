@@ -64,6 +64,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             sm,
         }
     }
+
     pub async fn persist(&mut self) -> anyhow::Result<()> {
         let data = PersistentState {
             current_term: self.current_term,
@@ -72,6 +73,18 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         };
         self.storage.save(&data).await?;
         Ok(())
+    }
+
+    pub async fn load_persisted(
+        &mut self,
+    ) -> anyhow::Result<Option<PersistentState<T>>> {
+        self.storage.load().await
+    }
+
+    pub fn restore_from(&mut self, persisted: PersistentState<T>) {
+        self.current_term = persisted.current_term;
+        self.voted_for = persisted.voted_for;
+        self.log = persisted.log;
     }
     pub async fn apply_committed(
         &mut self,
