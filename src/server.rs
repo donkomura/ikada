@@ -5,6 +5,7 @@ use crate::watchdog::WatchDog;
 use futures::{future, prelude::*};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use crate::config::Config;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tarpc::{
@@ -26,14 +27,6 @@ pub enum Command {
 pub enum Response {
     AppendEntries(Option<AppendEntriesResponse>),
     RequestVote(Option<RequestVoteResponse>),
-}
-
-#[derive(Default)]
-pub struct Config {
-    pub servers: Vec<SocketAddr>,
-    pub heartbeat_interval: tokio::time::Duration,
-    pub election_timeout: tokio::time::Duration,
-    pub rpc_timeout: Duration,
 }
 
 pub struct Chan<T> {
@@ -122,13 +115,13 @@ where
             }
         }
     }
-    pub async fn run(self, port: u16) -> anyhow::Result<()> {
+    pub async fn run(self, port: u16, servers: Vec<SocketAddr>) -> anyhow::Result<()> {
         // main thread for test
         let (tx, rx) = mpsc::channel::<Command>(32);
         let state = Arc::clone(&self.state);
         let heartbeat_tx = self.c.heartbeat_tx.clone();
         let mut workers = JoinSet::new();
-        workers.spawn(self.main());
+        workers.spawn(self.main(servers));
         workers.spawn(Self::rpc_handler(state, rx, heartbeat_tx));
         workers.spawn(Self::rpc_server(tx, port));
 
@@ -442,13 +435,10 @@ where
         Ok(())
     }
 
-    async fn setup(&mut self) -> anyhow::Result<()> {
+    async fn setup(&mut self, servers: Vec<SocketAddr>) -> anyhow::Result<()> {
         let node_id = self.state.lock().await.id;
 
-        // Initial connection - retry until all peers are connected
-        let peers_to_connect: Vec<_> = self
-            .config
-            .servers
+        let peers_to_connect: Vec<_> = servers
             .iter()
             .filter(|&&server| server != self.server_addr)
             .copied()
@@ -577,8 +567,8 @@ where
         );
         Ok(())
     }
-    async fn main(mut self) -> anyhow::Result<()> {
-        self.setup().await?;
+    async fn main(mut self, servers: Vec<SocketAddr>) -> anyhow::Result<()> {
+        self.setup(servers).await?;
 
         loop {
             let role = {
