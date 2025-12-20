@@ -24,7 +24,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut client = client.ok_or_else(|| anyhow::anyhow!("No available cluster nodes"))?;
+    let mut client =
+        client.ok_or_else(|| anyhow::anyhow!("No available cluster nodes"))?;
 
     let commands = vec![
         KVCommand::Set {

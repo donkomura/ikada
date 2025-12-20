@@ -339,7 +339,10 @@ where
                     success: false,
                     leader_hint: None,
                     data: None,
-                    error: Some(format!("Failed to deserialize command: {}", e)),
+                    error: Some(format!(
+                        "Failed to deserialize command: {}",
+                        e
+                    )),
                 };
             }
         };
@@ -480,8 +483,12 @@ where
                         .expect("failed to send append entries response");
                 }
                 Command::SubmitCommand(req, tx) => {
-                    let resp =
-                        Self::submit_command_handler(&req, Arc::clone(&state), client_tx.clone()).await;
+                    let resp = Self::submit_command_handler(
+                        &req,
+                        Arc::clone(&state),
+                        client_tx.clone(),
+                    )
+                    .await;
                     tx.send(resp)
                         .expect("failed to send submit command response");
                 }

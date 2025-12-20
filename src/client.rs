@@ -40,7 +40,9 @@ impl RaftClient {
             let mut ctx = context::current();
             ctx.deadline = std::time::Instant::now() + TIMEOUT;
 
-            let request = CommandRequest { command: command.clone() };
+            let request = CommandRequest {
+                command: command.clone(),
+            };
             let response = self.client.submit_command(ctx, request).await?;
 
             if response.success {
@@ -70,7 +72,9 @@ impl RaftClient {
             } else {
                 return Err(anyhow::anyhow!(
                     "Command failed: {}",
-                    response.error.unwrap_or_else(|| "Unknown error".to_string())
+                    response
+                        .error
+                        .unwrap_or_else(|| "Unknown error".to_string())
                 ));
             }
         }
