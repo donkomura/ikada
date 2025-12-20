@@ -1310,10 +1310,11 @@ mod test {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
         let (heartbeat_tx, _heartbeat_rx) = mpsc::unbounded_channel();
+        let (client_tx, _client_rx) = mpsc::channel::<bytes::Bytes>(32);
         let state_clone = Arc::clone(&state);
 
         tokio::spawn(async move {
-            Node::rpc_handler(state_clone, cmd_rx, heartbeat_tx).await
+            Node::rpc_handler(state_clone, cmd_rx, heartbeat_tx, client_tx).await
         });
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -1352,10 +1353,11 @@ mod test {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
         let (heartbeat_tx, _heartbeat_rx) = mpsc::unbounded_channel();
+        let (client_tx, _client_rx) = mpsc::channel::<bytes::Bytes>(32);
         let state_clone = Arc::clone(&state);
 
         tokio::spawn(async move {
-            Node::rpc_handler(state_clone, cmd_rx, heartbeat_tx).await
+            Node::rpc_handler(state_clone, cmd_rx, heartbeat_tx, client_tx).await
         });
 
         let (resp_tx, resp_rx) = oneshot::channel();

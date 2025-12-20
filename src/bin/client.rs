@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let mut client =
         client.ok_or_else(|| anyhow::anyhow!("No available cluster nodes"))?;
 
-    let commands = vec![
+    let commands = [
         KVCommand::Set {
             key: "name".to_string(),
             value: "Alice".to_string(),
@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         },
     ];
 
-    for cmd in commands.iter() {
+    for cmd in &commands {
         tracing::info!("Executing: {:?}", cmd);
         let serialized = bincode::serialize(&cmd)?;
         client.execute(serialized).await?;
