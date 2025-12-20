@@ -7,7 +7,7 @@ use ikada::trace::init_tracing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let tracer_provider = init_tracing("ikada")?;
+    let tracer_provider = init_tracing("ikada-server")?;
 
     let port = 1111;
     let servers = vec![
@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     let s1 = servers
         .clone()
         .into_iter()
-        .filter(|&x| x.port() != port + 1)
+        .filter(|&x| x.port() != port)
         .collect();
     let jh = tokio::spawn(async move {
         node1.run(port, s1).await.unwrap();
@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let s2 = servers
         .clone()
         .into_iter()
-        .filter(|&x| x.port() != port + 2)
+        .filter(|&x| x.port() != port + 1)
         .collect();
     let jh2 = tokio::spawn(async move {
         node2.run(port + 1, s2).await.unwrap();
@@ -48,11 +48,16 @@ async fn main() -> anyhow::Result<()> {
     let s3 = servers
         .clone()
         .into_iter()
-        .filter(|&x| x.port() != port + 3)
+        .filter(|&x| x.port() != port + 2)
         .collect();
     let jh3 = tokio::spawn(async move {
         node3.run(port + 2, s3).await.unwrap();
     });
+
+    println!("Raft cluster started with 3 nodes:");
+    println!("  - Node 1: localhost:{}", port);
+    println!("  - Node 2: localhost:{}", port + 1);
+    println!("  - Node 3: localhost:{}", port + 2);
 
     let _ = tokio::join!(jh, jh2, jh3);
 
