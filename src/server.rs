@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::raft::{self, RaftState, Role};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
@@ -5,7 +6,6 @@ use crate::watchdog::WatchDog;
 use futures::{future, prelude::*};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use crate::config::Config;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tarpc::{
@@ -53,7 +53,6 @@ impl<T> Chan<T> {
 pub struct Node<T: Send + Sync, SM: StateMachine<Command = T>> {
     config: Config,
     peers: HashMap<SocketAddr, RaftRpcClient>,
-    server_addr: SocketAddr,
     state: Arc<Mutex<RaftState<T, SM>>>,
     c: Chan<T>,
 }
@@ -81,7 +80,6 @@ where
         Node {
             config,
             peers: HashMap::default(),
-            server_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
             state: Arc::new(Mutex::new(RaftState::new(id, storage, sm))),
             c: Chan::new(),
         }
@@ -115,7 +113,11 @@ where
             }
         }
     }
-    pub async fn run(self, port: u16, servers: Vec<SocketAddr>) -> anyhow::Result<()> {
+    pub async fn run(
+        self,
+        port: u16,
+        servers: Vec<SocketAddr>,
+    ) -> anyhow::Result<()> {
         // main thread for test
         let (tx, rx) = mpsc::channel::<Command>(32);
         let state = Arc::clone(&self.state);
@@ -165,27 +167,27 @@ where
         state: Arc<Mutex<RaftState<T, SM>>>,
     ) -> anyhow::Result<AppendEntriesResponse> {
         let mut state = state.lock().await;
-        if req.term < state.current_term {
+        if req.term < state.persistent.current_term {
             tracing::warn!(
                 id=?state.id,
                 req_term=req.term,
-                current_term=state.current_term,
+                current_term=state.persistent.current_term,
                 "AppendEntries rejected: request term is older than current term"
             );
             return Ok(AppendEntriesResponse {
-                term: state.current_term,
+                term: state.persistent.current_term,
                 success: false,
             });
         }
 
-        if req.term > state.current_term {
-            state.current_term = req.term;
+        if req.term > state.persistent.current_term {
+            state.persistent.current_term = req.term;
             state.role = Role::Follower;
-            state.voted_for = None;
+            state.persistent.voted_for = None;
             if let Err(e) = state.persist().await {
                 tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update");
                 return Ok(AppendEntriesResponse {
-                    term: state.current_term,
+                    term: state.persistent.current_term,
                     success: false,
                 });
             }
@@ -200,12 +202,13 @@ where
                     "AppendEntries rejected: prev_log_index exceeds log length"
                 );
                 return Ok(AppendEntriesResponse {
-                    term: state.current_term,
+                    term: state.persistent.current_term,
                     success: false,
                 });
             }
 
-            let prev_log_entry = &state.log[(req.prev_log_index - 1) as usize];
+            let prev_log_entry =
+                &state.persistent.log[(req.prev_log_index - 1) as usize];
             if prev_log_entry.term != req.prev_log_term {
                 tracing::warn!(
                     id=?state.id,
@@ -215,7 +218,7 @@ where
                     "AppendEntries rejected: prev_log_term mismatch"
                 );
                 return Ok(AppendEntriesResponse {
-                    term: state.current_term,
+                    term: state.persistent.current_term,
                     success: false,
                 });
             }
@@ -229,12 +232,13 @@ where
 
             // Check if this index exists in the log
             if log_index <= state.get_last_log_idx() {
-                let existing_term = state.log[(log_index - 1) as usize].term;
+                let existing_term =
+                    state.persistent.log[(log_index - 1) as usize].term;
 
                 // If terms don't match, there's a conflict
                 if existing_term != rpc_entry.term {
                     // Delete the conflicting entry and all that follow
-                    state.log.truncate((log_index - 1) as usize);
+                    state.persistent.log.truncate((log_index - 1) as usize);
                     log_modified = true;
                     tracing::info!(
                         id=?state.id,
@@ -260,7 +264,7 @@ where
                     Err(e) => {
                         tracing::error!(id=?state.id, error=?e, "Failed to deserialize command");
                         return Ok(AppendEntriesResponse {
-                            term: state.current_term,
+                            term: state.persistent.current_term,
                             success: false,
                         });
                     }
@@ -269,7 +273,7 @@ where
                     term: rpc_entry.term,
                     command,
                 };
-                state.log.push(entry);
+                state.persistent.log.push(entry);
                 log_modified = true;
             }
         }
@@ -278,7 +282,7 @@ where
         if log_modified && let Err(e) = state.persist().await {
             tracing::error!(id=?state.id, error=?e, "Failed to persist state after log modification");
             return Ok(AppendEntriesResponse {
-                term: state.current_term,
+                term: state.persistent.current_term,
                 success: false,
             });
         }
@@ -300,7 +304,7 @@ where
         }
 
         Ok(AppendEntriesResponse {
-            term: state.current_term,
+            term: state.persistent.current_term,
             success: true,
         })
     }
@@ -311,14 +315,14 @@ where
         let (current_term, vote_granted) = {
             let mut state = state.lock().await;
 
-            if req.term > state.current_term {
-                state.current_term = req.term;
+            if req.term > state.persistent.current_term {
+                state.persistent.current_term = req.term;
                 state.role = Role::Follower;
-                state.voted_for = None;
+                state.persistent.voted_for = None;
                 if let Err(e) = state.persist().await {
                     tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update in RequestVote");
                     return RequestVoteResponse {
-                        term: state.current_term,
+                        term: state.persistent.current_term,
                         vote_granted: false,
                     };
                 }
@@ -326,22 +330,22 @@ where
 
             tracing::info!(id=?state.id, request.body=?req, "Command::RequestVote");
 
-            let vote_granted = if req.term < state.current_term {
+            let vote_granted = if req.term < state.persistent.current_term {
                 tracing::warn!(
                     id=?state.id,
                     candidate_id=req.candidate_id,
                     req_term=req.term,
-                    current_term=state.current_term,
+                    current_term=state.persistent.current_term,
                     "RequestVote rejected: candidate term is older"
                 );
                 false
-            } else if state.voted_for.is_some()
-                && state.voted_for.unwrap() != req.candidate_id
+            } else if state.persistent.voted_for.is_some()
+                && state.persistent.voted_for.unwrap() != req.candidate_id
             {
                 tracing::warn!(
                     id=?state.id,
                     candidate_id=req.candidate_id,
-                    voted_for=?state.voted_for,
+                    voted_for=?state.persistent.voted_for,
                     "RequestVote rejected: already voted for another candidate"
                 );
                 false
@@ -357,11 +361,11 @@ where
                 };
 
                 if log_is_up_to_date {
-                    state.voted_for = Some(req.candidate_id);
+                    state.persistent.voted_for = Some(req.candidate_id);
                     if let Err(e) = state.persist().await {
                         tracing::error!(id=?state.id, error=?e, "Failed to persist state after voting");
                         return RequestVoteResponse {
-                            term: state.current_term,
+                            term: state.persistent.current_term,
                             vote_granted: false,
                         };
                     }
@@ -380,7 +384,7 @@ where
                 }
             };
 
-            (state.current_term, vote_granted)
+            (state.persistent.current_term, vote_granted)
         };
 
         RequestVoteResponse {
@@ -400,7 +404,7 @@ where
                         Self::append_entries(&req, Arc::clone(&state)).await?;
                     let (id, current_term) = {
                         let state = state.lock().await;
-                        (state.id, state.current_term)
+                        (state.id, state.persistent.current_term)
                     };
                     tx.send(resp)
                         .expect("failed to send append entries response");
@@ -435,14 +439,11 @@ where
         Ok(())
     }
 
-    async fn setup(&mut self, servers: Vec<SocketAddr>) -> anyhow::Result<()> {
+    async fn setup(
+        &mut self,
+        peers_to_connect: Vec<SocketAddr>,
+    ) -> anyhow::Result<()> {
         let node_id = self.state.lock().await.id;
-
-        let peers_to_connect: Vec<_> = servers
-            .iter()
-            .filter(|&&server| server != self.server_addr)
-            .copied()
-            .collect();
 
         let mut retry_count = 0;
         let max_retries = 30; // Maximum 30 retries (about 3 seconds)
@@ -616,7 +617,7 @@ where
             }
             tokio::select! {
                 Some((id, term)) = self.c.heartbeat_rx.recv() => {
-                    let current_term = self.state.lock().await.current_term;
+                    let current_term = self.state.lock().await.persistent.current_term;
                     if term >= current_term {
                         // the headbeat is accepted in candidate state
                         // requester is a new leader
@@ -643,8 +644,8 @@ where
             tokio::select! {
                 Some(order) = self.c.client_rx.recv() => {
                     let mut state = self.state.lock().await;
-                    let term = state.current_term;
-                    state.log.push(raft::Entry {
+                    let term = state.persistent.current_term;
+                    state.persistent.log.push(raft::Entry {
                         term,
                         command: order,
                     });
@@ -677,15 +678,15 @@ where
             tracing::info!(id=?state.id, state=?state, "start_election");
             // vote for myself
             responses.push(RequestVoteResponse {
-                term: state.current_term,
+                term: state.persistent.current_term,
                 vote_granted: true,
             });
             (
-                state.current_term,
+                state.persistent.current_term,
                 state.id,
                 state.get_last_log_idx(),
                 state.get_last_log_term(),
-                state.voted_for,
+                state.persistent.voted_for,
             )
         };
 
@@ -758,7 +759,7 @@ where
     ) -> anyhow::Result<()> {
         let (id, current_term) = {
             let state = self.state.lock().await;
-            (state.id, state.current_term)
+            (state.id, state.persistent.current_term)
         };
         tracing::info!(id=id, responses=?responses, "election handled");
 
@@ -770,7 +771,7 @@ where
                 term = &current_term,
                 "newer term was discovered"
             );
-            self.state.lock().await.current_term =
+            self.state.lock().await.persistent.current_term =
                 new_terms.first().unwrap().term;
             self.become_follower().await?;
             return Ok(());
@@ -809,14 +810,14 @@ where
     async fn become_follower(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         state.role = Role::Follower;
-        state.voted_for = None;
+        state.persistent.voted_for = None;
         Ok(())
     }
     async fn become_candidate(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         state.role = Role::Candidate;
-        state.current_term += 1;
-        state.voted_for = Some(state.id); // Vote for self
+        state.persistent.current_term += 1;
+        state.persistent.voted_for = Some(state.id); // Vote for self
         state.persist().await?;
         Ok(())
     }
@@ -851,7 +852,7 @@ where
         let (leader_term, leader_id, leader_commit) = {
             let state = self.state.lock().await;
             (
-                state.current_term,
+                state.persistent.current_term,
                 state.leader_id.unwrap(),
                 state.commit_index,
             )
@@ -865,11 +866,15 @@ where
             let state = self.state.lock().await;
             let next_idx = state.next_index.get(addr).copied().unwrap_or(1);
             let (prev_log_idx, prev_log_term) = if next_idx > 1 {
-                (next_idx - 1, state.log[(next_idx - 2) as usize].term)
+                (
+                    next_idx - 1,
+                    state.persistent.log[(next_idx - 2) as usize].term,
+                )
             } else {
                 (0, 0)
             };
             let entries: Vec<LogEntry> = state
+                .persistent
                 .log
                 .iter()
                 .skip((next_idx - 1) as usize) // send logs after next_idx
@@ -993,8 +998,8 @@ where
         let current_commit_index = state.commit_index;
         let new_commit_index = Self::new_commit_index(
             state.commit_index,
-            state.current_term,
-            &state.log,
+            state.persistent.current_term,
+            &state.persistent.log,
             &state.match_index,
             self.peers.len(),
         );
@@ -1022,7 +1027,7 @@ where
     ) -> anyhow::Result<()> {
         let check_term = {
             let state = self.state.lock().await;
-            if res.term > state.current_term {
+            if res.term > state.persistent.current_term {
                 tracing::info!(id=?state.id, "become follower because of term mismatch");
                 true
             } else {
@@ -1031,14 +1036,14 @@ where
         };
 
         if check_term {
-            self.state.lock().await.current_term = res.term;
+            self.state.lock().await.persistent.current_term = res.term;
             self.become_follower().await?;
             return Ok(());
         }
 
         let (id, role, current_term) = {
             let state = self.state.lock().await;
-            (state.id, state.role, state.current_term)
+            (state.id, state.role, state.persistent.current_term)
         };
         if matches!(role, Role::Leader) && current_term != res.term {
             return Ok(());
@@ -1129,11 +1134,11 @@ mod test {
     async fn check_leader_state_after_become_candidate() -> anyhow::Result<()> {
         let mut node =
             Node::new(10101, Config::default(), create_test_state_machine());
-        let term = node.state.lock().await.current_term;
+        let term = node.state.lock().await.persistent.current_term;
         node.become_candidate().await?;
         let state = node.state.lock().await;
         assert_eq!(state.role, Role::Candidate);
-        assert_eq!(state.current_term, term + 1);
+        assert_eq!(state.persistent.current_term, term + 1);
         Ok(())
     }
     #[tokio::test]
@@ -1284,7 +1289,7 @@ mod test {
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.current_term = 50;
+        initial_state.persistent.current_term = 50;
         initial_state.role = Role::Leader;
         let state = Arc::new(Mutex::new(initial_state));
 
@@ -1312,7 +1317,7 @@ mod test {
 
         // termが更新され、followerに転向しているべき
         let final_state = state.lock().await;
-        assert_eq!(final_state.current_term, 100);
+        assert_eq!(final_state.persistent.current_term, 100);
         assert_eq!(final_state.role, Role::Follower);
 
         Ok(())
@@ -1326,7 +1331,7 @@ mod test {
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.current_term = 50;
+        initial_state.persistent.current_term = 50;
         initial_state.role = Role::Leader;
         let state = Arc::new(Mutex::new(initial_state));
 
@@ -1352,7 +1357,7 @@ mod test {
 
         // termが更新され、followerに転向しているべき
         let final_state = state.lock().await;
-        assert_eq!(final_state.current_term, 100);
+        assert_eq!(final_state.persistent.current_term, 100);
         assert_eq!(final_state.role, Role::Follower);
 
         Ok(())
@@ -1366,8 +1371,8 @@ mod test {
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.current_term = 10;
-        initial_state.log.push(raft::Entry {
+        initial_state.persistent.current_term = 10;
+        initial_state.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
@@ -1387,7 +1392,7 @@ mod test {
         assert_eq!(response.term, 10);
 
         let final_state = state.lock().await;
-        assert_eq!(final_state.voted_for, None);
+        assert_eq!(final_state.persistent.voted_for, None);
 
         Ok(())
     }
@@ -1401,16 +1406,16 @@ mod test {
             create_test_storage(),
             create_test_state_machine(),
         );
-        state1.current_term = 10;
-        state1.log.push(raft::Entry {
+        state1.persistent.current_term = 10;
+        state1.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
-        state1.log.push(raft::Entry {
+        state1.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
-        state1.log.push(raft::Entry {
+        state1.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
@@ -1426,7 +1431,7 @@ mod test {
             response1.vote_granted,
             "Same term and same index should grant vote"
         );
-        assert_eq!(state1.lock().await.voted_for, Some(2));
+        assert_eq!(state1.lock().await.persistent.voted_for, Some(2));
 
         // ケース2: 同じterm、候補者のindexが長い → 投票される
         let mut state2 = RaftState::new(
@@ -1434,16 +1439,16 @@ mod test {
             create_test_storage(),
             create_test_state_machine(),
         );
-        state2.current_term = 10;
-        state2.log.push(raft::Entry {
+        state2.persistent.current_term = 10;
+        state2.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
-        state2.log.push(raft::Entry {
+        state2.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
-        state2.log.push(raft::Entry {
+        state2.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
@@ -1459,7 +1464,7 @@ mod test {
             response2.vote_granted,
             "Same term and longer index should grant vote"
         );
-        assert_eq!(state2.lock().await.voted_for, Some(3));
+        assert_eq!(state2.lock().await.persistent.voted_for, Some(3));
 
         // ケース3: 同じterm、候補者のindexが短い → 拒否される
         let mut state3 = RaftState::new(
@@ -1467,16 +1472,16 @@ mod test {
             create_test_storage(),
             create_test_state_machine(),
         );
-        state3.current_term = 10;
-        state3.log.push(raft::Entry {
+        state3.persistent.current_term = 10;
+        state3.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
-        state3.log.push(raft::Entry {
+        state3.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
-        state3.log.push(raft::Entry {
+        state3.persistent.log.push(raft::Entry {
             term: 5,
             command: bytes::Bytes::new(),
         });
@@ -1492,7 +1497,7 @@ mod test {
             !response3.vote_granted,
             "Same term and shorter index should reject vote"
         );
-        assert_eq!(state3.lock().await.voted_for, None);
+        assert_eq!(state3.lock().await.persistent.voted_for, None);
 
         Ok(())
     }
@@ -1505,20 +1510,20 @@ mod test {
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.current_term = 3;
-        follower_state.log.push(raft::Entry {
+        follower_state.persistent.current_term = 3;
+        follower_state.persistent.log.push(raft::Entry {
             term: 1,
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
-        follower_state.log.push(raft::Entry {
+        follower_state.persistent.log.push(raft::Entry {
             term: 1,
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
-        follower_state.log.push(raft::Entry {
+        follower_state.persistent.log.push(raft::Entry {
             term: 2,
             command: bytes::Bytes::from(&b"cmd3_old"[..]),
         });
-        follower_state.log.push(raft::Entry {
+        follower_state.persistent.log.push(raft::Entry {
             term: 2,
             command: bytes::Bytes::from(&b"cmd4_old"[..]),
         });
@@ -1564,23 +1569,27 @@ mod test {
 
         // ログの検証
         let final_state = state.lock().await;
-        assert_eq!(final_state.log.len(), 5, "Log should have 5 entries");
+        assert_eq!(
+            final_state.persistent.log.len(),
+            5,
+            "Log should have 5 entries"
+        );
 
         // 最初の2つは変更なし
-        assert_eq!(final_state.log[0].term, 1);
-        assert_eq!(final_state.log[0].command.as_ref(), b"cmd1");
-        assert_eq!(final_state.log[1].term, 1);
-        assert_eq!(final_state.log[1].command.as_ref(), b"cmd2");
+        assert_eq!(final_state.persistent.log[0].term, 1);
+        assert_eq!(final_state.persistent.log[0].command.as_ref(), b"cmd1");
+        assert_eq!(final_state.persistent.log[1].term, 1);
+        assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2");
 
         // 競合したエントリは新しいもので置き換えられている
-        assert_eq!(final_state.log[2].term, 3);
-        assert_eq!(final_state.log[2].command.as_ref(), b"cmd3_new");
-        assert_eq!(final_state.log[3].term, 3);
-        assert_eq!(final_state.log[3].command.as_ref(), b"cmd4_new");
+        assert_eq!(final_state.persistent.log[2].term, 3);
+        assert_eq!(final_state.persistent.log[2].command.as_ref(), b"cmd3_new");
+        assert_eq!(final_state.persistent.log[3].term, 3);
+        assert_eq!(final_state.persistent.log[3].command.as_ref(), b"cmd4_new");
 
         // 新しいエントリが追加されている
-        assert_eq!(final_state.log[4].term, 3);
-        assert_eq!(final_state.log[4].command.as_ref(), b"cmd5_new");
+        assert_eq!(final_state.persistent.log[4].term, 3);
+        assert_eq!(final_state.persistent.log[4].command.as_ref(), b"cmd5_new");
 
         Ok(())
     }
@@ -1594,12 +1603,12 @@ mod test {
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.current_term = 2;
-        follower_state.log.push(raft::Entry {
+        follower_state.persistent.current_term = 2;
+        follower_state.persistent.log.push(raft::Entry {
             term: 1,
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
-        follower_state.log.push(raft::Entry {
+        follower_state.persistent.log.push(raft::Entry {
             term: 1,
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
@@ -1637,11 +1646,11 @@ mod test {
 
         // ログの検証: 新しいエントリが追加されている
         let final_state = state.lock().await;
-        assert_eq!(final_state.log.len(), 4);
-        assert_eq!(final_state.log[2].term, 2);
-        assert_eq!(final_state.log[2].command.as_ref(), b"cmd3");
-        assert_eq!(final_state.log[3].term, 2);
-        assert_eq!(final_state.log[3].command.as_ref(), b"cmd4");
+        assert_eq!(final_state.persistent.log.len(), 4);
+        assert_eq!(final_state.persistent.log[2].term, 2);
+        assert_eq!(final_state.persistent.log[2].command.as_ref(), b"cmd3");
+        assert_eq!(final_state.persistent.log[3].term, 2);
+        assert_eq!(final_state.persistent.log[3].command.as_ref(), b"cmd4");
 
         Ok(())
     }
@@ -1661,25 +1670,25 @@ mod test {
         {
             let mut state = node.state.lock().await;
             state.role = Role::Leader;
-            state.current_term = 5;
+            state.persistent.current_term = 5;
             state.commit_index = 0;
 
             // 古いterm=3のエントリ
-            state.log.push(raft::Entry {
+            state.persistent.log.push(raft::Entry {
                 term: 3,
                 command: bytes::Bytes::from("old_term_cmd1"),
             });
-            state.log.push(raft::Entry {
+            state.persistent.log.push(raft::Entry {
                 term: 3,
                 command: bytes::Bytes::from("old_term_cmd2"),
             });
 
             // 現在のterm=5のエントリ
-            state.log.push(raft::Entry {
+            state.persistent.log.push(raft::Entry {
                 term: 5,
                 command: bytes::Bytes::from("current_term_cmd1"),
             });
-            state.log.push(raft::Entry {
+            state.persistent.log.push(raft::Entry {
                 term: 5,
                 command: bytes::Bytes::from("current_term_cmd2"),
             });
@@ -1694,8 +1703,8 @@ mod test {
             let state = node.state.lock().await;
             Node::<bytes::Bytes, crate::statemachine::NoOpStateMachine>::new_commit_index(
                 state.commit_index,
-                state.current_term,
-                &state.log,
+                state.persistent.current_term,
+                &state.persistent.log,
                 &state.match_index,
                 2, // peer_count = 2
             )

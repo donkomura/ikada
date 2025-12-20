@@ -27,9 +27,7 @@ pub enum Role {
 #[derive(Debug)]
 pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     // Persistent state on all services
-    pub current_term: u32,
-    pub voted_for: Option<u32>,
-    pub log: Vec<Entry<T>>,
+    pub persistent: PersistentState<T>,
 
     // Volatile state on all servers
     pub commit_index: u32,
@@ -50,10 +48,12 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
 impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     pub fn new(id: u32, storage: Box<dyn Storage<T>>, sm: SM) -> Self {
         Self {
-            current_term: 1,
+            persistent: PersistentState {
+                current_term: 1,
+                voted_for: None,
+                log: Vec::new(),
+            },
             role: Role::Follower,
-            voted_for: None,
-            log: Vec::new(),
             commit_index: 0,
             last_applied: 0,
             next_index: HashMap::new(),
@@ -66,12 +66,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     }
 
     pub async fn persist(&mut self) -> anyhow::Result<()> {
-        let data = PersistentState {
-            current_term: self.current_term,
-            voted_for: self.voted_for,
-            log: self.log.clone(),
-        };
-        self.storage.save(&data).await?;
+        self.storage.save(&self.persistent).await?;
         Ok(())
     }
 
@@ -82,9 +77,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     }
 
     pub fn restore_from(&mut self, persisted: PersistentState<T>) {
-        self.current_term = persisted.current_term;
-        self.voted_for = persisted.voted_for;
-        self.log = persisted.log;
+        self.persistent = persisted;
     }
     pub async fn apply_committed(
         &mut self,
@@ -92,20 +85,20 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         let mut responses = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            let entry = &self.log[(self.last_applied - 1) as usize];
+            let entry = &self.persistent.log[(self.last_applied - 1) as usize];
             let response = self.sm.apply(&entry.command).await?;
             responses.push(response);
         }
         Ok(responses)
     }
     pub fn get_last_log_idx(&self) -> u32 {
-        self.log.len() as u32
+        self.persistent.log.len() as u32
     }
     pub fn get_last_log_entry(&self) -> Option<&Entry<T>> {
-        self.log.last()
+        self.persistent.log.last()
     }
     pub fn get_last_log_term(&self) -> u32 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        self.persistent.log.last().map(|e| e.term).unwrap_or(0)
     }
     pub fn get_last_voted_term(&self) -> u32 {
         0u32
