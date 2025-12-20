@@ -41,10 +41,26 @@ pub struct RequestVoteResponse {
     pub vote_granted: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(crate = "tarpc::serde")]
+pub struct CommandRequest {
+    pub command: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(crate = "tarpc::serde")]
+pub struct CommandResponse {
+    pub success: bool,
+    pub leader_hint: Option<u32>,
+    pub data: Option<Vec<u8>>,
+    pub error: Option<String>,
+}
+
 #[tarpc::service]
 pub trait RaftRpc {
     async fn echo(name: String) -> String;
     async fn append_entries(req: AppendEntriesRequest)
     -> AppendEntriesResponse;
     async fn request_vote(req: RequestVoteRequest) -> RequestVoteResponse;
+    async fn submit_command(req: CommandRequest) -> CommandResponse;
 }

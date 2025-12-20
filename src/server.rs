@@ -22,6 +22,7 @@ use tracing::Instrument;
 pub enum Command {
     AppendEntries(AppendEntriesRequest, oneshot::Sender<AppendEntriesResponse>),
     RequestVote(RequestVoteRequest, oneshot::Sender<RequestVoteResponse>),
+    SubmitCommand(CommandRequest, oneshot::Sender<CommandResponse>),
 }
 
 pub enum Response {
@@ -32,7 +33,6 @@ pub enum Response {
 pub struct Chan<T> {
     heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
     heartbeat_rx: mpsc::UnboundedReceiver<(u32, u32)>,
-    #[allow(dead_code)]
     client_tx: mpsc::Sender<T>,
     client_rx: mpsc::Receiver<T>,
 }
@@ -122,9 +122,10 @@ where
         let (tx, rx) = mpsc::channel::<Command>(32);
         let state = Arc::clone(&self.state);
         let heartbeat_tx = self.c.heartbeat_tx.clone();
+        let client_tx = self.c.client_tx.clone();
         let mut workers = JoinSet::new();
         workers.spawn(self.main(servers));
-        workers.spawn(Self::rpc_handler(state, rx, heartbeat_tx));
+        workers.spawn(Self::rpc_handler(state, rx, heartbeat_tx, client_tx));
         workers.spawn(Self::rpc_server(tx, port));
 
         if let Some(res) = workers.join_next().await {
@@ -150,7 +151,7 @@ where
         listener
             .filter_map(|r| future::ready(r.ok()))
             .map(server::BaseChannel::with_defaults)
-            .max_channels_per_key(1, |t| {
+            .max_channels_per_key(10, |t| {
                 t.transport().peer_addr().unwrap().ip()
             })
             .map(|channel| {
@@ -184,6 +185,7 @@ where
             state.persistent.current_term = req.term;
             state.role = Role::Follower;
             state.persistent.voted_for = None;
+            state.leader_id = Some(req.leader_id);
             if let Err(e) = state.persist().await {
                 tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update");
                 return Ok(AppendEntriesResponse {
@@ -191,6 +193,9 @@ where
                     success: false,
                 });
             }
+        } else if req.term == state.persistent.current_term {
+            // Update leader_id even if term is same
+            state.leader_id = Some(req.leader_id);
         }
 
         if req.prev_log_index > 0 {
@@ -308,6 +313,56 @@ where
             success: true,
         })
     }
+    async fn submit_command_handler(
+        req: &CommandRequest,
+        state: Arc<Mutex<RaftState<T, SM>>>,
+        client_tx: mpsc::Sender<T>,
+    ) -> CommandResponse {
+        let state_guard = state.lock().await;
+
+        // Check if this node is the leader
+        if !matches!(state_guard.role, Role::Leader) {
+            return CommandResponse {
+                success: false,
+                leader_hint: state_guard.leader_id,
+                data: None,
+                error: Some("Not the leader".to_string()),
+            };
+        }
+        drop(state_guard);
+
+        // Deserialize the command
+        let command = match bincode::deserialize(&req.command) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return CommandResponse {
+                    success: false,
+                    leader_hint: None,
+                    data: None,
+                    error: Some(format!("Failed to deserialize command: {}", e)),
+                };
+            }
+        };
+
+        // Send command to leader via client channel
+        if let Err(e) = client_tx.send(command).await {
+            return CommandResponse {
+                success: false,
+                leader_hint: None,
+                data: None,
+                error: Some(format!("Failed to send command to leader: {}", e)),
+            };
+        }
+
+        // TODO: Wait for the command to be committed and applied
+        CommandResponse {
+            success: true,
+            leader_hint: None,
+            data: Some(b"Command received".to_vec()),
+            error: None,
+        }
+    }
+
     async fn request_vote(
         req: &RequestVoteRequest,
         state: Arc<Mutex<RaftState<T, SM>>>,
@@ -396,6 +451,7 @@ where
         state: Arc<Mutex<RaftState<T, SM>>>,
         mut rx: mpsc::Receiver<Command>,
         heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
+        client_tx: mpsc::Sender<T>,
     ) -> anyhow::Result<()> {
         while let Some(command) = rx.recv().await {
             match command {
@@ -422,6 +478,12 @@ where
                         Self::request_vote(&req, Arc::clone(&state)).await;
                     tx.send(resp)
                         .expect("failed to send append entries response");
+                }
+                Command::SubmitCommand(req, tx) => {
+                    let resp =
+                        Self::submit_command_handler(&req, Arc::clone(&state), client_tx.clone()).await;
+                    tx.send(resp)
+                        .expect("failed to send submit command response");
                 }
             }
         }
@@ -496,73 +558,9 @@ where
                 self.peers.len(),
                 peers_to_connect.len()
             );
-        } else {
-            tracing::info!(
-                "Node {} successfully connected to all {} peers",
-                node_id,
-                self.peers.len()
-            );
         }
-
-        // Verify connections
         tracing::info!(
-            "Node {} verifying connections to {} peers",
-            node_id,
-            self.peers.len()
-        );
-        let mut failed_peers = Vec::new();
-
-        for (addr, client) in self.peers.clone() {
-            let mut ctx = tarpc::context::current();
-            ctx.deadline = Instant::now() + Duration::from_secs(2);
-            match client.echo(ctx, "connection_check".to_string()).await {
-                Ok(_resp) => {
-                    tracing::info!(
-                        "Node {} connection to {:?} verified",
-                        node_id,
-                        addr
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Node {} connection to {:?} verification failed: {:?}",
-                        node_id,
-                        addr,
-                        e
-                    );
-                    failed_peers.push(addr);
-                }
-            }
-        }
-
-        // Reconnect to failed peers
-        for addr in failed_peers {
-            tracing::info!(
-                "Node {} attempting to reconnect to {:?}",
-                node_id,
-                addr
-            );
-            match self.connect_to_peer(addr).await {
-                Ok(_) => {
-                    tracing::info!(
-                        "Node {} successfully reconnected to {:?}",
-                        node_id,
-                        addr
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Node {} failed to reconnect to {:?}: {:?}",
-                        node_id,
-                        addr,
-                        e
-                    );
-                }
-            }
-        }
-
-        tracing::info!(
-            "Node {} setup completed, {} peer connections established",
+            "Node {} successfully connected to all {} peers",
             node_id,
             self.peers.len()
         );
@@ -1111,6 +1109,16 @@ impl RaftRpc for RaftServer {
     ) -> RequestVoteResponse {
         let (tx, rx) = oneshot::channel::<RequestVoteResponse>();
         self.tx.send(Command::RequestVote(req, tx)).await.unwrap();
+        rx.await.unwrap()
+    }
+
+    async fn submit_command(
+        self,
+        _: tarpc::context::Context,
+        req: CommandRequest,
+    ) -> CommandResponse {
+        let (tx, rx) = oneshot::channel::<CommandResponse>();
+        self.tx.send(Command::SubmitCommand(req, tx)).await.unwrap();
         rx.await.unwrap()
     }
 }
