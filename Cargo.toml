@@ -13,6 +13,7 @@ futures = "0.3"
 opentelemetry = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
 opentelemetry_sdk = "0.31.0"
+rand = "0.9.2"
 serde = { version = "1.0", features = ["derive"] }
 tarpc = { version = "0.37", features = ["full"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "test-util"] }

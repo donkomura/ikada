@@ -1,3 +1,4 @@
+use rand::Rng;
 use std::time::Duration;
 
 pub struct Config {
@@ -8,9 +9,14 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let base_ms = 1000;
+        let min_ms = (base_ms as f64 * 1.5) as u64;
+        let max_ms = (base_ms as f64 * 3.0) as u64;
+        let timeout_ms = rand::rng().random_range(min_ms..=max_ms);
+
         Self {
             heartbeat_interval: tokio::time::Duration::from_millis(1000),
-            election_timeout: tokio::time::Duration::from_millis(10000),
+            election_timeout: tokio::time::Duration::from_millis(timeout_ms),
             rpc_timeout: tokio::time::Duration::from_millis(5000),
         }
     }
