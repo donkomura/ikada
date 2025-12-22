@@ -358,10 +358,9 @@ mod tests {
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 if let Command::AppendEntries(req, resp_tx) = cmd {
-                    let resp =
-                        handle_append_entries(&req, state_clone.clone())
-                            .await
-                            .unwrap();
+                    let resp = handle_append_entries(&req, state_clone.clone())
+                        .await
+                        .unwrap();
                     let _ = resp_tx.send(resp);
                 }
             }
