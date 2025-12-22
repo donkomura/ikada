@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use ikada::config::Config;
-use ikada::server::Node;
+use ikada::node::Node;
 use ikada::statemachine::KVStateMachine;
 use ikada::trace::init_tracing;
 

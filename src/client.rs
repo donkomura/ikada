@@ -43,7 +43,7 @@ impl RaftClient {
             let request = CommandRequest {
                 command: command.clone(),
             };
-            let response = self.client.submit_command(ctx, request).await?;
+            let response = self.client.client_request(ctx, request).await?;
 
             if response.success {
                 return response

@@ -1,0 +1,276 @@
+//! Role-based state machine loops.
+//!
+//! Implements the main Raft node lifecycle:
+//! - Role-based dispatch (follower/candidate/leader)
+//! - Election timeout and heartbeat handling
+//! - Client command processing by leader
+
+use super::Node;
+use crate::raft::{self, Role};
+use crate::statemachine::StateMachine;
+use crate::watchdog::WatchDog;
+use std::net::SocketAddr;
+
+impl<T, SM> Node<T, SM>
+where
+    T: Send
+        + Sync
+        + Clone
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + 'static,
+    SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
+{
+    /// Main event loop that dispatches to role-specific handlers.
+    /// Runs indefinitely until an error occurs.
+    pub(super) async fn main(
+        mut self,
+        servers: Vec<SocketAddr>,
+    ) -> anyhow::Result<()> {
+        self.setup(servers).await?;
+
+        loop {
+            let role = {
+                let state = self.state.lock().await;
+                state.role
+            };
+            match role {
+                Role::Follower => self.run_follower().await,
+                Role::Candidate => self.run_candidate().await,
+                Role::Leader => self.run_leader().await,
+            }?
+        }
+    }
+
+    /// Runs as follower, waiting for heartbeats from leader.
+    /// Transitions to candidate on election timeout.
+    pub(super) async fn run_follower(&mut self) -> anyhow::Result<()> {
+        let timeout = self.config.election_timeout;
+        let watchdog = WatchDog::default();
+
+        // Wait and reset to avoid immediate timeout on first run
+        watchdog.wait().await;
+        watchdog.reset(timeout).await;
+
+        loop {
+            if !matches!(self.state.lock().await.role, Role::Follower) {
+                break;
+            }
+            tokio::select! {
+                Some(_) = self.c.heartbeat_rx.recv() => {
+                    watchdog.reset(timeout).await;
+                }
+                _ = watchdog.wait() => {
+                    watchdog.reset(timeout).await;
+                    self.become_candidate().await?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs as candidate, starting elections periodically.
+    /// Transitions to follower if a valid leader's heartbeat is received.
+    pub(super) async fn run_candidate(&mut self) -> anyhow::Result<()> {
+        let timeout = self.config.election_timeout;
+        let watchdog = WatchDog::default();
+        loop {
+            if !matches!(self.state.lock().await.role, Role::Candidate) {
+                break;
+            }
+            tokio::select! {
+                Some((id, term)) = self.c.heartbeat_rx.recv() => {
+                    let current_term = self.state.lock().await.persistent.current_term;
+                    if term >= current_term {
+                        // Accept heartbeat: requester is the new leader
+                        self.state.lock().await.leader_id = Some(id);
+                        self.become_follower().await?;
+                    }
+                },
+                _ = watchdog.wait() => {
+                    watchdog.reset(timeout).await;
+                    self.start_election().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs as leader, processing client commands and sending periodic heartbeats.
+    /// Applies committed entries to the state machine after each heartbeat round.
+    pub(super) async fn run_leader(&mut self) -> anyhow::Result<()> {
+        let timeout = self.config.heartbeat_interval;
+        let watchdog = WatchDog::default();
+        loop {
+            if !matches!(self.state.lock().await.role, Role::Leader) {
+                break;
+            }
+            tokio::select! {
+                Some(order) = self.c.client_rx.recv() => {
+                    let mut state = self.state.lock().await;
+                    let term = state.persistent.current_term;
+                    let new_log_index = state.persistent.log.len() as u32 + 1;
+                    state.persistent.log.push(raft::Entry {
+                        term,
+                        command: order.clone(),
+                    });
+                    tracing::info!(
+                        id=?state.id,
+                        term=term,
+                        log_index=new_log_index,
+                        command=?order,
+                        log_len=state.persistent.log.len(),
+                        "Appended new entry to log"
+                    );
+                    if let Err(e) = state.persist().await {
+                        tracing::error!(id=?state.id, error=?e, "Failed to persist state after appending log entry");
+                    }
+                },
+                _ = watchdog.wait() => {
+                    self.broadcast_heartbeat().await?;
+                    let mut state = self.state.lock().await;
+                    if state.commit_index > state.last_applied {
+                        state.apply_committed().await?;
+                    }
+                    watchdog.reset(timeout).await;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::time::Duration;
+
+    fn create_test_state_machine() -> crate::statemachine::NoOpStateMachine {
+        crate::statemachine::NoOpStateMachine::default()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn election_must_be_done_with_not_candidate() -> anyhow::Result<()> {
+        let mut node =
+            Node::new(10101, Config::default(), create_test_state_machine());
+        node.become_candidate().await?;
+        node.run_candidate().await?;
+        assert_ne!(node.state.lock().await.role, Role::Candidate);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_follower_becomes_candidate_after_election_timeout()
+    -> anyhow::Result<()> {
+        let config = Config {
+            election_timeout: Duration::from_millis(2000),
+            ..Default::default()
+        };
+        let mut node = Node::new(10101, config, create_test_state_machine());
+        let result = tokio::spawn(async move { node.run_follower().await });
+        // election timeoutを超える時間（2100ms）進める
+        tokio::time::advance(Duration::from_millis(2100)).await;
+        // スケジューラに制御を渡してwatchdogのタイムアウトを発火させる
+        tokio::task::yield_now().await;
+        assert!(result.await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_candidate_calls_start_election() -> anyhow::Result<()> {
+        let config = Config {
+            rpc_timeout: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let mut node = Node::new(10101, config, create_test_state_machine());
+        node.become_candidate().await?;
+        let result = tokio::spawn(async move { node.run_candidate().await });
+        // 100ms進めてstart_electionが呼ばれる時間を与える
+        tokio::time::advance(Duration::from_millis(100)).await;
+        // スケジューラに制御を渡してタスクを実行させる
+        tokio::task::yield_now().await;
+        assert!(result.await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_follower_multiple_heartbeat_resets() -> anyhow::Result<()> {
+        let config = Config {
+            election_timeout: Duration::from_millis(1000),
+            ..Default::default()
+        };
+        let mut node = Node::new(10101, config, create_test_state_machine());
+
+        let heartbeat_tx = node.c.heartbeat_tx.clone();
+        let result = tokio::spawn(async move { node.run_follower().await });
+
+        // 1回目: 800ms経過後にheartbeat
+        tokio::time::advance(Duration::from_millis(800)).await;
+        tokio::task::yield_now().await;
+        assert!(!result.is_finished());
+
+        heartbeat_tx.send((1, 1)).unwrap();
+        tokio::task::yield_now().await;
+
+        // 2回目: さらに800ms経過後にheartbeat（リセットから800ms）
+        tokio::time::advance(Duration::from_millis(800)).await;
+        tokio::task::yield_now().await;
+        assert!(!result.is_finished());
+
+        heartbeat_tx.send((1, 1)).unwrap();
+        tokio::task::yield_now().await;
+
+        // 3回目: さらに800ms経過後にheartbeat（リセットから800ms）
+        tokio::time::advance(Duration::from_millis(800)).await;
+        tokio::task::yield_now().await;
+        assert!(!result.is_finished());
+
+        heartbeat_tx.send((1, 1)).unwrap();
+        tokio::task::yield_now().await;
+
+        // heartbeat停止: 1100ms経過でタイムアウト
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        tokio::task::yield_now().await;
+        assert!(result.is_finished());
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_follower_heartbeat_prevents_timeout() -> anyhow::Result<()> {
+        let config = Config {
+            election_timeout: Duration::from_millis(1000),
+            ..Default::default()
+        };
+        let mut node = Node::new(10101, config, create_test_state_machine());
+
+        let heartbeat_tx = node.c.heartbeat_tx.clone();
+        let result = tokio::spawn(async move { node.run_follower().await });
+
+        // 1回目: 800ms経過後にheartbeat
+        tokio::time::advance(Duration::from_millis(800)).await;
+        tokio::task::yield_now().await;
+        assert!(!result.is_finished());
+
+        heartbeat_tx.send((1, 1)).unwrap();
+        tokio::task::yield_now().await;
+
+        // 2回目: さらに800ms経過後にheartbeat（リセットから800ms）
+        tokio::time::advance(Duration::from_millis(800)).await;
+        tokio::task::yield_now().await;
+        assert!(!result.is_finished());
+
+        heartbeat_tx.send((1, 1)).unwrap();
+        tokio::task::yield_now().await;
+
+        // heartbeat停止: 1100ms経過でタイムアウト
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        tokio::task::yield_now().await;
+        assert!(result.is_finished());
+
+        Ok(())
+    }
+}
