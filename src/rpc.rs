@@ -62,5 +62,5 @@ pub trait RaftRpc {
     async fn append_entries(req: AppendEntriesRequest)
     -> AppendEntriesResponse;
     async fn request_vote(req: RequestVoteRequest) -> RequestVoteResponse;
-    async fn submit_command(req: CommandRequest) -> CommandResponse;
+    async fn client_request(req: CommandRequest) -> CommandResponse;
 }
