@@ -1,29 +1,32 @@
 use std::net::SocketAddr;
 use std::time::Duration;
-use tarpc::{client, context, tokio_serde::formats::Json};
+use tarpc::context;
 
+use crate::network::NetworkFactory;
 use crate::rpc::{CommandRequest, RaftRpcClient};
 
-pub struct RaftClient {
+pub struct RaftClient<NF: NetworkFactory> {
     client: RaftRpcClient,
     addr: SocketAddr,
+    network_factory: NF,
 }
 
-impl RaftClient {
-    pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
-        let transport =
-            tarpc::serde_transport::tcp::connect(addr, Json::default).await?;
-        let client =
-            RaftRpcClient::new(client::Config::default(), transport).spawn();
+impl<NF: NetworkFactory> RaftClient<NF> {
+    pub async fn connect(
+        addr: SocketAddr,
+        network_factory: NF,
+    ) -> anyhow::Result<Self> {
+        let client = network_factory.connect(addr).await?;
 
-        Ok(Self { client, addr })
+        Ok(Self {
+            client,
+            addr,
+            network_factory,
+        })
     }
 
     async fn reconnect(&mut self, addr: SocketAddr) -> anyhow::Result<()> {
-        let transport =
-            tarpc::serde_transport::tcp::connect(addr, Json::default).await?;
-        self.client =
-            RaftRpcClient::new(client::Config::default(), transport).spawn();
+        self.client = self.network_factory.connect(addr).await?;
         self.addr = addr;
         Ok(())
     }

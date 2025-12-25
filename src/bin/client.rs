@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use ikada::client::RaftClient;
+use ikada::network::TarpcNetworkFactory;
 use ikada::statemachine::KVCommand;
 use ikada::trace::init_tracing;
 
@@ -15,9 +16,10 @@ async fn main() -> anyhow::Result<()> {
         SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port + 2)),
     ];
 
+    let network_factory = TarpcNetworkFactory::new();
     let mut client = None;
     for &addr in &servers {
-        if let Ok(c) = RaftClient::connect(addr).await {
+        if let Ok(c) = RaftClient::connect(addr, network_factory.clone()).await {
             tracing::info!("Connected to {}", addr);
             client = Some(c);
             break;

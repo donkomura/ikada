@@ -6,6 +6,7 @@
 //! - next_index/match_index tracking for each peer
 
 use super::Node;
+use crate::network::NetworkFactory;
 use crate::raft::{self, Role};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-impl<T, SM> Node<T, SM>
+impl<T, SM, NF> Node<T, SM, NF>
 where
     T: Send
         + Sync
@@ -25,6 +26,7 @@ where
         + serde::de::DeserializeOwned
         + 'static,
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
+    NF: NetworkFactory + Clone + 'static,
 {
     /// Broadcasts AppendEntries RPCs to all followers.
     /// Called periodically by the leader to replicate log entries and maintain authority.
@@ -312,10 +314,22 @@ mod tests {
         crate::statemachine::NoOpStateMachine::default()
     }
 
+    fn create_test_node() -> Node<
+        bytes::Bytes,
+        crate::statemachine::NoOpStateMachine,
+        crate::network::mock::MockNetworkFactory,
+    > {
+        Node::new(
+            10101,
+            Config::default(),
+            create_test_state_machine(),
+            crate::network::mock::MockNetworkFactory::new(),
+        )
+    }
+
     #[tokio::test]
     async fn test_commit_only_current_term_entries() -> anyhow::Result<()> {
-        let node =
-            Node::new(10101, Config::default(), create_test_state_machine());
+        let node = create_test_node();
 
         // 3ノードクラスタを想定（リーダー + 2ピア）
         let peer1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10102);
@@ -356,7 +370,11 @@ mod tests {
         // new_commit_index()を直接テスト
         let new_commit_index = {
             let state = node.state.lock().await;
-            Node::<bytes::Bytes, crate::statemachine::NoOpStateMachine>::new_commit_index(
+            Node::<
+                bytes::Bytes,
+                crate::statemachine::NoOpStateMachine,
+                crate::network::mock::MockNetworkFactory,
+            >::new_commit_index(
                 state.commit_index,
                 state.persistent.current_term,
                 &state.persistent.log,
