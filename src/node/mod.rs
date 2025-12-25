@@ -61,7 +61,11 @@ impl<T> Chan<T> {
 /// Node is the main Raft participant structure.
 /// Fields are pub(crate) to allow submodules (election, replication, etc.)
 /// access without exposing internals to external crates.
-pub struct Node<T: Send + Sync, SM: StateMachine<Command = T>, NF: NetworkFactory> {
+pub struct Node<
+    T: Send + Sync,
+    SM: StateMachine<Command = T>,
+    NF: NetworkFactory,
+> {
     pub(crate) config: Config,
     pub(crate) peers: HashMap<SocketAddr, RaftRpcClient>,
     pub(crate) state: Arc<Mutex<RaftState<T, SM>>>,

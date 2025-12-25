@@ -19,7 +19,8 @@ async fn main() -> anyhow::Result<()> {
     let network_factory = TarpcNetworkFactory::new();
     let mut client = None;
     for &addr in &servers {
-        if let Ok(c) = RaftClient::connect(addr, network_factory.clone()).await {
+        if let Ok(c) = RaftClient::connect(addr, network_factory.clone()).await
+        {
             tracing::info!("Connected to {}", addr);
             client = Some(c);
             break;

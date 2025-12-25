@@ -151,12 +151,12 @@ pub mod mock {
                     })?;
 
             let client =
-                RaftRpcClient::new(client::Config::default(), transport).spawn();
+                RaftRpcClient::new(client::Config::default(), transport)
+                    .spawn();
 
             Ok(client)
         }
     }
-
 }
 
 #[cfg(test)]
