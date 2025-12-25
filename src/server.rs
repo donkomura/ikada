@@ -30,18 +30,14 @@ pub async fn rpc_server(
         .filter_map(|r| future::ready(r.ok()))
         .map(server::BaseChannel::with_defaults)
         .max_channels_per_key(10, |t| t.transport().peer_addr().unwrap().ip())
-        .map(|channel| {
+        .for_each_concurrent(10, |channel| async {
             let server = RaftServer { tx: tx.clone() };
-            channel.execute(server.serve()).for_each(spawn)
+            channel.execute(server.serve()).for_each(|response| async move {
+                tokio::spawn(response);
+            }).await
         })
-        .buffer_unordered(10)
-        .for_each(|_| async {})
         .await;
     Ok(())
-}
-
-async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
-    tokio::spawn(fut);
 }
 
 /// RPC server implementation that forwards requests to the node via channels.
@@ -51,10 +47,6 @@ struct RaftServer {
 }
 
 impl RaftRpc for RaftServer {
-    async fn echo(self, _: tarpc::context::Context, name: String) -> String {
-        format!("echo: {name}")
-    }
-
     async fn append_entries(
         self,
         _: tarpc::context::Context,
