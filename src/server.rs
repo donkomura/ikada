@@ -32,9 +32,12 @@ pub async fn rpc_server(
         .max_channels_per_key(10, |t| t.transport().peer_addr().unwrap().ip())
         .for_each_concurrent(10, |channel| async {
             let server = RaftServer { tx: tx.clone() };
-            channel.execute(server.serve()).for_each(|response| async move {
-                tokio::spawn(response);
-            }).await
+            channel
+                .execute(server.serve())
+                .for_each(|response| async move {
+                    tokio::spawn(response);
+                })
+                .await
         })
         .await;
     Ok(())

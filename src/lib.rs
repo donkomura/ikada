@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+pub mod network;
 pub mod node;
 pub mod raft;
 pub mod rpc;

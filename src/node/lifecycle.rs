@@ -6,12 +6,13 @@
 //! - Client command processing by leader
 
 use super::Node;
+use crate::network::NetworkFactory;
 use crate::raft::{self, Role};
 use crate::statemachine::StateMachine;
 use crate::watchdog::WatchDog;
 use std::net::SocketAddr;
 
-impl<T, SM> Node<T, SM>
+impl<T, SM, NF> Node<T, SM, NF>
 where
     T: Send
         + Sync
@@ -21,6 +22,7 @@ where
         + serde::de::DeserializeOwned
         + 'static,
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
+    NF: NetworkFactory + Clone + 'static,
 {
     /// Main event loop that dispatches to role-specific handlers.
     /// Runs indefinitely until an error occurs.
@@ -152,10 +154,24 @@ mod tests {
         crate::statemachine::NoOpStateMachine::default()
     }
 
+    fn create_test_node(
+        config: Config,
+    ) -> Node<
+        bytes::Bytes,
+        crate::statemachine::NoOpStateMachine,
+        crate::network::mock::MockNetworkFactory,
+    > {
+        Node::new(
+            10101,
+            config,
+            create_test_state_machine(),
+            crate::network::mock::MockNetworkFactory::new(),
+        )
+    }
+
     #[tokio::test(start_paused = true)]
     async fn election_must_be_done_with_not_candidate() -> anyhow::Result<()> {
-        let mut node =
-            Node::new(10101, Config::default(), create_test_state_machine());
+        let mut node = create_test_node(Config::default());
         node.become_candidate().await?;
         node.run_candidate().await?;
         assert_ne!(node.state.lock().await.role, Role::Candidate);
@@ -169,7 +185,7 @@ mod tests {
             election_timeout: Duration::from_millis(2000),
             ..Default::default()
         };
-        let mut node = Node::new(10101, config, create_test_state_machine());
+        let mut node = create_test_node(config);
         let result = tokio::spawn(async move { node.run_follower().await });
         // election timeoutを超える時間（2100ms）進める
         tokio::time::advance(Duration::from_millis(2100)).await;
@@ -185,7 +201,7 @@ mod tests {
             rpc_timeout: Duration::from_millis(500),
             ..Default::default()
         };
-        let mut node = Node::new(10101, config, create_test_state_machine());
+        let mut node = create_test_node(config);
         node.become_candidate().await?;
         let result = tokio::spawn(async move { node.run_candidate().await });
         // 100ms進めてstart_electionが呼ばれる時間を与える
@@ -202,7 +218,7 @@ mod tests {
             election_timeout: Duration::from_millis(1000),
             ..Default::default()
         };
-        let mut node = Node::new(10101, config, create_test_state_machine());
+        let mut node = create_test_node(config);
 
         let heartbeat_tx = node.c.heartbeat_tx.clone();
         let result = tokio::spawn(async move { node.run_follower().await });
@@ -245,7 +261,7 @@ mod tests {
             election_timeout: Duration::from_millis(1000),
             ..Default::default()
         };
-        let mut node = Node::new(10101, config, create_test_state_machine());
+        let mut node = create_test_node(config);
 
         let heartbeat_tx = node.c.heartbeat_tx.clone();
         let result = tokio::spawn(async move { node.run_follower().await });

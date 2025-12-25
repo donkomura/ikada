@@ -6,6 +6,7 @@
 //! - State transitions (follower ↔ candidate ↔ leader)
 
 use super::Node;
+use crate::network::NetworkFactory;
 use crate::raft::Role;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-impl<T, SM> Node<T, SM>
+impl<T, SM, NF> Node<T, SM, NF>
 where
     T: Send
         + Sync
@@ -24,6 +25,7 @@ where
         + serde::de::DeserializeOwned
         + 'static,
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
+    NF: NetworkFactory + Clone + 'static,
 {
     /// Initiates an election by requesting votes from all peers.
     pub(super) async fn start_election(&mut self) -> anyhow::Result<()> {
@@ -228,10 +230,22 @@ mod tests {
         crate::statemachine::NoOpStateMachine::default()
     }
 
+    fn create_test_node() -> Node<
+        bytes::Bytes,
+        crate::statemachine::NoOpStateMachine,
+        crate::network::mock::MockNetworkFactory,
+    > {
+        Node::new(
+            10101,
+            Config::default(),
+            create_test_state_machine(),
+            crate::network::mock::MockNetworkFactory::new(),
+        )
+    }
+
     #[tokio::test]
     async fn check_leader_state_after_become_leader() -> anyhow::Result<()> {
-        let mut node =
-            Node::new(10101, Config::default(), create_test_state_machine());
+        let mut node = create_test_node();
         node.become_leader().await?;
         let state = node.state.lock().await;
         assert_eq!(state.role, Role::Leader);
@@ -241,8 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_leader_state_after_become_candidate() -> anyhow::Result<()> {
-        let mut node =
-            Node::new(10101, Config::default(), create_test_state_machine());
+        let mut node = create_test_node();
         let term = node.state.lock().await.persistent.current_term;
         node.become_candidate().await?;
         let state = node.state.lock().await;
@@ -253,8 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_leader_state_after_become_follower() -> anyhow::Result<()> {
-        let mut node =
-            Node::new(10101, Config::default(), create_test_state_machine());
+        let mut node = create_test_node();
         node.become_follower().await?;
         let state = node.state.lock().await;
         assert_eq!(state.role, Role::Follower);

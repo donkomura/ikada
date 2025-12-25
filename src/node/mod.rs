@@ -11,13 +11,13 @@ mod lifecycle;
 mod replication;
 
 use crate::config::Config;
+use crate::network::NetworkFactory;
 use crate::raft::RaftState;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tarpc::client;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -61,14 +61,19 @@ impl<T> Chan<T> {
 /// Node is the main Raft participant structure.
 /// Fields are pub(crate) to allow submodules (election, replication, etc.)
 /// access without exposing internals to external crates.
-pub struct Node<T: Send + Sync, SM: StateMachine<Command = T>> {
+pub struct Node<
+    T: Send + Sync,
+    SM: StateMachine<Command = T>,
+    NF: NetworkFactory,
+> {
     pub(crate) config: Config,
     pub(crate) peers: HashMap<SocketAddr, RaftRpcClient>,
     pub(crate) state: Arc<Mutex<RaftState<T, SM>>>,
     pub(crate) c: Chan<T>,
+    pub(crate) network_factory: NF,
 }
 
-impl<T, SM> Node<T, SM>
+impl<T, SM, NF> Node<T, SM, NF>
 where
     T: Send
         + Sync
@@ -78,10 +83,11 @@ where
         + serde::de::DeserializeOwned
         + 'static,
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
+    NF: NetworkFactory + Clone + 'static,
 {
     /// Creates a new Raft node.
     /// Port is used as node ID for simplicity in testing/demo scenarios.
-    pub fn new(port: u16, config: Config, sm: SM) -> Self {
+    pub fn new(port: u16, config: Config, sm: SM, network_factory: NF) -> Self {
         use crate::storage::MemStorage;
         let storage = Box::new(MemStorage::default());
         let id = port as u32;
@@ -91,6 +97,7 @@ where
             peers: HashMap::default(),
             state: Arc::new(Mutex::new(RaftState::new(id, storage, sm))),
             c: Chan::new(),
+            network_factory,
         }
     }
 
@@ -217,12 +224,7 @@ where
         &mut self,
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
-        let transport = tarpc::serde_transport::tcp::connect(addr, || {
-            tarpc::tokio_serde::formats::Json::default()
-        });
-        let client =
-            RaftRpcClient::new(client::Config::default(), transport.await?)
-                .spawn();
+        let client = self.network_factory.connect(addr).await?;
         self.peers.insert(addr, client);
         Ok(())
     }

@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use ikada::config::Config;
+use ikada::network::TarpcNetworkFactory;
 use ikada::node::Node;
 use ikada::statemachine::KVStateMachine;
 use ikada::trace::init_tracing;
@@ -15,16 +16,29 @@ async fn main() -> anyhow::Result<()> {
         SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port + 1)),
         SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port + 2)),
     ];
-    let mut node1 =
-        Node::new(port, Config::default(), KVStateMachine::default());
+    let network_factory = TarpcNetworkFactory::new();
+    let mut node1 = Node::new(
+        port,
+        Config::default(),
+        KVStateMachine::default(),
+        network_factory.clone(),
+    );
     node1.restore().await?;
 
-    let mut node2 =
-        Node::new(port + 1, Config::default(), KVStateMachine::default());
+    let mut node2 = Node::new(
+        port + 1,
+        Config::default(),
+        KVStateMachine::default(),
+        network_factory.clone(),
+    );
     node2.restore().await?;
 
-    let mut node3 =
-        Node::new(port + 2, Config::default(), KVStateMachine::default());
+    let mut node3 = Node::new(
+        port + 2,
+        Config::default(),
+        KVStateMachine::default(),
+        network_factory.clone(),
+    );
     node3.restore().await?;
 
     let s1 = servers
