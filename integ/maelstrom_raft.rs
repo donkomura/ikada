@@ -212,12 +212,6 @@ impl MaelstromRaftNode {
     }
 
     /// Initialize the Maelstrom Raft node
-    ///
-    /// Sets up:
-    /// 1. Maelstrom node information
-    /// 2. Network factory for protocol translation
-    /// 3. ikada Raft node with proper state
-    /// 4. Background task for running ikada lifecycle
     async fn handle_init(
         &self,
         src: String,
@@ -679,16 +673,20 @@ impl MaelstromRaftNode {
                     self.fix_cas_reply_to(&mut response_msg.body, body.msg_id);
                     Ok(Some(response_msg))
                 }
-                Err(e) => self.error_response(
-                    src,
-                    body.msg_id,
-                    13,
-                    format!("Forward error: {}", e),
-                ),
+                Err(e) => {
+                    self.error_response(
+                        src,
+                        body.msg_id,
+                        13,
+                        format!("Forward error: {}", e),
+                    )
+                    .await
+                }
             };
         }
 
         self.error_response(src, body.msg_id, 13, "Not the leader".to_string())
+            .await
     }
 
     fn fix_cas_reply_to(&self, body: &mut Body, msg_id: u64) {
@@ -703,7 +701,7 @@ impl MaelstromRaftNode {
         }
     }
 
-    fn error_response(
+    async fn error_response(
         &self,
         dest: String,
         in_reply_to: u64,
@@ -711,7 +709,7 @@ impl MaelstromRaftNode {
         text: String,
     ) -> anyhow::Result<Option<Message>> {
         Ok(Some(Message {
-            src: "".to_string(),
+            src: self.get_node_id().await.unwrap_or_default(),
             dest: Some(dest),
             body: Body::Error(ErrorBody {
                 in_reply_to,
@@ -731,29 +729,34 @@ impl MaelstromRaftNode {
         let current_value_str = match current_value {
             Ok(Some(v)) => v,
             Ok(None) => {
-                return self.error_response(
-                    src,
-                    body.msg_id,
-                    ERROR_KEY_NOT_EXIST,
-                    format!("Key {:?} does not exist", key_str),
-                );
+                return self
+                    .error_response(
+                        src,
+                        body.msg_id,
+                        ERROR_KEY_NOT_EXIST,
+                        format!("Key {:?} does not exist", key_str),
+                    )
+                    .await;
             }
             Err(e) => {
                 return self
-                    .error_response(src, body.msg_id, 13, format!("Error: {}", e));
+                    .error_response(src, body.msg_id, 13, format!("Error: {}", e))
+                    .await;
             }
         };
 
         if current_value_str != body.from.to_string() {
-            return self.error_response(
-                src,
-                body.msg_id,
-                ERROR_CAS_MISMATCH,
-                format!(
-                    "Expected {} but found {}",
-                    body.from, current_value_str
-                ),
-            );
+            return self
+                .error_response(
+                    src,
+                    body.msg_id,
+                    ERROR_CAS_MISMATCH,
+                    format!(
+                        "Expected {} but found {}",
+                        body.from, current_value_str
+                    ),
+                )
+                .await;
         }
 
         self.set_new_value(&key_str, body.to.to_string(), src, body.msg_id)
@@ -787,12 +790,13 @@ impl MaelstromRaftNode {
 
         match self.execute_command(set_command).await {
             Ok(_) => Ok(Some(Message {
-                src: "".to_string(),
+                src: self.get_node_id().await.unwrap_or_default(),
                 dest: Some(dest),
                 body: Body::CasOk(CasOkBody { in_reply_to }),
             })),
             Err(e) => {
                 self.error_response(dest, in_reply_to, 13, format!("Error: {}", e))
+                    .await
             }
         }
     }
