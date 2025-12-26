@@ -53,6 +53,8 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
+      - name: Install Graphviz and Gnuplot
+        run: sudo apt-get update && sudo apt-get install -y graphviz gnuplot
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
@@ -60,7 +62,14 @@ jobs:
           path: bin/
       - name: Make binary executable
         run: chmod +x bin/maelstrom-ikada
+      - name: Cache Maelstrom
+        id: cache-maelstrom
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/maelstrom
+          key: maelstrom-v0.2.3
       - name: Download Maelstrom
+        if: steps.cache-maelstrom.outputs.cache-hit != 'true'
         run: |
           wget https://github.com/jepsen-io/maelstrom/releases/download/v0.2.3/maelstrom.tar.bz2
           tar -xjf maelstrom.tar.bz2

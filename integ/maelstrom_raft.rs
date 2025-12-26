@@ -331,9 +331,7 @@ impl MaelstromRaftNode {
 
         cmd_tx
             .send(Command::ClientRequest(
-                CommandRequest {
-                    command: cmd_bytes,
-                },
+                CommandRequest { command: cmd_bytes },
                 resp_tx,
             ))
             .await?;
@@ -368,18 +366,14 @@ impl MaelstromRaftNode {
     ) -> anyhow::Result<KVResponse> {
         let leader_id = self.get_current_leader_id().await?;
 
-        if let Some(leader_hint) = leader_id {
-            if let Some(leader_node_id) =
+        if let Some(leader_hint) = leader_id
+            && let Some(leader_node_id) =
                 self.get_node_id_by_hint(leader_hint).await
-            {
-                return self.forward_to_leader(leader_node_id, cmd).await;
-            }
+        {
+            return self.forward_to_leader(leader_node_id, cmd).await;
         }
 
-        Err(anyhow::anyhow!(
-            "Command failed: {:?}",
-            response.error
-        ))
+        Err(anyhow::anyhow!("Command failed: {:?}", response.error))
     }
 
     async fn get_current_leader_id(&self) -> anyhow::Result<Option<u32>> {
@@ -740,12 +734,17 @@ impl MaelstromRaftNode {
             }
             Err(e) => {
                 return self
-                    .error_response(src, body.msg_id, 13, format!("Error: {}", e))
+                    .error_response(
+                        src,
+                        body.msg_id,
+                        13,
+                        format!("Error: {}", e),
+                    )
                     .await;
             }
         };
 
-        if current_value_str != body.from.to_string() {
+        if current_value_str != body.from {
             return self
                 .error_response(
                     src,
@@ -795,8 +794,13 @@ impl MaelstromRaftNode {
                 body: Body::CasOk(CasOkBody { in_reply_to }),
             })),
             Err(e) => {
-                self.error_response(dest, in_reply_to, 13, format!("Error: {}", e))
-                    .await
+                self.error_response(
+                    dest,
+                    in_reply_to,
+                    13,
+                    format!("Error: {}", e),
+                )
+                .await
             }
         }
     }
@@ -918,19 +922,22 @@ where
 
                 match cmd {
                     Command::AppendEntries(req, resp_tx) => {
-                        let resp = ikada::node::handlers::handle_append_entries(
-                            &req,
-                            state_clone.clone(),
-                        )
-                        .await
-                        .unwrap_or(AppendEntriesResponse {
-                            term: 0,
-                            success: false,
-                        });
+                        let resp =
+                            ikada::node::handlers::handle_append_entries(
+                                &req,
+                                state_clone.clone(),
+                            )
+                            .await
+                            .unwrap_or(
+                                AppendEntriesResponse {
+                                    term: 0,
+                                    success: false,
+                                },
+                            );
 
                         if resp.success || resp.term > req.term {
-                            let _ =
-                                heartbeat_tx_clone.send((req.leader_id, req.term));
+                            let _ = heartbeat_tx_clone
+                                .send((req.leader_id, req.term));
                         }
 
                         let _ = resp_tx.send(resp);
@@ -945,12 +952,13 @@ where
                         let _ = resp_tx.send(resp);
                     }
                     Command::ClientRequest(req, resp_tx) => {
-                        let resp = ikada::node::handlers::handle_client_request(
-                            &req,
-                            state_clone.clone(),
-                            client_tx_clone.clone(),
-                        )
-                        .await;
+                        let resp =
+                            ikada::node::handlers::handle_client_request(
+                                &req,
+                                state_clone.clone(),
+                                client_tx_clone.clone(),
+                            )
+                            .await;
 
                         let _ = resp_tx.send(resp);
                     }
