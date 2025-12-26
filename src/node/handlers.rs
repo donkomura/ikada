@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, mpsc};
 
 /// Handles AppendEntries RPC from leader.
 /// Returns success only if log consistency checks pass (Raft §5.3).
-pub(super) async fn handle_append_entries<T, SM>(
+pub async fn handle_append_entries<T, SM>(
     req: &AppendEntriesRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
 ) -> anyhow::Result<AppendEntriesResponse>
@@ -177,7 +177,7 @@ where
 
 /// Handles RequestVote RPC from candidate.
 /// Grants vote only if log is at least as up-to-date (Raft §5.4).
-pub(super) async fn handle_request_vote<T, SM>(
+pub async fn handle_request_vote<T, SM>(
     req: &RequestVoteRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
 ) -> RequestVoteResponse
@@ -267,7 +267,7 @@ where
 
 /// Handles client command submission.
 /// Redirects to leader if this node is not the current leader.
-pub(super) async fn handle_client_request<T, SM>(
+pub async fn handle_client_request<T, SM>(
     req: &CommandRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
     client_tx: mpsc::Sender<T>,
@@ -275,34 +275,63 @@ pub(super) async fn handle_client_request<T, SM>(
 where
     T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned,
     SM: StateMachine<Command = T>,
+    SM::Response: Clone + serde::Serialize,
 {
-    let state_guard = state.lock().await;
+    let (command, _log_index, result_rx) = {
+        let mut state_guard = state.lock().await;
 
-    // Check if this node is the leader
-    if !matches!(state_guard.role, Role::Leader) {
-        return CommandResponse {
-            success: false,
-            leader_hint: state_guard.leader_id,
-            data: None,
-            error: Some("Not the leader".to_string()),
+        // Check if this node is the leader
+        if !matches!(state_guard.role, Role::Leader) {
+            return CommandResponse {
+                success: false,
+                leader_hint: state_guard.leader_id,
+                data: None,
+                error: Some("Not the leader".to_string()),
+            };
+        }
+
+        // Deserialize the command
+        let command: T = match bincode::deserialize(&req.command) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return CommandResponse {
+                    success: false,
+                    leader_hint: None,
+                    data: None,
+                    error: Some(format!(
+                        "Failed to deserialize command: {}",
+                        e
+                    )),
+                };
+            }
         };
-    }
-    drop(state_guard);
 
-    // Deserialize the command
-    let command = match bincode::deserialize(&req.command) {
-        Ok(cmd) => cmd,
-        Err(e) => {
+        // Add to log and get the log index
+        let term = state_guard.persistent.current_term;
+        let log_index = state_guard.persistent.log.len() as u32 + 1;
+        state_guard.persistent.log.push(crate::raft::Entry {
+            term,
+            command: command.clone(),
+        });
+
+        // Persist the log
+        if let Err(e) = state_guard.persist().await {
             return CommandResponse {
                 success: false,
                 leader_hint: None,
                 data: None,
-                error: Some(format!("Failed to deserialize command: {}", e)),
+                error: Some(format!("Failed to persist log: {}", e)),
             };
         }
+
+        // Create channel for waiting for the result
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        state_guard.pending_responses.insert(log_index, result_tx);
+
+        (command, log_index, result_rx)
     };
 
-    // Send command to leader via client channel
+    // Send command to client_tx for replication
     if let Err(e) = client_tx.send(command).await {
         return CommandResponse {
             success: false,
@@ -312,12 +341,39 @@ where
         };
     }
 
-    // TODO: Wait for the command to be committed and applied
-    CommandResponse {
-        success: true,
-        leader_hint: None,
-        data: Some(b"Command received".to_vec()),
-        error: None,
+    // Wait for the result (with timeout)
+    match tokio::time::timeout(std::time::Duration::from_secs(10), result_rx)
+        .await
+    {
+        Ok(Ok(response)) => {
+            // Serialize the response
+            match bincode::serialize(&response) {
+                Ok(data) => CommandResponse {
+                    success: true,
+                    leader_hint: None,
+                    data: Some(data),
+                    error: None,
+                },
+                Err(e) => CommandResponse {
+                    success: false,
+                    leader_hint: None,
+                    data: None,
+                    error: Some(format!("Failed to serialize response: {}", e)),
+                },
+            }
+        }
+        Ok(Err(_)) => CommandResponse {
+            success: false,
+            leader_hint: None,
+            data: None,
+            error: Some("Response channel closed".to_string()),
+        },
+        Err(_) => CommandResponse {
+            success: false,
+            leader_hint: None,
+            data: None,
+            error: Some("Request timeout".to_string()),
+        },
     }
 }
 

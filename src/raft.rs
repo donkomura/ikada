@@ -2,6 +2,7 @@ use crate::statemachine::StateMachine;
 use crate::storage::Storage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use tokio::sync::oneshot;
 
 #[derive(Debug, Clone)]
 pub struct Entry<T: Send + Sync> {
@@ -24,7 +25,6 @@ pub enum Role {
     Leader,
 }
 
-#[derive(Debug)]
 pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     // Persistent state on all services
     pub persistent: PersistentState<T>,
@@ -43,6 +43,9 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
 
     storage: Box<dyn Storage<T>>,
     sm: SM,
+
+    // Pending client responses (log_index -> response sender)
+    pub pending_responses: HashMap<u32, oneshot::Sender<SM::Response>>,
 }
 
 impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
@@ -62,6 +65,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             id,
             storage,
             sm,
+            pending_responses: HashMap::new(),
         }
     }
 
@@ -87,6 +91,13 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             self.last_applied += 1;
             let entry = &self.persistent.log[(self.last_applied - 1) as usize];
             let response = self.sm.apply(&entry.command).await?;
+
+            // Send response to waiting client if there's a pending channel
+            if let Some(tx) = self.pending_responses.remove(&self.last_applied)
+            {
+                let _ = tx.send(response.clone());
+            }
+
             responses.push(response);
         }
         Ok(responses)

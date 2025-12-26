@@ -95,7 +95,10 @@ impl RaftRpcTrait for RaftRpcClient {
         ctx: tarpc::context::Context,
         req: AppendEntriesRequest,
     ) -> anyhow::Result<AppendEntriesResponse> {
-        self.clone().append_entries(ctx, req).await.map_err(Into::into)
+        self.clone()
+            .append_entries(ctx, req)
+            .await
+            .map_err(Into::into)
     }
 
     async fn request_vote(
@@ -103,7 +106,10 @@ impl RaftRpcTrait for RaftRpcClient {
         ctx: tarpc::context::Context,
         req: RequestVoteRequest,
     ) -> anyhow::Result<RequestVoteResponse> {
-        self.clone().request_vote(ctx, req).await.map_err(Into::into)
+        self.clone()
+            .request_vote(ctx, req)
+            .await
+            .map_err(Into::into)
     }
 
     async fn client_request(
@@ -111,6 +117,9 @@ impl RaftRpcTrait for RaftRpcClient {
         ctx: tarpc::context::Context,
         req: CommandRequest,
     ) -> anyhow::Result<CommandResponse> {
-        self.clone().client_request(ctx, req).await.map_err(Into::into)
+        self.clone()
+            .client_request(ctx, req)
+            .await
+            .map_err(Into::into)
     }
 }

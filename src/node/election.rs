@@ -39,7 +39,7 @@ where
             voted_for,
         ) = {
             let state = self.state.lock().await;
-            tracing::info!(id=?state.id, state=?state, "start_election");
+            tracing::info!(id=?state.id, "start_election");
             // Self-vote
             responses.push(RequestVoteResponse {
                 term: state.persistent.current_term,
@@ -164,6 +164,7 @@ where
     /// Transitions to leader and initializes next_index/match_index.
     pub(super) async fn become_leader(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
+        tracing::info!(id=?state.id, term=state.persistent.current_term, "BECOMING LEADER");
         state.role = Role::Leader;
         state.leader_id = Some(state.id);
 
@@ -217,7 +218,7 @@ where
                     error = ?e,
                     "request_vote RPC failed to peer"
                 );
-                e.into()
+                e
             })
     }
 }

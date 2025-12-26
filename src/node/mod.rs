@@ -45,6 +45,12 @@ pub struct Chan<T> {
     pub client_rx: mpsc::Receiver<T>,
 }
 
+impl<T> Default for Chan<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> Chan<T> {
     pub fn new() -> Self {
         let (heartbeat_tx, heartbeat_rx) = mpsc::unbounded_channel();
@@ -187,6 +193,8 @@ where
                     let state_clone = Arc::clone(&state);
                     let heartbeat_tx = heartbeat_tx.clone();
                     tokio::spawn(async move {
+                        let current_term =
+                            state_clone.lock().await.persistent.current_term;
                         let resp = handlers::handle_append_entries(&req, state_clone.clone())
                             .await
                             .unwrap_or_else(|e| {
@@ -199,9 +207,9 @@ where
 
                         let _ = resp_tx.send(resp.clone());
 
-                        // Notify lifecycle loop of successful AppendEntries to reset election timeout
-                        if resp.success {
-                            let _state = state_clone.lock().await;
+                        // Reset election timeout if we received AppendEntries from current or higher term leader
+                        // This prevents unnecessary elections even when log consistency checks fail
+                        if req.term >= current_term {
                             let _ =
                                 heartbeat_tx.send((req.term, req.leader_id));
                         }

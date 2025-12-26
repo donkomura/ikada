@@ -7,7 +7,7 @@
 
 use super::Node;
 use crate::network::NetworkFactory;
-use crate::raft::{self, Role};
+use crate::raft::Role;
 use crate::statemachine::StateMachine;
 use crate::watchdog::WatchDog;
 use std::net::SocketAddr;
@@ -47,7 +47,7 @@ where
 
     /// Runs as follower, waiting for heartbeats from leader.
     /// Transitions to candidate on election timeout.
-    pub(super) async fn run_follower(&mut self) -> anyhow::Result<()> {
+    pub async fn run_follower(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.election_timeout;
         let watchdog = WatchDog::default();
 
@@ -75,7 +75,7 @@ where
 
     /// Runs as candidate, starting elections periodically.
     /// Transitions to follower if a valid leader's heartbeat is received.
-    pub(super) async fn run_candidate(&mut self) -> anyhow::Result<()> {
+    pub async fn run_candidate(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.election_timeout;
         let watchdog = WatchDog::default();
         loop {
@@ -102,36 +102,31 @@ where
 
     /// Runs as leader, processing client commands and sending periodic heartbeats.
     /// Applies committed entries to the state machine after each heartbeat round.
-    pub(super) async fn run_leader(&mut self) -> anyhow::Result<()> {
+    pub async fn run_leader(&mut self) -> anyhow::Result<()> {
+        let _id = self.state.lock().await.id;
+
         let timeout = self.config.heartbeat_interval;
         let watchdog = WatchDog::default();
+        watchdog.reset(timeout).await;
+
         loop {
             if !matches!(self.state.lock().await.role, Role::Leader) {
                 break;
             }
             tokio::select! {
-                Some(order) = self.c.client_rx.recv() => {
+                Some(_order) = self.c.client_rx.recv() => {
+                    // Command already added to log by handle_client_request
+                    // Just trigger immediate replication
+                    self.broadcast_heartbeat().await?;
+                    self.update_commit_index().await?;
                     let mut state = self.state.lock().await;
-                    let term = state.persistent.current_term;
-                    let new_log_index = state.persistent.log.len() as u32 + 1;
-                    state.persistent.log.push(raft::Entry {
-                        term,
-                        command: order.clone(),
-                    });
-                    tracing::info!(
-                        id=?state.id,
-                        term=term,
-                        log_index=new_log_index,
-                        command=?order,
-                        log_len=state.persistent.log.len(),
-                        "Appended new entry to log"
-                    );
-                    if let Err(e) = state.persist().await {
-                        tracing::error!(id=?state.id, error=?e, "Failed to persist state after appending log entry");
+                    if state.commit_index > state.last_applied {
+                        state.apply_committed().await?;
                     }
                 },
                 _ = watchdog.wait() => {
                     self.broadcast_heartbeat().await?;
+                    self.update_commit_index().await?;
                     let mut state = self.state.lock().await;
                     if state.commit_index > state.last_applied {
                         state.apply_committed().await?;

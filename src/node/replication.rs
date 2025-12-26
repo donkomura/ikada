@@ -14,8 +14,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::task::JoinSet;
-use tracing::Instrument;
+use tokio::sync::mpsc;
 
 impl<T, SM, NF> Node<T, SM, NF>
 where
@@ -32,33 +31,39 @@ where
     /// Broadcasts AppendEntries RPCs to all followers.
     /// Called periodically by the leader to replicate log entries and maintain authority.
     pub(super) async fn broadcast_heartbeat(&mut self) -> anyhow::Result<bool> {
-        let (leader_term, leader_id, leader_commit) = {
+        // Lock once and copy all needed data
+        let (leader_term, leader_id, leader_commit, log_data, peer_data) = {
             let state = self.state.lock().await;
+
+            // Copy log and peer state data
+            let log_entries = state.persistent.log.clone();
+            let next_indices: Vec<_> = self
+                .peers
+                .keys()
+                .map(|addr| {
+                    (*addr, state.next_index.get(addr).copied().unwrap_or(1))
+                })
+                .collect();
+
             (
                 state.persistent.current_term,
                 state.leader_id.unwrap(),
                 state.commit_index,
+                log_entries,
+                next_indices,
             )
         };
+
         let mut requests = Vec::new();
-        for (addr, client) in self
-            .peers
-            .iter()
-            .map(|(addr, client)| (addr, client.clone()))
-        {
-            let state = self.state.lock().await;
-            let next_idx = state.next_index.get(addr).copied().unwrap_or(1);
+        for (addr, next_idx) in peer_data {
+            let client = self.peers.get(&addr).unwrap().clone();
+
             let (prev_log_idx, prev_log_term) = if next_idx > 1 {
-                (
-                    next_idx - 1,
-                    state.persistent.log[(next_idx - 2) as usize].term,
-                )
+                (next_idx - 1, log_data[(next_idx - 2) as usize].term)
             } else {
                 (0, 0)
             };
-            let entries: Vec<LogEntry> = state
-                .persistent
-                .log
+            let entries: Vec<LogEntry> = log_data
                 .iter()
                 .skip((next_idx - 1) as usize) // send logs after next_idx
                 .map(|e| {
@@ -72,17 +77,6 @@ where
                 .collect();
             let sent_up_to_index = prev_log_idx + entries.len() as u32;
 
-            tracing::debug!(
-                id=?leader_id,
-                peer=?addr,
-                prev_log_index=prev_log_idx,
-                prev_log_term=prev_log_term,
-                entries_count=entries.len(),
-                sent_up_to_index=sent_up_to_index,
-                leader_commit=leader_commit,
-                "Sending AppendEntries to peer"
-            );
-
             requests.push((
                 addr,
                 client,
@@ -95,7 +89,8 @@ where
         let rpc_timeout = self.config.rpc_timeout;
 
         // TODO: optimize algorithm: should be gossip?
-        let mut tasks = JoinSet::new();
+        let (result_tx, mut result_rx) = mpsc::channel(requests.len());
+
         for (
             addr,
             client,
@@ -113,17 +108,24 @@ where
                 entries,
                 leader_commit,
             };
-            tasks.spawn(Self::send_heartbeat(
-                *addr,
-                client,
-                req,
-                sent_up_to_index,
-                rpc_timeout,
-            ));
-        }
+            let result_tx = result_tx.clone();
 
-        while let Some(result) = tasks.join_next().await {
-            match result? {
+            tokio::spawn(async move {
+                let result = Self::send_heartbeat(
+                    addr,
+                    client,
+                    req,
+                    sent_up_to_index,
+                    rpc_timeout,
+                )
+                .await;
+                let _ = result_tx.send(result).await;
+            });
+        }
+        drop(result_tx); // Drop the original sender so the receiver knows when all tasks are done
+
+        while let Some(result) = result_rx.recv().await {
+            match result {
                 Ok((server, res, sent_up_to_index)) => {
                     self.handle_heartbeat(server, res, sent_up_to_index)
                         .await?;
@@ -147,10 +149,7 @@ where
     ) -> anyhow::Result<(SocketAddr, AppendEntriesResponse, u32)> {
         let mut ctx = tarpc::context::current();
         ctx.deadline = Instant::now() + rpc_timeout;
-        let res = client
-            .append_entries(ctx, req.clone())
-            .instrument(tracing::info_span!("append entries to {server}"))
-            .await?;
+        let res = client.append_entries(ctx, req.clone()).await?;
         Ok((server, res, sent_up_to_index))
     }
 
@@ -169,12 +168,6 @@ where
         let mut new_commit_index = current_commit_index;
         for n in (current_commit_index + 1)..=log_len {
             if log[(n - 1) as usize].term != current_term {
-                tracing::trace!(
-                    index = n,
-                    entry_term = log[(n - 1) as usize].term,
-                    current_term = current_term,
-                    "Skipping index: not from current term"
-                );
                 continue;
             }
             let mut count = 1; // Leader always has the entry
@@ -184,14 +177,6 @@ where
                 }
             }
             let majority = total_nodes / 2;
-            tracing::trace!(
-                index = n,
-                replicated_count = count,
-                total_nodes = total_nodes,
-                majority = majority,
-                has_majority = count > majority,
-                "Checking index for commit"
-            );
             if count > majority {
                 new_commit_index = n;
             }
@@ -221,14 +206,6 @@ where
         // Update commit_index if we found a higher value
         if new_commit_index > current_commit_index {
             state.commit_index = new_commit_index;
-            tracing::info!(
-                id=?state.id,
-                old_commit_index=current_commit_index,
-                new_commit_index=new_commit_index,
-                match_indices=?state.match_index,
-                log_len=state.persistent.log.len(),
-                "Updated commit_index: entry replicated on majority"
-            );
         }
 
         Ok(())
@@ -236,7 +213,6 @@ where
 
     /// Handles AppendEntries response from a follower.
     /// Updates next_index and match_index based on success/failure (Raft §5.3).
-    #[tracing::instrument(skip(self))]
     pub(super) async fn handle_heartbeat(
         &mut self,
         addr: SocketAddr,
@@ -245,21 +221,22 @@ where
     ) -> anyhow::Result<()> {
         let check_term = {
             let state = self.state.lock().await;
-            if res.term > state.persistent.current_term {
-                tracing::info!(id=?state.id, "become follower because of term mismatch");
-                true
-            } else {
-                false
-            }
+            res.term > state.persistent.current_term
         };
 
         if check_term {
-            self.state.lock().await.persistent.current_term = res.term;
+            {
+                let mut state = self.state.lock().await;
+                state.persistent.current_term = res.term;
+                state.role = Role::Follower;
+                state.persistent.voted_for = None;
+                let _ = state.persist().await;
+            }
             self.become_follower().await?;
             return Ok(());
         }
 
-        let (id, role, current_term) = {
+        let (_id, role, current_term) = {
             let state = self.state.lock().await;
             (state.id, state.role, state.persistent.current_term)
         };
@@ -270,32 +247,13 @@ where
         {
             let mut state = self.state.lock().await;
             if res.success {
-                let old_match_index =
-                    state.match_index.get(&addr).copied().unwrap_or(0);
                 state.match_index.insert(addr, sent_up_to_index);
                 state.next_index.insert(addr, sent_up_to_index + 1);
-
-                tracing::debug!(
-                    id=?id,
-                    peer=?addr,
-                    old_match_index=old_match_index,
-                    new_match_index=sent_up_to_index,
-                    next_index=sent_up_to_index + 1,
-                    "AppendEntries succeeded"
-                );
             } else {
                 let current_next_idx =
                     state.next_index.get(&addr).copied().unwrap_or(1);
                 let new_next_idx = current_next_idx.saturating_sub(1).max(1);
                 state.next_index.insert(addr, new_next_idx);
-
-                tracing::warn!(
-                    id=?id,
-                    peer=?addr,
-                    old_next_index=current_next_idx,
-                    new_next_index=new_next_idx,
-                    "AppendEntries rejected, decrementing next_index"
-                );
             }
         }
 

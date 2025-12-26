@@ -4,7 +4,7 @@ use std::collections::HashMap;
 #[async_trait::async_trait]
 pub trait StateMachine: Send + Sync {
     type Command: Send + Sync + Clone;
-    type Response: Send + Sync;
+    type Response: Send + Sync + Clone + Serialize;
 
     async fn apply(
         &mut self,
@@ -44,7 +44,7 @@ pub enum KVCommand {
     Delete { key: String },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum KVResponse {
     Ok,
     Value(Option<String>),
