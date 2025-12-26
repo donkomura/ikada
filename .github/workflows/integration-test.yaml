@@ -76,6 +76,7 @@ jobs:
           sudo mv maelstrom /usr/local/bin/
       - name: Run Maelstrom test
         env:
+          RUST_LOG: info
           WORKLOAD: ${{ matrix.workload }}
           TIME_LIMIT: ${{ matrix.time-limit }}
           RATE: ${{ matrix.rate }}

@@ -744,7 +744,10 @@ impl MaelstromRaftNode {
             }
         };
 
-        if current_value_str != body.from {
+        let current_value_json: serde_json::Value = serde_json::from_str(&current_value_str)
+            .unwrap_or_else(|_| serde_json::Value::String(current_value_str.clone()));
+
+        if current_value_json != body.from {
             return self
                 .error_response(
                     src,
@@ -752,7 +755,7 @@ impl MaelstromRaftNode {
                     ERROR_CAS_MISMATCH,
                     format!(
                         "Expected {} but found {}",
-                        body.from, current_value_str
+                        body.from, current_value_json
                     ),
                 )
                 .await;
