@@ -11,39 +11,72 @@ use ikada::config::Config;
 use ikada::node::{Command, Node};
 use ikada::raft::RaftState;
 use ikada::rpc::{
-    AppendEntriesRequest, CommandRequest, LogEntry, RequestVoteRequest,
+    AppendEntriesRequest, CommandRequest, CommandResponse, LogEntry,
+    RequestVoteRequest,
 };
 use ikada::statemachine::{KVCommand, KVResponse, KVStateMachine};
 
+const BASE_PORT: u16 = 1111;
+const FORWARD_MSG_ID_START: u64 = 1000000;
+const COMMAND_CHANNEL_SIZE: usize = 128;
+
 type RaftStateHandle = Arc<Mutex<RaftState<KVCommand, KVStateMachine>>>;
 
+/// Maelstrom-specific node identification
+struct NodeInfo {
+    node_id: Option<String>,
+    node_ids: Vec<String>,
+}
+
+/// ikada Raft state management
+struct RaftContext {
+    state: Option<RaftStateHandle>,
+    cmd_tx: Option<mpsc::Sender<Command>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Request forwarding management
+///
+/// Maelstrom doesn't provide built-in request forwarding mechanism.
+/// This implementation handles forwarding client requests from followers to leader,
+/// tracking response channels for forwarded requests.
+struct ForwardManager {
+    response_handlers: HashMap<u64, oneshot::Sender<Message>>,
+    next_msg_id: u64,
+}
+
+impl ForwardManager {
+    fn new() -> Self {
+        Self {
+            response_handlers: HashMap::new(),
+            next_msg_id: FORWARD_MSG_ID_START,
+        }
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_msg_id;
+        self.next_msg_id += 1;
+        id
+    }
+}
+
+/// Main node for Maelstrom integration
 pub struct MaelstromRaftNode {
-    node_id: Arc<Mutex<Option<String>>>,
-    node_ids: Arc<Mutex<Vec<String>>>,
-    state: Arc<Mutex<Option<RaftStateHandle>>>,
+    node_info: Arc<Mutex<NodeInfo>>,
+    raft_context: Arc<Mutex<RaftContext>>,
     network_factory: Arc<Mutex<Option<MaelstromNetworkFactory>>>,
+    forward_manager: Arc<Mutex<ForwardManager>>,
     outgoing_tx: mpsc::UnboundedSender<Message>,
-    cmd_tx: Arc<Mutex<Option<mpsc::Sender<Command>>>>,
-    raft_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    forward_response_handlers:
-        Arc<Mutex<HashMap<u64, oneshot::Sender<Message>>>>,
-    next_forward_msg_id: Arc<Mutex<u64>>,
 }
 
 impl Clone for MaelstromRaftNode {
     fn clone(&self) -> Self {
         Self {
-            node_id: Arc::clone(&self.node_id),
-            node_ids: Arc::clone(&self.node_ids),
-            state: Arc::clone(&self.state),
+            node_info: Arc::clone(&self.node_info),
+            raft_context: Arc::clone(&self.raft_context),
             network_factory: Arc::clone(&self.network_factory),
+            forward_manager: Arc::clone(&self.forward_manager),
             outgoing_tx: self.outgoing_tx.clone(),
-            cmd_tx: Arc::clone(&self.cmd_tx),
-            raft_task_handle: Arc::clone(&self.raft_task_handle),
-            forward_response_handlers: Arc::clone(
-                &self.forward_response_handlers,
-            ),
-            next_forward_msg_id: Arc::clone(&self.next_forward_msg_id),
         }
     }
 }
@@ -51,28 +84,29 @@ impl Clone for MaelstromRaftNode {
 impl MaelstromRaftNode {
     pub fn new(outgoing_tx: mpsc::UnboundedSender<Message>) -> Self {
         Self {
-            node_id: Arc::new(Mutex::new(None)),
-            node_ids: Arc::new(Mutex::new(Vec::new())),
-            state: Arc::new(Mutex::new(None)),
+            node_info: Arc::new(Mutex::new(NodeInfo {
+                node_id: None,
+                node_ids: Vec::new(),
+            })),
+            raft_context: Arc::new(Mutex::new(RaftContext {
+                state: None,
+                cmd_tx: None,
+                task_handle: None,
+            })),
             network_factory: Arc::new(Mutex::new(None)),
+            forward_manager: Arc::new(Mutex::new(ForwardManager::new())),
             outgoing_tx,
-            cmd_tx: Arc::new(Mutex::new(None)),
-            raft_task_handle: Arc::new(Mutex::new(None)),
-            forward_response_handlers: Arc::new(Mutex::new(HashMap::new())),
-            next_forward_msg_id: Arc::new(Mutex::new(1000000)),
         }
     }
 
     async fn get_next_forward_msg_id(&self) -> u64 {
-        let mut next_id = self.next_forward_msg_id.lock().await;
-        let id = *next_id;
-        *next_id += 1;
-        id
+        let mut forward_mgr = self.forward_manager.lock().await;
+        forward_mgr.next_id()
     }
 
     async fn get_node_id(&self) -> Option<String> {
-        let node_id = self.node_id.lock().await;
-        node_id.clone()
+        let info = self.node_info.lock().await;
+        info.node_id.clone()
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -83,8 +117,8 @@ impl MaelstromRaftNode {
         while let Some(line) = lines.next_line().await? {
             let msg: Message = serde_json::from_str(&line)?;
 
-            if let Some(response) = self.handle_message(msg).await? {
-                self.send_message(response)?;
+            if let Some(response_msg) = self.handle_message(msg).await? {
+                self.send_message(response_msg)?;
             }
         }
 
@@ -92,18 +126,21 @@ impl MaelstromRaftNode {
     }
 
     fn send_message(&self, msg: Message) -> anyhow::Result<()> {
-        self.outgoing_tx.send(msg)?;
-        Ok(())
+        self.outgoing_tx
+            .send(msg)
+            .map_err(|e| anyhow::anyhow!("Failed to send message: {}", e))
     }
 
     async fn handle_message(
         &self,
         msg: Message,
     ) -> anyhow::Result<Option<Message>> {
-        // Check if this is a response to a forwarded request
+        // Handle responses to forwarded requests
+        // This is part of our custom forwarding implementation
         if let Some(in_reply_to) = self.get_in_reply_to(&msg.body) {
-            let mut handlers = self.forward_response_handlers.lock().await;
-            if let Some(tx) = handlers.remove(&in_reply_to) {
+            let mut forward_mgr = self.forward_manager.lock().await;
+            if let Some(tx) = forward_mgr.response_handlers.remove(&in_reply_to)
+            {
                 let _ = tx.send(msg);
                 return Ok(None);
             }
@@ -111,8 +148,6 @@ impl MaelstromRaftNode {
 
         match msg.body {
             Body::Init(init_body) => self.handle_init(msg.src, init_body).await,
-
-            // Client requests - spawn in separate tasks to avoid blocking
             Body::Read(read_body) => {
                 let node = self.clone();
                 let src = msg.src;
@@ -149,8 +184,6 @@ impl MaelstromRaftNode {
                 });
                 Ok(None)
             }
-
-            // Raft RPCs - handle immediately to avoid deadlock
             Body::AppendEntries(ae_body) => {
                 self.handle_append_entries(msg.src, ae_body).await
             }
@@ -178,18 +211,22 @@ impl MaelstromRaftNode {
         }
     }
 
+    /// Initialize the Maelstrom Raft node
+    ///
+    /// Sets up:
+    /// 1. Maelstrom node information
+    /// 2. Network factory for protocol translation
+    /// 3. ikada Raft node with proper state
+    /// 4. Background task for running ikada lifecycle
     async fn handle_init(
         &self,
         src: String,
         body: InitBody,
     ) -> anyhow::Result<Option<Message>> {
         {
-            let mut node_id = self.node_id.lock().await;
-            *node_id = Some(body.node_id.clone());
-        }
-        {
-            let mut node_ids = self.node_ids.lock().await;
-            *node_ids = body.node_ids.clone();
+            let mut info = self.node_info.lock().await;
+            info.node_id = Some(body.node_id.clone());
+            info.node_ids = body.node_ids.clone();
         }
 
         let network_factory = MaelstromNetworkFactory::new(
@@ -197,29 +234,19 @@ impl MaelstromRaftNode {
             self.outgoing_tx.clone(),
         );
 
-        let mut node_mapping = HashMap::new();
-        let mut peers = Vec::new();
-
-        let own_idx = body
+        // Create node mapping
+        let node_mapping: HashMap<u32, String> = body
             .node_ids
             .iter()
-            .position(|n| n == &body.node_id)
-            .unwrap_or(0);
-        let own_port = 1111 + own_idx as u16;
-
-        for (idx, node_name) in body.node_ids.iter().enumerate() {
-            let port = 1111 + idx as u16;
-            node_mapping.insert(port as u32, node_name.clone());
-
-            if node_name != &body.node_id {
-                peers.push(SocketAddr::from((
-                    std::net::Ipv4Addr::LOCALHOST,
-                    port,
-                )));
-            }
-        }
-
+            .enumerate()
+            .map(|(i, id)| (BASE_PORT as u32 + i as u32, id.clone()))
+            .collect();
         network_factory.set_node_mapping(node_mapping).await;
+
+        *self.network_factory.lock().await = Some(network_factory.clone());
+
+        let own_port = self.get_own_port(&body.node_id, &body.node_ids);
+        let peers = self.get_peer_addresses(&body.node_id, &body.node_ids);
 
         use ikada::storage::MemStorage;
         let storage = Box::new(MemStorage::default());
@@ -229,15 +256,12 @@ impl MaelstromRaftNode {
             KVStateMachine::default(),
         )));
 
-        {
-            let mut state_lock = self.state.lock().await;
-            *state_lock = Some(Arc::clone(&state));
-        }
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(100);
         {
-            let mut cmd_tx_lock = self.cmd_tx.lock().await;
-            *cmd_tx_lock = Some(cmd_tx.clone());
+            let mut context = self.raft_context.lock().await;
+            context.state = Some(Arc::clone(&state));
+            context.cmd_tx = Some(cmd_tx);
         }
 
         let node = Node::new_with_state(
@@ -246,17 +270,13 @@ impl MaelstromRaftNode {
             network_factory.clone(),
         );
 
-        let handle = tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             let _ = run_raft_node(node, own_port, peers, cmd_rx).await;
         });
 
         {
-            let mut handle_lock = self.raft_task_handle.lock().await;
-            *handle_lock = Some(handle);
-        }
-        {
-            let mut nf_lock = self.network_factory.lock().await;
-            *nf_lock = Some(network_factory);
+            let mut context = self.raft_context.lock().await;
+            context.task_handle = Some(task_handle);
         }
 
         Ok(Some(Message {
@@ -268,87 +288,130 @@ impl MaelstromRaftNode {
         }))
     }
 
+    fn get_own_port(&self, node_id: &str, node_ids: &[String]) -> u16 {
+        let index = node_ids.iter().position(|id| id == node_id).unwrap();
+        BASE_PORT + index as u16
+    }
+
+    fn get_peer_addresses(
+        &self,
+        node_id: &str,
+        node_ids: &[String],
+    ) -> Vec<SocketAddr> {
+        node_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| *id != node_id)
+            .map(|(i, _)| {
+                SocketAddr::from(([127, 0, 0, 1], BASE_PORT + i as u16))
+            })
+            .collect()
+    }
+
+    async fn get_node_id_by_hint(&self, hint: u32) -> Option<String> {
+        let info = self.node_info.lock().await;
+        let index = (hint - BASE_PORT as u32) as usize;
+        info.node_ids.get(index).cloned()
+    }
+
     async fn execute_command(
         &self,
         cmd: KVCommand,
     ) -> anyhow::Result<KVResponse> {
-        let cmd_tx = {
-            let cmd_tx_lock = self.cmd_tx.lock().await;
-            cmd_tx_lock
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?
-        };
+        let response = self.send_to_raft(cmd.clone()).await?;
 
+        if response.success {
+            return self.parse_success_response(response);
+        }
+
+        self.handle_command_failure(cmd, response).await
+    }
+
+    async fn send_to_raft(
+        &self,
+        cmd: KVCommand,
+    ) -> anyhow::Result<CommandResponse> {
+        let cmd_tx = self.get_command_channel().await?;
         let cmd_bytes = bincode::serialize(&cmd)?;
         let (resp_tx, resp_rx) = oneshot::channel();
 
         cmd_tx
             .send(Command::ClientRequest(
                 CommandRequest {
-                    command: cmd_bytes.clone(),
+                    command: cmd_bytes,
                 },
                 resp_tx,
             ))
             .await?;
 
-        let response = resp_rx.await?;
+        Ok(resp_rx.await?)
+    }
 
-        if !response.success {
-            // If not the leader, try to forward to the leader (Maelstrom-specific routing)
-            // Get the actual leader_id from state instead of relying on response.leader_hint
-            let leader_id = {
-                let state_lock = self.state.lock().await;
-                let state = state_lock
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
-                let state_inner = state.lock().await;
-                state_inner.leader_id
-            };
+    async fn get_command_channel(
+        &self,
+    ) -> anyhow::Result<mpsc::Sender<Command>> {
+        let context = self.raft_context.lock().await;
+        context
+            .cmd_tx
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Node not initialized"))
+    }
 
-            if let Some(leader_hint) = leader_id {
-                // Get leader's node_id string from the hint
-                if let Some(leader_node_id) =
-                    self.get_node_id_by_hint(leader_hint).await
-                {
-                    // Forward the command to the leader via Maelstrom message
-                    return self.forward_to_leader(leader_node_id, cmd).await;
-                }
-            }
-
-            return Err(anyhow::anyhow!(
-                "Command failed: {:?}",
-                response.error
-            ));
-        }
-
+    fn parse_success_response(
+        &self,
+        response: CommandResponse,
+    ) -> anyhow::Result<KVResponse> {
         let data = response
             .data
             .ok_or_else(|| anyhow::anyhow!("No response data"))?;
-        let kv_response: KVResponse = bincode::deserialize(&data)?;
-
-        Ok(kv_response)
+        Ok(bincode::deserialize(&data)?)
     }
 
-    async fn get_node_id_by_hint(&self, hint: u32) -> Option<String> {
-        // Convert port-based hint to node_id string
-        // In our setup: port 1111 -> n0, port 1112 -> n1, etc.
-        let index = (hint as usize).saturating_sub(1111);
-        let node_ids = self.node_ids.lock().await;
-        node_ids.get(index).cloned()
+    async fn handle_command_failure(
+        &self,
+        cmd: KVCommand,
+        response: CommandResponse,
+    ) -> anyhow::Result<KVResponse> {
+        let leader_id = self.get_current_leader_id().await?;
+
+        if let Some(leader_hint) = leader_id {
+            if let Some(leader_node_id) =
+                self.get_node_id_by_hint(leader_hint).await
+            {
+                return self.forward_to_leader(leader_node_id, cmd).await;
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Command failed: {:?}",
+            response.error
+        ))
     }
 
+    async fn get_current_leader_id(&self) -> anyhow::Result<Option<u32>> {
+        let context = self.raft_context.lock().await;
+        let state = context
+            .state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
+        let state_inner = state.lock().await;
+        Ok(state_inner.leader_id)
+    }
+
+    /// Forward client request to the leader
+    ///
+    /// Maelstrom doesn't provide built-in forwarding, so we implement it here.
+    /// Converts KVCommand to Maelstrom message, sends to leader, and waits for response.
     async fn forward_to_leader(
         &self,
         leader_node_id: String,
         cmd: KVCommand,
     ) -> anyhow::Result<KVResponse> {
-        // Create a forwarding message based on command type
         let my_node_id = self
             .get_node_id()
             .await
             .ok_or_else(|| anyhow::anyhow!("Node ID not set"))?;
 
-        // Don't forward to ourselves to avoid infinite loop
         if leader_node_id == my_node_id {
             return Err(anyhow::anyhow!("Cannot forward to self"));
         }
@@ -356,10 +419,9 @@ impl MaelstromRaftNode {
         let msg_id = self.get_next_forward_msg_id().await;
         let (tx, rx) = oneshot::channel();
 
-        // Register the response handler
         {
-            let mut handlers = self.forward_response_handlers.lock().await;
-            handlers.insert(msg_id, tx);
+            let mut forward_mgr = self.forward_manager.lock().await;
+            forward_mgr.response_handlers.insert(msg_id, tx);
         }
 
         let msg = match &cmd {
@@ -395,25 +457,21 @@ impl MaelstromRaftNode {
                 }
             }
             KVCommand::Delete { .. } => {
-                // Delete not supported in Maelstrom lin-kv workload
                 return Err(anyhow::anyhow!(
                     "Delete command not supported for forwarding"
                 ));
             }
         };
 
-        // Send the message
         self.outgoing_tx
             .send(msg)
             .map_err(|e| anyhow::anyhow!("Failed to forward: {}", e))?;
 
-        // Wait for response with timeout
         let response =
             tokio::time::timeout(std::time::Duration::from_secs(5), rx)
                 .await
                 .map_err(|_| anyhow::anyhow!("Forward request timed out"))??;
 
-        // Convert the Maelstrom response to KVResponse
         match response.body {
             Body::ReadOk(body) => {
                 let value_str = body.value.to_string();
@@ -434,6 +492,9 @@ impl MaelstromRaftNode {
         }
     }
 
+    /// Forward CAS operation to the leader
+    ///
+    /// Custom implementation for forwarding compare-and-swap operations.
     async fn forward_cas_to_leader(
         &self,
         leader_node_id: String,
@@ -446,7 +507,6 @@ impl MaelstromRaftNode {
             .await
             .ok_or_else(|| anyhow::anyhow!("Node ID not set"))?;
 
-        // Don't forward to ourselves to avoid infinite loop
         if leader_node_id == my_node_id {
             return Err(anyhow::anyhow!("Cannot forward CAS to self"));
         }
@@ -454,10 +514,9 @@ impl MaelstromRaftNode {
         let msg_id = self.get_next_forward_msg_id().await;
         let (tx, rx) = oneshot::channel();
 
-        // Register the response handler
         {
-            let mut handlers = self.forward_response_handlers.lock().await;
-            handlers.insert(msg_id, tx);
+            let mut forward_mgr = self.forward_manager.lock().await;
+            forward_mgr.response_handlers.insert(msg_id, tx);
         }
 
         let key_value: serde_json::Value = serde_json::from_str(&key)
@@ -474,12 +533,10 @@ impl MaelstromRaftNode {
             }),
         };
 
-        // Send the message
         self.outgoing_tx
             .send(msg)
             .map_err(|e| anyhow::anyhow!("Failed to forward CAS: {}", e))?;
 
-        // Wait for response with timeout
         let response =
             tokio::time::timeout(std::time::Duration::from_secs(5), rx)
                 .await
@@ -577,148 +634,166 @@ impl MaelstromRaftNode {
     ) -> anyhow::Result<Option<Message>> {
         let key_str = body.key.to_string().trim_matches('"').to_string();
 
-        // Check if we're the leader by inspecting state
-        let (is_leader, leader_id) = {
-            let state_lock = self.state.lock().await;
-            let state = state_lock
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
-            let state_inner = state.lock().await;
-            (
-                state_inner.role == ikada::raft::Role::Leader,
-                state_inner.leader_id,
-            )
-        };
+        let is_leader = self.check_is_leader().await?;
 
-        // If not leader, forward the entire CAS operation to the leader
         if !is_leader {
-            if let Some(leader_hint) = leader_id
-                && let Some(leader_node_id) =
-                    self.get_node_id_by_hint(leader_hint).await
-            {
-                // Forward the CAS request to leader and return its response directly
-                match self
-                    .forward_cas_to_leader(
-                        leader_node_id,
-                        key_str,
-                        body.from.clone(),
-                        body.to.clone(),
-                    )
-                    .await
-                {
-                    Ok(mut response_msg) => {
-                        // Update the response to be sent to the original source and fix in_reply_to
-                        response_msg.dest = Some(src);
-
-                        // Fix in_reply_to field in the body
-                        match &mut response_msg.body {
-                            Body::CasOk(cas_ok_body) => {
-                                cas_ok_body.in_reply_to = body.msg_id;
-                            }
-                            Body::Error(error_body) => {
-                                error_body.in_reply_to = body.msg_id;
-                            }
-                            _ => {}
-                        }
-
-                        return Ok(Some(response_msg));
-                    }
-                    Err(e) => {
-                        return Ok(Some(Message {
-                            src: self.get_node_id().await.unwrap(),
-                            dest: Some(src),
-                            body: Body::Error(ErrorBody {
-                                in_reply_to: body.msg_id,
-                                code: 13,
-                                text: Some(format!("Forward error: {}", e)),
-                            }),
-                        }));
-                    }
-                }
-            }
-
-            return Ok(Some(Message {
-                src: self.get_node_id().await.unwrap(),
-                dest: Some(src),
-                body: Body::Error(ErrorBody {
-                    in_reply_to: body.msg_id,
-                    code: 13,
-                    text: Some("Not the leader".to_string()),
-                }),
-            }));
+            return self.forward_cas_if_possible(src, body, key_str).await;
         }
 
-        // We're the leader, execute CAS atomically
-        let get_command = KVCommand::Get {
-            key: key_str.clone(),
-        };
-        let current_value_str = match self.execute_command(get_command).await {
-            Ok(KVResponse::Value(Some(v))) => v,
-            Ok(KVResponse::Value(None)) => {
-                return Ok(Some(Message {
-                    src: self.get_node_id().await.unwrap(),
-                    dest: Some(src),
-                    body: Body::Error(ErrorBody {
-                        in_reply_to: body.msg_id,
-                        code: ERROR_KEY_NOT_EXIST,
-                        text: Some(format!("Key {:?} does not exist", key_str)),
-                    }),
-                }));
+        self.execute_cas_as_leader(src, body, key_str).await
+    }
+
+    async fn check_is_leader(&self) -> anyhow::Result<bool> {
+        let context = self.raft_context.lock().await;
+        let state = context
+            .state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
+        let state_inner = state.lock().await;
+        Ok(state_inner.role == ikada::raft::Role::Leader)
+    }
+
+    async fn forward_cas_if_possible(
+        &self,
+        src: String,
+        body: CasBody,
+        key_str: String,
+    ) -> anyhow::Result<Option<Message>> {
+        let leader_id = self.get_current_leader_id().await?;
+
+        if let Some(leader_hint) = leader_id
+            && let Some(leader_node_id) =
+                self.get_node_id_by_hint(leader_hint).await
+        {
+            return match self
+                .forward_cas_to_leader(
+                    leader_node_id,
+                    key_str,
+                    body.from.clone(),
+                    body.to.clone(),
+                )
+                .await
+            {
+                Ok(mut response_msg) => {
+                    response_msg.dest = Some(src);
+                    self.fix_cas_reply_to(&mut response_msg.body, body.msg_id);
+                    Ok(Some(response_msg))
+                }
+                Err(e) => self.error_response(
+                    src,
+                    body.msg_id,
+                    13,
+                    format!("Forward error: {}", e),
+                ),
+            };
+        }
+
+        self.error_response(src, body.msg_id, 13, "Not the leader".to_string())
+    }
+
+    fn fix_cas_reply_to(&self, body: &mut Body, msg_id: u64) {
+        match body {
+            Body::CasOk(cas_ok_body) => {
+                cas_ok_body.in_reply_to = msg_id;
+            }
+            Body::Error(error_body) => {
+                error_body.in_reply_to = msg_id;
+            }
+            _ => {}
+        }
+    }
+
+    fn error_response(
+        &self,
+        dest: String,
+        in_reply_to: u64,
+        code: u32,
+        text: String,
+    ) -> anyhow::Result<Option<Message>> {
+        Ok(Some(Message {
+            src: "".to_string(),
+            dest: Some(dest),
+            body: Body::Error(ErrorBody {
+                in_reply_to,
+                code,
+                text: Some(text),
+            }),
+        }))
+    }
+
+    async fn execute_cas_as_leader(
+        &self,
+        src: String,
+        body: CasBody,
+        key_str: String,
+    ) -> anyhow::Result<Option<Message>> {
+        let current_value = self.get_current_value(&key_str).await;
+        let current_value_str = match current_value {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return self.error_response(
+                    src,
+                    body.msg_id,
+                    ERROR_KEY_NOT_EXIST,
+                    format!("Key {:?} does not exist", key_str),
+                );
             }
             Err(e) => {
-                return Ok(Some(Message {
-                    src: self.get_node_id().await.unwrap(),
-                    dest: Some(src),
-                    body: Body::Error(ErrorBody {
-                        in_reply_to: body.msg_id,
-                        code: 13,
-                        text: Some(format!("Error: {}", e)),
-                    }),
-                }));
+                return self
+                    .error_response(src, body.msg_id, 13, format!("Error: {}", e));
             }
-            _ => unreachable!(),
         };
 
-        let from_str = body.from.to_string();
-
-        if current_value_str != from_str {
-            return Ok(Some(Message {
-                src: self.get_node_id().await.unwrap(),
-                dest: Some(src),
-                body: Body::Error(ErrorBody {
-                    in_reply_to: body.msg_id,
-                    code: ERROR_CAS_MISMATCH,
-                    text: Some(format!(
-                        "Expected {} but found {}",
-                        from_str, current_value_str
-                    )),
-                }),
-            }));
+        if current_value_str != body.from.to_string() {
+            return self.error_response(
+                src,
+                body.msg_id,
+                ERROR_CAS_MISMATCH,
+                format!(
+                    "Expected {} but found {}",
+                    body.from, current_value_str
+                ),
+            );
         }
 
-        let to_str = body.to.to_string();
+        self.set_new_value(&key_str, body.to.to_string(), src, body.msg_id)
+            .await
+    }
+
+    async fn get_current_value(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let get_command = KVCommand::Get {
+            key: key.to_string(),
+        };
+        match self.execute_command(get_command).await? {
+            KVResponse::Value(v) => Ok(v),
+            _ => unreachable!(),
+        }
+    }
+
+    async fn set_new_value(
+        &self,
+        key: &str,
+        value: String,
+        dest: String,
+        in_reply_to: u64,
+    ) -> anyhow::Result<Option<Message>> {
         let set_command = KVCommand::Set {
-            key: key_str,
-            value: to_str,
+            key: key.to_string(),
+            value,
         };
 
         match self.execute_command(set_command).await {
             Ok(_) => Ok(Some(Message {
-                src: self.get_node_id().await.unwrap(),
-                dest: Some(src),
-                body: Body::CasOk(CasOkBody {
-                    in_reply_to: body.msg_id,
-                }),
+                src: "".to_string(),
+                dest: Some(dest),
+                body: Body::CasOk(CasOkBody { in_reply_to }),
             })),
-            Err(e) => Ok(Some(Message {
-                src: self.get_node_id().await.unwrap(),
-                dest: Some(src),
-                body: Body::Error(ErrorBody {
-                    in_reply_to: body.msg_id,
-                    code: 13,
-                    text: Some(format!("Error: {}", e)),
-                }),
-            })),
+            Err(e) => {
+                self.error_response(dest, in_reply_to, 13, format!("Error: {}", e))
+            }
         }
     }
 
@@ -728,8 +803,8 @@ impl MaelstromRaftNode {
         body: AppendEntriesBody,
     ) -> anyhow::Result<Option<Message>> {
         let cmd_tx = {
-            let cmd_tx_lock = self.cmd_tx.lock().await;
-            match cmd_tx_lock.as_ref() {
+            let context = self.raft_context.lock().await;
+            match context.cmd_tx.as_ref() {
                 Some(tx) => tx.clone(),
                 None => return Ok(None),
             }
@@ -779,8 +854,8 @@ impl MaelstromRaftNode {
         body: RequestVoteBody,
     ) -> anyhow::Result<Option<Message>> {
         let cmd_tx = {
-            let cmd_tx_lock = self.cmd_tx.lock().await;
-            match cmd_tx_lock.as_ref() {
+            let context = self.raft_context.lock().await;
+            match context.cmd_tx.as_ref() {
                 Some(tx) => tx.clone(),
                 None => return Ok(None),
             }
@@ -810,6 +885,7 @@ impl MaelstromRaftNode {
     }
 }
 
+/// Run ikada Raft node lifecycle
 async fn run_raft_node<NF>(
     mut node: Node<KVCommand, KVStateMachine, NF>,
     _port: u16,
@@ -838,22 +914,19 @@ where
 
                 match cmd {
                     Command::AppendEntries(req, resp_tx) => {
-                        let resp =
-                            ikada::node::handlers::handle_append_entries(
-                                &req,
-                                state_clone.clone(),
-                            )
-                            .await
-                            .unwrap_or(
-                                AppendEntriesResponse {
-                                    term: 0,
-                                    success: false,
-                                },
-                            );
+                        let resp = ikada::node::handlers::handle_append_entries(
+                            &req,
+                            state_clone.clone(),
+                        )
+                        .await
+                        .unwrap_or(AppendEntriesResponse {
+                            term: 0,
+                            success: false,
+                        });
 
                         if resp.success || resp.term > req.term {
-                            let _ = heartbeat_tx_clone
-                                .send((req.leader_id, req.term));
+                            let _ =
+                                heartbeat_tx_clone.send((req.leader_id, req.term));
                         }
 
                         let _ = resp_tx.send(resp);
@@ -868,13 +941,12 @@ where
                         let _ = resp_tx.send(resp);
                     }
                     Command::ClientRequest(req, resp_tx) => {
-                        let resp =
-                            ikada::node::handlers::handle_client_request(
-                                &req,
-                                state_clone.clone(),
-                                client_tx_clone.clone(),
-                            )
-                            .await;
+                        let resp = ikada::node::handlers::handle_client_request(
+                            &req,
+                            state_clone.clone(),
+                            client_tx_clone.clone(),
+                        )
+                        .await;
 
                         let _ = resp_tx.send(resp);
                     }
@@ -884,9 +956,9 @@ where
     });
 
     loop {
-        let (role, id) = {
+        let role = {
             let state = node.state.lock().await;
-            (state.role, state.id)
+            state.role
         };
 
         match role {
