@@ -258,11 +258,20 @@ impl MaelstromRaftNode {
             context.cmd_tx = Some(cmd_tx);
         }
 
-        let node = Node::new_with_state(
-            Config::default(),
-            state,
-            network_factory.clone(),
-        );
+        // Use shorter timeouts for Maelstrom testing
+        let timeout_ms = {
+            use rand::Rng;
+            let base_ms = 500;
+            let max_ms = base_ms * 2;
+            rand::rng().random_range(base_ms..=max_ms)
+        };
+        let config = Config {
+            heartbeat_interval: tokio::time::Duration::from_millis(50),
+            election_timeout: tokio::time::Duration::from_millis(timeout_ms),
+            rpc_timeout: std::time::Duration::from_millis(1000),
+        };
+
+        let node = Node::new_with_state(config, state, network_factory.clone());
 
         let task_handle = tokio::spawn(async move {
             let _ = run_raft_node(node, own_port, peers, cmd_rx).await;
@@ -364,7 +373,15 @@ impl MaelstromRaftNode {
         cmd: KVCommand,
         response: CommandResponse,
     ) -> anyhow::Result<KVResponse> {
-        let leader_id = self.get_current_leader_id().await?;
+        let (leader_id, is_leader) = self.get_leader_info().await?;
+
+        // If we are the leader, don't forward to ourselves
+        if is_leader {
+            return Err(anyhow::anyhow!(
+                "Command failed on leader: {:?}",
+                response.error
+            ));
+        }
 
         if let Some(leader_hint) = leader_id
             && let Some(leader_node_id) =
@@ -376,14 +393,20 @@ impl MaelstromRaftNode {
         Err(anyhow::anyhow!("Command failed: {:?}", response.error))
     }
 
-    async fn get_current_leader_id(&self) -> anyhow::Result<Option<u32>> {
+    async fn get_leader_info(&self) -> anyhow::Result<(Option<u32>, bool)> {
         let context = self.raft_context.lock().await;
         let state = context
             .state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
         let state_inner = state.lock().await;
-        Ok(state_inner.leader_id)
+        let is_leader = state_inner.role == ikada::raft::Role::Leader;
+        Ok((state_inner.leader_id, is_leader))
+    }
+
+    async fn get_current_leader_id(&self) -> anyhow::Result<Option<u32>> {
+        let (leader_id, _) = self.get_leader_info().await?;
+        Ok(leader_id)
     }
 
     /// Forward client request to the leader
@@ -744,7 +767,13 @@ impl MaelstromRaftNode {
             }
         };
 
-        if current_value_str != body.from {
+        // Parse current value as JSON for comparison
+        let current_value_json: serde_json::Value =
+            serde_json::from_str(&current_value_str).unwrap_or_else(|_| {
+                serde_json::Value::String(current_value_str.clone())
+            });
+
+        if current_value_json != body.from {
             return self
                 .error_response(
                     src,
@@ -752,7 +781,7 @@ impl MaelstromRaftNode {
                     ERROR_CAS_MISMATCH,
                     format!(
                         "Expected {} but found {}",
-                        body.from, current_value_str
+                        body.from, current_value_json
                     ),
                 )
                 .await;
