@@ -12,6 +12,7 @@ use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tracing::Instrument;
@@ -139,7 +140,7 @@ where
     /// Sends AppendEntries RPC to a single follower.
     async fn send_heartbeat(
         server: SocketAddr,
-        client: RaftRpcClient,
+        client: Arc<dyn RaftRpcTrait>,
         req: AppendEntriesRequest,
         sent_up_to_index: u32,
         rpc_timeout: Duration,

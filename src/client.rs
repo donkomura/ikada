@@ -1,12 +1,13 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tarpc::context;
 
 use crate::network::NetworkFactory;
-use crate::rpc::{CommandRequest, RaftRpcClient};
+use crate::rpc::{CommandRequest, RaftRpcTrait};
 
 pub struct RaftClient<NF: NetworkFactory> {
-    client: RaftRpcClient,
+    client: Arc<dyn RaftRpcTrait>,
     addr: SocketAddr,
     network_factory: NF,
 }

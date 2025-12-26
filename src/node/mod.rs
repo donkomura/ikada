@@ -6,7 +6,7 @@
 //! - Command/Response abstractions to decouple RPC layer from consensus logic
 
 mod election;
-mod handlers;
+pub mod handlers;
 mod lifecycle;
 mod replication;
 
@@ -38,7 +38,7 @@ pub enum Response {
 
 /// Chan holds all channels needed for node-internal communication.
 /// Separated from Node to keep initialization logic cleaner.
-pub(crate) struct Chan<T> {
+pub struct Chan<T> {
     pub heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
     pub heartbeat_rx: mpsc::UnboundedReceiver<(u32, u32)>,
     pub client_tx: mpsc::Sender<T>,
@@ -46,7 +46,7 @@ pub(crate) struct Chan<T> {
 }
 
 impl<T> Chan<T> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let (heartbeat_tx, heartbeat_rx) = mpsc::unbounded_channel();
         let (client_tx, client_rx) = mpsc::channel::<T>(32);
         Self {
@@ -59,18 +59,17 @@ impl<T> Chan<T> {
 }
 
 /// Node is the main Raft participant structure.
-/// Fields are pub(crate) to allow submodules (election, replication, etc.)
-/// access without exposing internals to external crates.
+/// Fields are pub to allow external integration (e.g., Maelstrom testing).
 pub struct Node<
     T: Send + Sync,
     SM: StateMachine<Command = T>,
     NF: NetworkFactory,
 > {
-    pub(crate) config: Config,
-    pub(crate) peers: HashMap<SocketAddr, RaftRpcClient>,
-    pub(crate) state: Arc<Mutex<RaftState<T, SM>>>,
-    pub(crate) c: Chan<T>,
-    pub(crate) network_factory: NF,
+    pub config: Config,
+    pub peers: HashMap<SocketAddr, Arc<dyn RaftRpcTrait>>,
+    pub state: Arc<Mutex<RaftState<T, SM>>>,
+    pub c: Chan<T>,
+    pub network_factory: NF,
 }
 
 impl<T, SM, NF> Node<T, SM, NF>
@@ -96,6 +95,22 @@ where
             config,
             peers: HashMap::default(),
             state: Arc::new(Mutex::new(RaftState::new(id, storage, sm))),
+            c: Chan::new(),
+            network_factory,
+        }
+    }
+
+    /// Creates a new Raft node with an existing RaftState.
+    /// Useful for custom initialization scenarios.
+    pub fn new_with_state(
+        config: Config,
+        state: Arc<Mutex<RaftState<T, SM>>>,
+        network_factory: NF,
+    ) -> Self {
+        Node {
+            config,
+            peers: HashMap::default(),
+            state,
             c: Chan::new(),
             network_factory,
         }
@@ -231,7 +246,7 @@ where
 
     /// Connects to all peer nodes in the cluster.
     /// Called once at startup before entering the main loop.
-    pub(crate) async fn setup(
+    pub async fn setup(
         &mut self,
         servers: Vec<SocketAddr>,
     ) -> anyhow::Result<()> {

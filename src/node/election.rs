@@ -11,6 +11,7 @@ use crate::raft::Role;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use tracing::Instrument;
@@ -195,7 +196,7 @@ where
     /// Sends RequestVote RPC to a single peer.
     async fn send_request_vote(
         peer_addr: SocketAddr,
-        client: RaftRpcClient,
+        client: Arc<dyn RaftRpcTrait>,
         req: RequestVoteRequest,
         rpc_timeout: Duration,
     ) -> anyhow::Result<RequestVoteResponse> {

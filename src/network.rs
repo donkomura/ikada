@@ -1,15 +1,16 @@
 use async_trait::async_trait;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tarpc::{client, tokio_serde::formats::Json};
 
-use crate::rpc::RaftRpcClient;
+use crate::rpc::{RaftRpcClient, RaftRpcTrait};
 
 #[async_trait]
 pub trait NetworkFactory: Send + Sync {
     async fn connect(
         &self,
         addr: SocketAddr,
-    ) -> Result<RaftRpcClient, NetworkError>;
+    ) -> Result<Arc<dyn RaftRpcTrait>, NetworkError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,7 +51,7 @@ impl NetworkFactory for TarpcNetworkFactory {
     async fn connect(
         &self,
         addr: SocketAddr,
-    ) -> Result<RaftRpcClient, NetworkError> {
+    ) -> Result<Arc<dyn RaftRpcTrait>, NetworkError> {
         let transport =
             tarpc::serde_transport::tcp::connect(addr, Json::default)
                 .await
@@ -64,7 +65,7 @@ impl NetworkFactory for TarpcNetworkFactory {
         let client =
             RaftRpcClient::new(client::Config::default(), transport).spawn();
 
-        Ok(client)
+        Ok(Arc::new(client))
     }
 }
 
@@ -79,7 +80,7 @@ pub mod mock {
     pub struct MockNetworkFactory {
         connect_called: Arc<Mutex<Vec<SocketAddr>>>,
         should_fail: bool,
-        clients: Arc<Mutex<HashMap<SocketAddr, RaftRpcClient>>>,
+        clients: Arc<Mutex<HashMap<SocketAddr, Arc<dyn RaftRpcTrait>>>>,
     }
 
     impl MockNetworkFactory {
@@ -106,7 +107,7 @@ pub mod mock {
         pub async fn register_mock_client(
             &self,
             addr: SocketAddr,
-            client: RaftRpcClient,
+            client: Arc<dyn RaftRpcTrait>,
         ) {
             self.clients.lock().await.insert(addr, client);
         }
@@ -123,7 +124,7 @@ pub mod mock {
         async fn connect(
             &self,
             addr: SocketAddr,
-        ) -> Result<RaftRpcClient, NetworkError> {
+        ) -> Result<Arc<dyn RaftRpcTrait>, NetworkError> {
             self.connect_called.lock().await.push(addr);
 
             if self.should_fail {
@@ -135,7 +136,7 @@ pub mod mock {
 
             let clients = self.clients.lock().await;
             if let Some(client) = clients.get(&addr) {
-                return Ok(client.clone());
+                return Ok(Arc::clone(client));
             }
 
             use tarpc::client;
@@ -154,7 +155,7 @@ pub mod mock {
                 RaftRpcClient::new(client::Config::default(), transport)
                     .spawn();
 
-            Ok(client)
+            Ok(Arc::new(client))
         }
     }
 }
