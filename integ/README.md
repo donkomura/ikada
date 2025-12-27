@@ -31,5 +31,5 @@ cargo build --release --bin maelstrom-ikada
   --nemesis partition
 
 # View results
-cd store && /tmp/maelstrom/maelstrom serve
+/tmp/maelstrom/maelstrom serve
 ```
