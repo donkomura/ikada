@@ -767,8 +767,9 @@ impl MaelstromRaftNode {
             })),
             Ok(KVResponse::Value(actual)) => {
                 let actual_value = actual.as_ref().map(|v| {
-                    serde_json::from_str::<serde_json::Value>(v)
-                        .unwrap_or_else(|_| serde_json::Value::String(v.clone()))
+                    serde_json::from_str::<serde_json::Value>(v).unwrap_or_else(
+                        |_| serde_json::Value::String(v.clone()),
+                    )
                 });
 
                 if actual_value.is_none() {
@@ -795,8 +796,13 @@ impl MaelstromRaftNode {
                 .await
             }
             Err(e) => {
-                self.error_response(src, body.msg_id, ERROR_GENERAL, format!("Error: {}", e))
-                    .await
+                self.error_response(
+                    src,
+                    body.msg_id,
+                    ERROR_GENERAL,
+                    format!("Error: {}", e),
+                )
+                .await
             }
         }
     }

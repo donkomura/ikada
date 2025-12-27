@@ -39,9 +39,16 @@ pub struct KVStateMachine {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum KVCommand {
-    Set { key: String, value: String },
-    Get { key: String },
-    Delete { key: String },
+    Set {
+        key: String,
+        value: String,
+    },
+    Get {
+        key: String,
+    },
+    Delete {
+        key: String,
+    },
     CompareAndSet {
         key: String,
         from: String,
