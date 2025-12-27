@@ -975,12 +975,14 @@ where
     let heartbeat_tx = node.c.heartbeat_tx.clone();
     let client_tx = node.c.client_tx.clone();
     let state = Arc::clone(&node.state);
+    let rpc_timeout = node.config.rpc_timeout;
 
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let state_clone = Arc::clone(&state);
             let heartbeat_tx_clone = heartbeat_tx.clone();
             let client_tx_clone = client_tx.clone();
+            let timeout = rpc_timeout;
 
             tokio::spawn(async move {
                 use ikada::rpc::*;
@@ -1018,10 +1020,12 @@ where
                     }
                     Command::ClientRequest(req, resp_tx) => {
                         let resp =
-                            ikada::node::handlers::handle_client_request(
+                            ikada::node::handlers::handle_client_request_impl(
                                 &req,
                                 state_clone.clone(),
                                 client_tx_clone.clone(),
+                                timeout,
+                                true,
                             )
                             .await;
 

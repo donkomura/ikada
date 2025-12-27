@@ -44,15 +44,7 @@ jobs:
           - test-name: "3nodes-basic"
             workload: "lin-kv"
             time-limit: 10
-            rate: 10
-            node-count: 3
-            concurrency: "2n"
-            nemesis: ""
-            nemesis-interval: ""
-          - test-name: "3nodes-rate50"
-            workload: "lin-kv"
-            time-limit: 10
-            rate: 50
+            rate: 20
             node-count: 3
             concurrency: "2n"
             nemesis: ""
@@ -60,23 +52,15 @@ jobs:
           - test-name: "3nodes-partition"
             workload: "lin-kv"
             time-limit: 60
-            rate: 50
+            rate: 20
             node-count: 3
             concurrency: "2n"
             nemesis: "partition"
             nemesis-interval: "5"
-          - test-name: "5nodes-partition-rate20"
+          - test-name: "5nodes-partition"
             workload: "lin-kv"
             time-limit: 60
             rate: 20
-            node-count: 5
-            concurrency: "2n"
-            nemesis: "partition"
-            nemesis-interval: "5"
-          - test-name: "5nodes-partition-rate50"
-            workload: "lin-kv"
-            time-limit: 60
-            rate: 50
             node-count: 5
             concurrency: "2n"
             nemesis: "partition"

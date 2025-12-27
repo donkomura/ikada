@@ -265,12 +265,15 @@ where
     }
 }
 
-/// Handles client command submission.
+/// Handles client command submission (internal implementation).
+/// This function is called by Node's handle_client_request method after leadership confirmation.
 /// Redirects to leader if this node is not the current leader.
-pub async fn handle_client_request<T, SM>(
+pub async fn handle_client_request_impl<T, SM>(
     req: &CommandRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
     client_tx: mpsc::Sender<T>,
+    timeout: std::time::Duration,
+    leadership_confirmed: bool,
 ) -> CommandResponse
 where
     T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned,
@@ -287,6 +290,32 @@ where
                 leader_hint: state_guard.leader_id,
                 data: None,
                 error: Some("Not the leader".to_string()),
+            };
+        }
+
+        // Check if leadership was confirmed via heartbeat (Raft Section 8)
+        if !leadership_confirmed {
+            return CommandResponse {
+                success: false,
+                leader_hint: None,
+                data: None,
+                error: Some("Failed to confirm leadership via heartbeat".to_string()),
+            };
+        }
+
+        // Apply all committed entries before processing new request
+        // This ensures linearizable reads by guaranteeing we see all committed values
+        if state_guard.commit_index > state_guard.last_applied
+            && let Err(e) = state_guard.apply_committed().await
+        {
+            return CommandResponse {
+                success: false,
+                leader_hint: None,
+                data: None,
+                error: Some(format!(
+                    "Failed to apply committed entries: {}",
+                    e
+                )),
             };
         }
 
@@ -342,9 +371,7 @@ where
     }
 
     // Wait for the result (with timeout)
-    match tokio::time::timeout(std::time::Duration::from_secs(10), result_rx)
-        .await
-    {
+    match tokio::time::timeout(timeout, result_rx).await {
         Ok(Ok(response)) => {
             // Serialize the response
             match bincode::serialize(&response) {
