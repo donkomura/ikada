@@ -3,7 +3,16 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
@@ -46,6 +55,20 @@ jobs:
             node-count: 3
             concurrency: "2n"
             nemesis: ""
+          - test-name: "3nodes-partition"
+            workload: "lin-kv"
+            time-limit: 10
+            rate: 10
+            node-count: 3
+            concurrency: "2n"
+            nemesis: "partition"
+          - test-name: "5nodes-partition"
+            workload: "lin-kv"
+            time-limit: 10
+            rate: 10
+            node-count: 5
+            concurrency: "2n"
+            nemesis: "partition"
     steps:
       - uses: actions/checkout@v4
       - name: Install Java
@@ -66,14 +89,21 @@ jobs:
         id: cache-maelstrom
         uses: actions/cache@v4
         with:
-          path: /usr/local/bin/maelstrom
+          path: ~/maelstrom
           key: maelstrom-v0.2.3
       - name: Download Maelstrom
         if: steps.cache-maelstrom.outputs.cache-hit != 'true'
         run: |
           wget https://github.com/jepsen-io/maelstrom/releases/download/v0.2.3/maelstrom.tar.bz2
           tar -xjf maelstrom.tar.bz2
-          sudo mv maelstrom /usr/local/bin/
+          mv maelstrom ~/maelstrom
+      - name: Quick smoke test
+        run: |
+          ~/maelstrom/maelstrom test \
+            -w echo \
+            --bin ~/maelstrom/demo/ruby/echo.rb \
+            --time-limit 5 \
+            --node-count 1
       - name: Run Maelstrom test
         env:
           WORKLOAD: ${{ matrix.workload }}
@@ -87,7 +117,7 @@ jobs:
           if [ -n "$NEMESIS" ]; then
             NEMESIS_FLAG="--nemesis $NEMESIS"
           fi
-          /usr/local/bin/maelstrom/maelstrom test \
+          ~/maelstrom/maelstrom test \
             -w "$WORKLOAD" \
             --bin bin/maelstrom-ikada \
             --time-limit "$TIME_LIMIT" \
