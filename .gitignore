@@ -31,3 +31,6 @@ target
 
 # vscode
 .vscode
+
+# Maelstrom test results
+store/
