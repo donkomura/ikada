@@ -62,6 +62,20 @@ jobs:
             node-count: 3
             concurrency: "2n"
             nemesis: "partition"
+          - test-name: "5nodes-partition-rate20"
+            workload: "lin-kv"
+            time-limit: 60
+            rate: 20
+            node-count: 5
+            concurrency: "2n"
+            nemesis: "partition"
+          - test-name: "5nodes-partition-rate50"
+            workload: "lin-kv"
+            time-limit: 60
+            rate: 50
+            node-count: 5
+            concurrency: "2n"
+            nemesis: "partition"
     steps:
       - uses: actions/checkout@v4
       - name: Install Java
