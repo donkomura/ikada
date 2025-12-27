@@ -58,15 +58,8 @@ jobs:
           - test-name: "3nodes-partition"
             workload: "lin-kv"
             time-limit: 10
-            rate: 10
+            rate: 50
             node-count: 3
-            concurrency: "2n"
-            nemesis: "partition"
-          - test-name: "5nodes-partition"
-            workload: "lin-kv"
-            time-limit: 10
-            rate: 10
-            node-count: 5
             concurrency: "2n"
             nemesis: "partition"
     steps:
