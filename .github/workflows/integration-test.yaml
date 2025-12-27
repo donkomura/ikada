@@ -57,7 +57,7 @@ jobs:
             nemesis: ""
           - test-name: "3nodes-partition"
             workload: "lin-kv"
-            time-limit: 10
+            time-limit: 60
             rate: 50
             node-count: 3
             concurrency: "2n"
