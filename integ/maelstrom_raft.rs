@@ -19,6 +19,7 @@ use ikada::statemachine::{KVCommand, KVResponse, KVStateMachine};
 const BASE_PORT: u16 = 1111;
 const FORWARD_MSG_ID_START: u64 = 1000000;
 const COMMAND_CHANNEL_SIZE: usize = 128;
+const ERROR_GENERAL: u32 = 13;
 
 type RaftStateHandle = Arc<Mutex<RaftState<KVCommand, KVStateMachine>>>;
 
@@ -472,6 +473,11 @@ impl MaelstromRaftNode {
                     "Delete command not supported for forwarding"
                 ));
             }
+            KVCommand::CompareAndSet { .. } => {
+                return Err(anyhow::anyhow!(
+                    "CompareAndSet command not supported for forwarding"
+                ));
+            }
         };
 
         self.outgoing_tx
@@ -488,7 +494,7 @@ impl MaelstromRaftNode {
                 let value_str = body.value.to_string();
                 Ok(KVResponse::Value(Some(value_str)))
             }
-            Body::WriteOk(_) => Ok(KVResponse::Ok),
+            Body::WriteOk(_) => Ok(KVResponse::Success),
             Body::Error(body) => {
                 if body.code == ERROR_KEY_NOT_EXIST {
                     Ok(KVResponse::Value(None))
@@ -597,7 +603,7 @@ impl MaelstromRaftNode {
                 dest: Some(src),
                 body: Body::Error(ErrorBody {
                     in_reply_to: body.msg_id,
-                    code: 13,
+                    code: ERROR_GENERAL,
                     text: Some(format!("Error: {}", e)),
                 }),
             })),
@@ -631,7 +637,7 @@ impl MaelstromRaftNode {
                 dest: Some(src),
                 body: Body::Error(ErrorBody {
                     in_reply_to: body.msg_id,
-                    code: 13,
+                    code: ERROR_GENERAL,
                     text: Some(format!("Error: {}", e)),
                 }),
             })),
@@ -742,94 +748,55 @@ impl MaelstromRaftNode {
         body: CasBody,
         key_str: String,
     ) -> anyhow::Result<Option<Message>> {
-        let current_value = self.get_current_value(&key_str).await;
-        let current_value_str = match current_value {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                return self
-                    .error_response(
-                        src,
-                        body.msg_id,
-                        ERROR_KEY_NOT_EXIST,
-                        format!("Key {:?} does not exist", key_str),
-                    )
-                    .await;
-            }
-            Err(e) => {
-                return self
-                    .error_response(
-                        src,
-                        body.msg_id,
-                        13,
-                        format!("Error: {}", e),
-                    )
-                    .await;
-            }
+        let from_str = body.from.to_string().trim_matches('"').to_string();
+        let to_str = body.to.to_string().trim_matches('"').to_string();
+
+        let cas_command = KVCommand::CompareAndSet {
+            key: key_str.clone(),
+            from: from_str.clone(),
+            to: to_str,
         };
 
-        // Parse current value as JSON for comparison
-        let current_value_json: serde_json::Value =
-            serde_json::from_str(&current_value_str).unwrap_or_else(|_| {
-                serde_json::Value::String(current_value_str.clone())
-            });
+        match self.execute_command(cas_command).await {
+            Ok(KVResponse::Success) => Ok(Some(Message {
+                src: self.get_node_id().await.unwrap_or_default(),
+                dest: Some(src),
+                body: Body::CasOk(CasOkBody {
+                    in_reply_to: body.msg_id,
+                }),
+            })),
+            Ok(KVResponse::Value(actual)) => {
+                let actual_value = actual.as_ref().map(|v| {
+                    serde_json::from_str::<serde_json::Value>(v)
+                        .unwrap_or_else(|_| serde_json::Value::String(v.clone()))
+                });
 
-        if current_value_json != body.from {
-            return self
-                .error_response(
+                if actual_value.is_none() {
+                    return self
+                        .error_response(
+                            src,
+                            body.msg_id,
+                            ERROR_KEY_NOT_EXIST,
+                            format!("Key {:?} does not exist", key_str),
+                        )
+                        .await;
+                }
+
+                self.error_response(
                     src,
                     body.msg_id,
                     ERROR_CAS_MISMATCH,
                     format!(
                         "Expected {} but found {}",
-                        body.from, current_value_json
+                        body.from,
+                        actual_value.unwrap()
                     ),
                 )
-                .await;
-        }
-
-        self.set_new_value(&key_str, body.to.to_string(), src, body.msg_id)
-            .await
-    }
-
-    async fn get_current_value(
-        &self,
-        key: &str,
-    ) -> anyhow::Result<Option<String>> {
-        let get_command = KVCommand::Get {
-            key: key.to_string(),
-        };
-        match self.execute_command(get_command).await? {
-            KVResponse::Value(v) => Ok(v),
-            _ => unreachable!(),
-        }
-    }
-
-    async fn set_new_value(
-        &self,
-        key: &str,
-        value: String,
-        dest: String,
-        in_reply_to: u64,
-    ) -> anyhow::Result<Option<Message>> {
-        let set_command = KVCommand::Set {
-            key: key.to_string(),
-            value,
-        };
-
-        match self.execute_command(set_command).await {
-            Ok(_) => Ok(Some(Message {
-                src: self.get_node_id().await.unwrap_or_default(),
-                dest: Some(dest),
-                body: Body::CasOk(CasOkBody { in_reply_to }),
-            })),
-            Err(e) => {
-                self.error_response(
-                    dest,
-                    in_reply_to,
-                    13,
-                    format!("Error: {}", e),
-                )
                 .await
+            }
+            Err(e) => {
+                self.error_response(src, body.msg_id, ERROR_GENERAL, format!("Error: {}", e))
+                    .await
             }
         }
     }

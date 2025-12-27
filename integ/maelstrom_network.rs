@@ -128,6 +128,7 @@ impl MaelstromRpcClient {
         &self,
         msg: Message,
         msg_id: u64,
+        timeout: std::time::Duration,
     ) -> Result<Message, NetworkError> {
         let (tx, rx) = oneshot::channel();
 
@@ -140,9 +141,19 @@ impl MaelstromRpcClient {
             NetworkError::Other(format!("Failed to send: {}", e))
         })?;
 
-        rx.await.map_err(|e| {
-            NetworkError::Other(format!("Response channel closed: {}", e))
-        })
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(result) => result.map_err(|e| {
+                NetworkError::Other(format!("Response channel closed: {}", e))
+            }),
+            Err(_) => {
+                let handlers = Arc::clone(&self.rpc_handlers);
+                tokio::spawn(async move {
+                    let mut handlers = handlers.lock().await;
+                    handlers.remove(&msg_id);
+                });
+                Err(NetworkError::Timeout)
+            }
+        }
     }
 }
 
@@ -150,7 +161,7 @@ impl MaelstromRpcClient {
 impl RaftRpcTrait for MaelstromRpcClient {
     async fn append_entries(
         &self,
-        _ctx: context::Context,
+        ctx: context::Context,
         req: AppendEntriesRequest,
     ) -> anyhow::Result<AppendEntriesResponse> {
         let dest = match self.node_id_to_string(self.node_id).await {
@@ -191,7 +202,12 @@ impl RaftRpcTrait for MaelstromRpcClient {
             }),
         };
 
-        match self.send_and_wait(msg, msg_id).await {
+        let timeout = ctx
+            .deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_secs(3));
+
+        match self.send_and_wait(msg, msg_id, timeout).await {
             Ok(response) => match response.body {
                 Body::AppendEntriesOk(body) => Ok(AppendEntriesResponse {
                     term: body.term,
@@ -210,7 +226,7 @@ impl RaftRpcTrait for MaelstromRpcClient {
 
     async fn request_vote(
         &self,
-        _ctx: context::Context,
+        ctx: context::Context,
         req: RequestVoteRequest,
     ) -> anyhow::Result<RequestVoteResponse> {
         let dest = match self.node_id_to_string(self.node_id).await {
@@ -237,7 +253,12 @@ impl RaftRpcTrait for MaelstromRpcClient {
             }),
         };
 
-        match self.send_and_wait(msg, msg_id).await {
+        let timeout = ctx
+            .deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_secs(3));
+
+        match self.send_and_wait(msg, msg_id, timeout).await {
             Ok(response) => match response.body {
                 Body::RequestVoteOk(body) => Ok(RequestVoteResponse {
                     term: body.term,
