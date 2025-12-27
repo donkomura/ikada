@@ -382,22 +382,6 @@ impl MaelstromRaftNode {
         Err(anyhow::anyhow!("Command failed: {:?}", response.error))
     }
 
-    async fn get_leader_info(&self) -> anyhow::Result<(Option<u32>, bool)> {
-        let context = self.raft_context.lock().await;
-        let state = context
-            .state
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
-        let state_inner = state.lock().await;
-        let is_leader = state_inner.role == ikada::raft::Role::Leader;
-        Ok((state_inner.leader_id, is_leader))
-    }
-
-    async fn get_current_leader_id(&self) -> anyhow::Result<Option<u32>> {
-        let (leader_id, _) = self.get_leader_info().await?;
-        Ok(leader_id)
-    }
-
     /// Check if we should forward to leader and return leader's node ID.
     /// Returns None if:
     /// - We are the leader ourselves
