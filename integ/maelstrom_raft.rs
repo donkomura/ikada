@@ -375,20 +375,7 @@ impl MaelstromRaftNode {
         cmd: KVCommand,
         response: CommandResponse,
     ) -> anyhow::Result<KVResponse> {
-        let (leader_id, is_leader) = self.get_leader_info().await?;
-
-        // If we are the leader, don't forward to ourselves
-        if is_leader {
-            return Err(anyhow::anyhow!(
-                "Command failed on leader: {:?}",
-                response.error
-            ));
-        }
-
-        if let Some(leader_hint) = leader_id
-            && let Some(leader_node_id) =
-                self.get_node_id_by_hint(leader_hint).await
-        {
+        if let Some(leader_node_id) = self.should_forward_to_leader().await? {
             return self.forward_to_leader(leader_node_id, cmd).await;
         }
 
@@ -409,6 +396,43 @@ impl MaelstromRaftNode {
     async fn get_current_leader_id(&self) -> anyhow::Result<Option<u32>> {
         let (leader_id, _) = self.get_leader_info().await?;
         Ok(leader_id)
+    }
+
+    /// Check if we should forward to leader and return leader's node ID.
+    /// Returns None if:
+    /// - We are the leader ourselves
+    /// - No leader is known
+    /// - Leader ID points to ourselves (stale state after partition)
+    async fn should_forward_to_leader(&self) -> anyhow::Result<Option<String>> {
+        let context = self.raft_context.lock().await;
+        let state = context
+            .state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
+        let state_inner = state.lock().await;
+
+        if state_inner.role == ikada::raft::Role::Leader {
+            return Ok(None);
+        }
+
+        let Some(leader_hint) = state_inner.leader_id else {
+            return Ok(None);
+        };
+
+        let my_node_id = self
+            .get_node_id()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Node ID not set"))?;
+        let leader_node_id = self.get_node_id_by_hint(leader_hint).await;
+
+        if leader_node_id.as_ref() == Some(&my_node_id) {
+            drop(state_inner);
+            let mut state_mut = state.lock().await;
+            state_mut.leader_id = None;
+            return Ok(None);
+        }
+
+        Ok(leader_node_id)
     }
 
     /// Forward client request to the leader
@@ -570,58 +594,54 @@ impl MaelstromRaftNode {
         src: String,
         body: ReadBody,
     ) -> anyhow::Result<Option<Message>> {
-        let (leader_id, is_leader) = self.get_leader_info().await?;
+        if let Some(leader_node_id) = self.should_forward_to_leader().await? {
+            let key_str = body.key.to_string().trim_matches('"').to_string();
+            let command = KVCommand::Get { key: key_str };
+
+            match self.forward_to_leader(leader_node_id, command).await {
+                Ok(KVResponse::Value(Some(value))) => {
+                    let json_value: serde_json::Value =
+                        serde_json::from_str(&value)
+                            .unwrap_or(serde_json::Value::String(value));
+
+                    return Ok(Some(Message {
+                        src: self.get_node_id().await.unwrap(),
+                        dest: Some(src),
+                        body: Body::ReadOk(ReadOkBody {
+                            in_reply_to: body.msg_id,
+                            value: json_value,
+                        }),
+                    }));
+                }
+                Ok(KVResponse::Value(None)) => {
+                    return Ok(Some(Message {
+                        src: self.get_node_id().await.unwrap(),
+                        dest: Some(src),
+                        body: Body::Error(ErrorBody {
+                            in_reply_to: body.msg_id,
+                            code: ERROR_KEY_NOT_EXIST,
+                            text: Some("Key does not exist".to_string()),
+                        }),
+                    }));
+                }
+                Err(e) => {
+                    return Ok(Some(Message {
+                        src: self.get_node_id().await.unwrap(),
+                        dest: Some(src),
+                        body: Body::Error(ErrorBody {
+                            in_reply_to: body.msg_id,
+                            code: ERROR_GENERAL,
+                            text: Some(format!("Forward error: {}", e)),
+                        }),
+                    }));
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let is_leader = self.check_is_leader().await?;
 
         if !is_leader {
-            if let Some(leader_hint) = leader_id
-                && let Some(leader_node_id) =
-                    self.get_node_id_by_hint(leader_hint).await
-            {
-                let key_str =
-                    body.key.to_string().trim_matches('"').to_string();
-                let command = KVCommand::Get { key: key_str };
-
-                match self.forward_to_leader(leader_node_id, command).await {
-                    Ok(KVResponse::Value(Some(value))) => {
-                        let json_value: serde_json::Value =
-                            serde_json::from_str(&value)
-                                .unwrap_or(serde_json::Value::String(value));
-
-                        return Ok(Some(Message {
-                            src: self.get_node_id().await.unwrap(),
-                            dest: Some(src),
-                            body: Body::ReadOk(ReadOkBody {
-                                in_reply_to: body.msg_id,
-                                value: json_value,
-                            }),
-                        }));
-                    }
-                    Ok(KVResponse::Value(None)) => {
-                        return Ok(Some(Message {
-                            src: self.get_node_id().await.unwrap(),
-                            dest: Some(src),
-                            body: Body::Error(ErrorBody {
-                                in_reply_to: body.msg_id,
-                                code: ERROR_KEY_NOT_EXIST,
-                                text: Some("Key does not exist".to_string()),
-                            }),
-                        }));
-                    }
-                    Err(e) => {
-                        return Ok(Some(Message {
-                            src: self.get_node_id().await.unwrap(),
-                            dest: Some(src),
-                            body: Body::Error(ErrorBody {
-                                in_reply_to: body.msg_id,
-                                code: ERROR_GENERAL,
-                                text: Some(format!("Forward error: {}", e)),
-                            }),
-                        }));
-                    }
-                    _ => unreachable!(),
-                }
-            }
-
             return Ok(Some(Message {
                 src: self.get_node_id().await.unwrap(),
                 dest: Some(src),
@@ -740,12 +760,7 @@ impl MaelstromRaftNode {
         body: CasBody,
         key_str: String,
     ) -> anyhow::Result<Option<Message>> {
-        let leader_id = self.get_current_leader_id().await?;
-
-        if let Some(leader_hint) = leader_id
-            && let Some(leader_node_id) =
-                self.get_node_id_by_hint(leader_hint).await
-        {
+        if let Some(leader_node_id) = self.should_forward_to_leader().await? {
             return match self
                 .forward_cas_to_leader(
                     leader_node_id,
