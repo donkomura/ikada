@@ -259,17 +259,18 @@ impl MaelstromRaftNode {
             context.cmd_tx = Some(cmd_tx);
         }
 
-        // Use shorter timeouts for Maelstrom testing
+        // Maelstrom-optimized timeouts
         let timeout_ms = {
             use rand::Rng;
             let base_ms = 500;
-            let max_ms = base_ms * 2;
+            let max_ms = 1500;
             rand::rng().random_range(base_ms..=max_ms)
         };
         let config = Config {
             heartbeat_interval: tokio::time::Duration::from_millis(50),
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
-            rpc_timeout: std::time::Duration::from_millis(1000),
+            rpc_timeout: std::time::Duration::from_millis(500),
+            heartbeat_failure_retry_limit: 1,
         };
 
         let node = Node::new_with_state(config, state, network_factory.clone());
@@ -569,6 +570,69 @@ impl MaelstromRaftNode {
         src: String,
         body: ReadBody,
     ) -> anyhow::Result<Option<Message>> {
+        let (leader_id, is_leader) = self.get_leader_info().await?;
+
+        if !is_leader {
+            if let Some(leader_hint) = leader_id
+                && let Some(leader_node_id) =
+                    self.get_node_id_by_hint(leader_hint).await
+            {
+                let key_str =
+                    body.key.to_string().trim_matches('"').to_string();
+                let command = KVCommand::Get { key: key_str };
+
+                match self.forward_to_leader(leader_node_id, command).await {
+                    Ok(KVResponse::Value(Some(value))) => {
+                        let json_value: serde_json::Value =
+                            serde_json::from_str(&value)
+                                .unwrap_or(serde_json::Value::String(value));
+
+                        return Ok(Some(Message {
+                            src: self.get_node_id().await.unwrap(),
+                            dest: Some(src),
+                            body: Body::ReadOk(ReadOkBody {
+                                in_reply_to: body.msg_id,
+                                value: json_value,
+                            }),
+                        }));
+                    }
+                    Ok(KVResponse::Value(None)) => {
+                        return Ok(Some(Message {
+                            src: self.get_node_id().await.unwrap(),
+                            dest: Some(src),
+                            body: Body::Error(ErrorBody {
+                                in_reply_to: body.msg_id,
+                                code: ERROR_KEY_NOT_EXIST,
+                                text: Some("Key does not exist".to_string()),
+                            }),
+                        }));
+                    }
+                    Err(e) => {
+                        return Ok(Some(Message {
+                            src: self.get_node_id().await.unwrap(),
+                            dest: Some(src),
+                            body: Body::Error(ErrorBody {
+                                in_reply_to: body.msg_id,
+                                code: ERROR_GENERAL,
+                                text: Some(format!("Forward error: {}", e)),
+                            }),
+                        }));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            return Ok(Some(Message {
+                src: self.get_node_id().await.unwrap(),
+                dest: Some(src),
+                body: Body::Error(ErrorBody {
+                    in_reply_to: body.msg_id,
+                    code: ERROR_GENERAL,
+                    text: Some("Not leader and no leader known".to_string()),
+                }),
+            }));
+        }
+
         let key_str = body.key.to_string().trim_matches('"').to_string();
         let command = KVCommand::Get {
             key: key_str.clone(),

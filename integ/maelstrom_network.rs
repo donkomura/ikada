@@ -204,8 +204,7 @@ impl RaftRpcTrait for MaelstromRpcClient {
 
         let timeout = ctx
             .deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .max(std::time::Duration::from_secs(3));
+            .saturating_duration_since(std::time::Instant::now());
 
         match self.send_and_wait(msg, msg_id, timeout).await {
             Ok(response) => match response.body {
@@ -255,8 +254,7 @@ impl RaftRpcTrait for MaelstromRpcClient {
 
         let timeout = ctx
             .deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .max(std::time::Duration::from_secs(3));
+            .saturating_duration_since(std::time::Instant::now());
 
         match self.send_and_wait(msg, msg_id, timeout).await {
             Ok(response) => match response.body {

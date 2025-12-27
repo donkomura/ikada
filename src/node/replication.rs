@@ -30,6 +30,7 @@ where
 {
     /// Broadcasts AppendEntries RPCs to all followers.
     /// Called periodically by the leader to replicate log entries and maintain authority.
+    /// Returns true if majority of peers responded successfully, false otherwise.
     pub(super) async fn broadcast_heartbeat(&mut self) -> anyhow::Result<bool> {
         // Lock once and copy all needed data
         let (leader_term, leader_id, leader_commit, log_data, peer_data) = {
@@ -54,6 +55,7 @@ where
             )
         };
 
+        let peer_count = peer_data.len();
         let mut requests = Vec::new();
         for (addr, next_idx) in peer_data {
             let client = self.peers.get(&addr).unwrap().clone();
@@ -124,11 +126,13 @@ where
         }
         drop(result_tx); // Drop the original sender so the receiver knows when all tasks are done
 
+        let mut success_count = 0;
         while let Some(result) = result_rx.recv().await {
             match result {
                 Ok((server, res, sent_up_to_index)) => {
                     self.handle_heartbeat(server, res, sent_up_to_index)
                         .await?;
+                    success_count += 1;
                 }
                 Err(e) => {
                     tracing::warn!("Failed to send heartbeat: {:?}", e);
@@ -136,7 +140,23 @@ where
             }
         }
 
-        Ok(true)
+        // Check if we have connectivity to majority of peers
+        // total_nodes = peer_count + 1 (self)
+        // We need responses from at least majority - 1 peers (since leader counts as 1)
+        let total_nodes = peer_count + 1;
+        let majority = total_nodes / 2;
+        let has_majority = success_count > majority;
+
+        if !has_majority {
+            tracing::warn!(
+                "Leader only has {} successful responses out of {} peers (need > {} for majority)",
+                success_count,
+                peer_count,
+                majority
+            );
+        }
+
+        Ok(has_majority)
     }
 
     /// Sends AppendEntries RPC to a single follower.

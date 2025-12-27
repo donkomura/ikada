@@ -102,6 +102,7 @@ where
 
     /// Runs as leader, processing client commands and sending periodic heartbeats.
     /// Applies committed entries to the state machine after each heartbeat round.
+    /// Automatically steps down to Follower if majority connectivity is lost.
     pub async fn run_leader(&mut self) -> anyhow::Result<()> {
         let _id = self.state.lock().await.id;
 
@@ -109,15 +110,33 @@ where
         let watchdog = WatchDog::default();
         watchdog.reset(timeout).await;
 
+        let mut failure_retry_count = 0;
+        let retry_limit = self.config.heartbeat_failure_retry_limit;
+
         loop {
             if !matches!(self.state.lock().await.role, Role::Leader) {
                 break;
             }
             tokio::select! {
                 Some(_order) = self.c.client_rx.recv() => {
-                    // Command already added to log by handle_client_request
-                    // Just trigger immediate replication
-                    self.broadcast_heartbeat().await?;
+                    let has_majority = self.broadcast_heartbeat().await?;
+                    if !has_majority {
+                        failure_retry_count += 1;
+                        tracing::warn!(
+                            "Leader lost majority connectivity (retry {}/{})",
+                            failure_retry_count,
+                            retry_limit
+                        );
+                        if failure_retry_count >= retry_limit {
+                            tracing::warn!(
+                                "Leader stepping down due to loss of majority connectivity"
+                            );
+                            self.become_follower().await?;
+                            break;
+                        }
+                    } else {
+                        failure_retry_count = 0;
+                    }
                     self.update_commit_index().await?;
                     let mut state = self.state.lock().await;
                     if state.commit_index > state.last_applied {
@@ -125,7 +144,24 @@ where
                     }
                 },
                 _ = watchdog.wait() => {
-                    self.broadcast_heartbeat().await?;
+                    let has_majority = self.broadcast_heartbeat().await?;
+                    if !has_majority {
+                        failure_retry_count += 1;
+                        tracing::warn!(
+                            "Leader lost majority connectivity (retry {}/{})",
+                            failure_retry_count,
+                            retry_limit
+                        );
+                        if failure_retry_count >= retry_limit {
+                            tracing::warn!(
+                                "Leader stepping down due to loss of majority connectivity"
+                            );
+                            self.become_follower().await?;
+                            break;
+                        }
+                    } else {
+                        failure_retry_count = 0;
+                    }
                     self.update_commit_index().await?;
                     let mut state = self.state.lock().await;
                     if state.commit_index > state.last_applied {

@@ -5,6 +5,7 @@ pub struct Config {
     pub heartbeat_interval: tokio::time::Duration,
     pub election_timeout: tokio::time::Duration,
     pub rpc_timeout: Duration,
+    pub heartbeat_failure_retry_limit: u32,
 }
 
 impl Default for Config {
@@ -18,6 +19,7 @@ impl Default for Config {
             heartbeat_interval: tokio::time::Duration::from_millis(1000),
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
             rpc_timeout: tokio::time::Duration::from_millis(5000),
+            heartbeat_failure_retry_limit: 1,
         }
     }
 }
