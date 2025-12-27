@@ -181,6 +181,7 @@ where
         let mut state = self.state.lock().await;
         state.role = Role::Follower;
         state.persistent.voted_for = None;
+        state.leader_id = None;
         Ok(())
     }
 
