@@ -42,11 +42,16 @@ pub enum KVCommand {
     Set { key: String, value: String },
     Get { key: String },
     Delete { key: String },
+    CompareAndSet {
+        key: String,
+        from: String,
+        to: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum KVResponse {
-    Ok,
+    Success,
     Value(Option<String>),
 }
 
@@ -62,7 +67,7 @@ impl StateMachine for KVStateMachine {
         match command {
             KVCommand::Set { key, value } => {
                 self.data.insert(key.clone(), value.clone());
-                Ok(KVResponse::Ok)
+                Ok(KVResponse::Success)
             }
             KVCommand::Get { key } => {
                 let value = self.data.get(&key.clone());
@@ -71,6 +76,16 @@ impl StateMachine for KVStateMachine {
             KVCommand::Delete { key } => {
                 let value = self.data.remove(key);
                 Ok(KVResponse::Value(value))
+            }
+            KVCommand::CompareAndSet { key, from, to } => {
+                let current = self.data.get(key);
+                let success = current.map(|v| v == from).unwrap_or(false);
+                if success {
+                    self.data.insert(key.clone(), to.clone());
+                    Ok(KVResponse::Success)
+                } else {
+                    Ok(KVResponse::Value(current.cloned()))
+                }
             }
         }
     }
