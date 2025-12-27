@@ -259,13 +259,7 @@ impl MaelstromRaftNode {
             context.cmd_tx = Some(cmd_tx);
         }
 
-        // Use shorter timeouts for Maelstrom testing
-        // Election timeout: 500-1500ms provides good balance between:
-        // - Wide enough range to avoid split votes (1000ms spread)
-        // - Fast enough for multiple election rounds within 10s test window
-        // RPC timeout: 500ms is long enough for normal operations but fast enough
-        // to detect network partitions without blocking elections too long
-        // heartbeat_failure_retry_limit: 1 to quickly detect and step down from isolated leaders
+        // Maelstrom-optimized timeouts
         let timeout_ms = {
             use rand::Rng;
             let base_ms = 500;
