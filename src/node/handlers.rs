@@ -299,7 +299,9 @@ where
                 success: false,
                 leader_hint: None,
                 data: None,
-                error: Some("Failed to confirm leadership via heartbeat".to_string()),
+                error: Some(
+                    "Failed to confirm leadership via heartbeat".to_string(),
+                ),
             };
         }
 

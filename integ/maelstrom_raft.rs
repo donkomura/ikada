@@ -34,6 +34,7 @@ struct RaftContext {
     state: Option<RaftStateHandle>,
     cmd_tx: Option<mpsc::Sender<Command>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    last_heartbeat_majority: Option<Arc<Mutex<bool>>>,
 }
 
 /// Request forwarding management
@@ -93,6 +94,7 @@ impl MaelstromRaftNode {
                 state: None,
                 cmd_tx: None,
                 task_handle: None,
+                last_heartbeat_majority: None,
             })),
             network_factory: Arc::new(Mutex::new(None)),
             forward_manager: Arc::new(Mutex::new(ForwardManager::new())),
@@ -274,6 +276,7 @@ impl MaelstromRaftNode {
         };
 
         let node = Node::new_with_state(config, state, network_factory.clone());
+        let last_heartbeat_majority = Arc::clone(&node.last_heartbeat_majority);
 
         let task_handle = tokio::spawn(async move {
             let _ = run_raft_node(node, own_port, peers, cmd_rx).await;
@@ -282,6 +285,7 @@ impl MaelstromRaftNode {
         {
             let mut context = self.raft_context.lock().await;
             context.task_handle = Some(task_handle);
+            context.last_heartbeat_majority = Some(last_heartbeat_majority);
         }
 
         Ok(Some(Message {
@@ -623,9 +627,9 @@ impl MaelstromRaftNode {
             }
         }
 
-        let is_leader = self.check_is_leader().await?;
+        let leadership_confirmed = self.check_leadership_confirmed().await?;
 
-        if !is_leader {
+        if !leadership_confirmed {
             return Ok(Some(Message {
                 src: self.get_node_id().await.unwrap(),
                 dest: Some(src),
@@ -719,23 +723,35 @@ impl MaelstromRaftNode {
     ) -> anyhow::Result<Option<Message>> {
         let key_str = body.key.to_string().trim_matches('"').to_string();
 
-        let is_leader = self.check_is_leader().await?;
+        let leadership_confirmed = self.check_leadership_confirmed().await?;
 
-        if !is_leader {
+        if !leadership_confirmed {
             return self.forward_cas_if_possible(src, body, key_str).await;
         }
 
         self.execute_cas_as_leader(src, body, key_str).await
     }
 
-    async fn check_is_leader(&self) -> anyhow::Result<bool> {
+    async fn check_leadership_confirmed(&self) -> anyhow::Result<bool> {
         let context = self.raft_context.lock().await;
+
         let state = context
             .state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
         let state_inner = state.lock().await;
-        Ok(state_inner.role == ikada::raft::Role::Leader)
+
+        if state_inner.role != ikada::raft::Role::Leader {
+            return Ok(false);
+        }
+
+        let last_heartbeat_majority =
+            context.last_heartbeat_majority.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("last_heartbeat_majority not initialized")
+            })?;
+
+        let has_majority = *last_heartbeat_majority.lock().await;
+        Ok(has_majority)
     }
 
     async fn forward_cas_if_possible(
@@ -976,6 +992,7 @@ where
     let client_tx = node.c.client_tx.clone();
     let state = Arc::clone(&node.state);
     let rpc_timeout = node.config.rpc_timeout;
+    let last_heartbeat_majority = Arc::clone(&node.last_heartbeat_majority);
 
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
@@ -983,6 +1000,8 @@ where
             let heartbeat_tx_clone = heartbeat_tx.clone();
             let client_tx_clone = client_tx.clone();
             let timeout = rpc_timeout;
+            let last_heartbeat_majority_clone =
+                Arc::clone(&last_heartbeat_majority);
 
             tokio::spawn(async move {
                 use ikada::rpc::*;
@@ -1019,13 +1038,25 @@ where
                         let _ = resp_tx.send(resp);
                     }
                     Command::ClientRequest(req, resp_tx) => {
+                        // Raft Section 8: Check leadership confirmation before serving reads
+                        let state_inner = state_clone.lock().await;
+                        let is_leader =
+                            state_inner.role == ikada::raft::Role::Leader;
+                        drop(state_inner);
+
+                        let leadership_confirmed = if is_leader {
+                            *last_heartbeat_majority_clone.lock().await
+                        } else {
+                            false
+                        };
+
                         let resp =
                             ikada::node::handlers::handle_client_request_impl(
                                 &req,
                                 state_clone.clone(),
                                 client_tx_clone.clone(),
                                 timeout,
-                                true,
+                                leadership_confirmed,
                             )
                             .await;
 

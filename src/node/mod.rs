@@ -170,8 +170,6 @@ where
         let heartbeat_tx = self.c.heartbeat_tx.clone();
         let client_tx = self.c.client_tx.clone();
         let config = self.config.clone();
-        let peers = self.peers.clone();
-        let network_factory = self.network_factory.clone();
         let last_heartbeat_majority = self.last_heartbeat_majority.clone();
         let mut workers = JoinSet::new();
         workers.spawn(self.main(servers));
@@ -181,8 +179,6 @@ where
             heartbeat_tx,
             client_tx,
             config,
-            peers,
-            network_factory,
             last_heartbeat_majority,
         ));
         workers.spawn(crate::server::rpc_server(tx, port));
@@ -205,8 +201,6 @@ where
         heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
         client_tx: mpsc::Sender<T>,
         config: Config,
-        _peers: HashMap<SocketAddr, Arc<dyn RaftRpcTrait>>,
-        _network_factory: NF,
         last_heartbeat_majority: Arc<Mutex<bool>>,
     ) -> anyhow::Result<()> {
         while let Some(cmd) = rx.recv().await {
@@ -250,9 +244,11 @@ where
                     let state_clone = Arc::clone(&state);
                     let client_tx = client_tx.clone();
                     let timeout = config.rpc_timeout;
-                    let last_heartbeat_majority = Arc::clone(&last_heartbeat_majority);
+                    let last_heartbeat_majority =
+                        Arc::clone(&last_heartbeat_majority);
                     tokio::spawn(async move {
-                        let leadership_confirmed = *last_heartbeat_majority.lock().await;
+                        let leadership_confirmed =
+                            *last_heartbeat_majority.lock().await;
                         let resp = handlers::handle_client_request_impl(
                             &req,
                             state_clone,
