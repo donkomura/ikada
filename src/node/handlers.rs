@@ -10,7 +10,7 @@ use crate::raft::{self, RaftState, Role};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 /// Handles AppendEntries RPC from leader.
 /// Returns success only if log consistency checks pass (Raft §5.3).
@@ -503,7 +503,6 @@ where
 pub async fn handle_client_request_impl<T, SM>(
     req: &CommandRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
-    client_tx: mpsc::Sender<T>,
     timeout: std::time::Duration,
     heartbeat_term: Option<u32>,
     peer_count: usize,
@@ -513,7 +512,7 @@ where
     SM: StateMachine<Command = T>,
     SM::Response: Clone + serde::Serialize,
 {
-    let (command, log_index, result_rx) = {
+    let (log_index, result_rx) = {
         let mut state_guard = state.lock().await;
 
         // Validate that this node is the leader and has confirmed leadership via majority heartbeat
@@ -553,28 +552,11 @@ where
         };
 
         // Step 2: Leader appends entry to its local log (not yet committed to state machine)
-        let (log_index, result_rx) = match append_command_to_log(
-            &mut state_guard,
-            command.clone(),
-        )
-        .await
-        {
+        match append_command_to_log(&mut state_guard, command.clone()).await {
             Ok(result) => result,
             Err(response) => return response,
-        };
-
-        (command, log_index, result_rx)
+        }
     };
-
-    // Send command to leader's internal channel for processing
-    if let Err(e) = client_tx.send(command).await {
-        return CommandResponse {
-            success: false,
-            leader_hint: None,
-            data: None,
-            error: Some(format!("Failed to send command to leader: {}", e)),
-        };
-    }
 
     // Step 3-7 (indirect): Wait for majority of followers to replicate the entry
     // Note: AppendEntries RPC is actually sent by broadcast_heartbeat in the leader loop,

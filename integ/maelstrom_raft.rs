@@ -264,14 +264,14 @@ impl MaelstromRaftNode {
         // Maelstrom-optimized timeouts
         let timeout_ms = {
             use rand::Rng;
-            let base_ms = 500;
-            let max_ms = 1500;
+            let base_ms = 150;
+            let max_ms = 300;
             rand::rng().random_range(base_ms..=max_ms)
         };
         let config = Config {
-            heartbeat_interval: tokio::time::Duration::from_millis(50),
+            heartbeat_interval: tokio::time::Duration::from_millis(10),
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
-            rpc_timeout: std::time::Duration::from_millis(500),
+            rpc_timeout: std::time::Duration::from_millis(100),
             heartbeat_failure_retry_limit: 1,
         };
 
@@ -279,7 +279,7 @@ impl MaelstromRaftNode {
         let last_heartbeat_majority = Arc::clone(&node.last_heartbeat_majority);
 
         let task_handle = tokio::spawn(async move {
-            let _ = run_raft_node(node, own_port, peers, cmd_rx).await;
+            let _ = node.run_with_handler(peers, cmd_rx).await;
         });
 
         {
@@ -971,107 +971,5 @@ impl MaelstromRaftNode {
                 vote_granted: response.vote_granted,
             }),
         }))
-    }
-}
-
-/// Run ikada Raft node lifecycle
-async fn run_raft_node<NF>(
-    mut node: Node<KVCommand, KVStateMachine, NF>,
-    _port: u16,
-    peers: Vec<SocketAddr>,
-    mut cmd_rx: mpsc::Receiver<Command>,
-) -> anyhow::Result<()>
-where
-    NF: ikada::network::NetworkFactory + Clone + Send + 'static,
-{
-    node.setup(peers).await?;
-
-    use ikada::raft::Role;
-
-    let heartbeat_tx = node.c.heartbeat_tx.clone();
-    let state = Arc::clone(&node.state);
-    let client_request_tx = node.c.client_request_tx.clone();
-
-    tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            let state_clone = Arc::clone(&state);
-            let heartbeat_tx_clone = heartbeat_tx.clone();
-            let client_request_tx_clone = client_request_tx.clone();
-
-            tokio::spawn(async move {
-                use ikada::rpc::*;
-
-                match cmd {
-                    Command::AppendEntries(req, resp_tx) => {
-                        let resp =
-                            ikada::node::handlers::handle_append_entries(
-                                &req,
-                                state_clone.clone(),
-                            )
-                            .await
-                            .unwrap_or(
-                                AppendEntriesResponse {
-                                    term: 0,
-                                    success: false,
-                                },
-                            );
-
-                        if resp.success || resp.term > req.term {
-                            let _ = heartbeat_tx_clone
-                                .send((req.leader_id, req.term));
-                        }
-
-                        let _ = resp_tx.send(resp);
-                    }
-                    Command::RequestVote(req, resp_tx) => {
-                        let resp = ikada::node::handlers::handle_request_vote(
-                            &req,
-                            state_clone.clone(),
-                        )
-                        .await;
-
-                        let _ = resp_tx.send(resp);
-                    }
-                    Command::ClientRequest(req, resp_tx) => {
-                        // Check if this node is the leader
-                        let role = {
-                            let state = state_clone.lock().await;
-                            state.role
-                        };
-
-                        if matches!(role, ikada::raft::Role::Leader) {
-                            // Send to leader loop for synchronous processing
-                            let _ =
-                                client_request_tx_clone.send((req, resp_tx));
-                        } else {
-                            // Not a leader, return error with leader hint
-                            let leader_hint = {
-                                let state = state_clone.lock().await;
-                                state.leader_id
-                            };
-                            let _ = resp_tx.send(CommandResponse {
-                                success: false,
-                                leader_hint,
-                                data: None,
-                                error: Some("Not the leader".to_string()),
-                            });
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    loop {
-        let role = {
-            let state = node.state.lock().await;
-            state.role
-        };
-
-        match role {
-            Role::Follower => node.run_follower().await?,
-            Role::Candidate => node.run_candidate().await?,
-            Role::Leader => node.run_leader().await?,
-        }
     }
 }

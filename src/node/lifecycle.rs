@@ -132,13 +132,11 @@ where
                     let peer_count = self.peers.len();
                     let rpc_timeout = self.config.rpc_timeout;
                     let state = self.state.clone();
-                    let client_tx = self.c.client_tx.clone();
 
                     tokio::spawn(async move {
                         let resp = handlers::handle_client_request_impl(
                             &req,
                             state,
-                            client_tx,
                             rpc_timeout + std::time::Duration::from_millis(100),
                             heartbeat_term,
                             peer_count,

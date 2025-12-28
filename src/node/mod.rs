@@ -30,12 +30,6 @@ pub enum Command {
     ClientRequest(CommandRequest, oneshot::Sender<CommandResponse>),
 }
 
-/// Response wraps optional RPC responses for internal use.
-pub enum Response {
-    AppendEntries(Option<AppendEntriesResponse>),
-    RequestVote(Option<RequestVoteResponse>),
-}
-
 /// Chan holds all channels needed for node-internal communication.
 /// Separated from Node to keep initialization logic cleaner.
 pub struct Chan<T> {
@@ -177,23 +171,8 @@ where
         servers: Vec<SocketAddr>,
     ) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel::<Command>(32);
-        let state = Arc::clone(&self.state);
-        let heartbeat_tx = self.c.heartbeat_tx.clone();
-        let client_tx = self.c.client_tx.clone();
-        let config = self.config.clone();
-        let last_heartbeat_majority = self.last_heartbeat_majority.clone();
-        let peer_count = self.peers.len();
         let mut workers = JoinSet::new();
-        workers.spawn(self.main(servers));
-        workers.spawn(Self::rpc_handler(
-            state,
-            rx,
-            heartbeat_tx,
-            client_tx,
-            config,
-            last_heartbeat_majority,
-            peer_count,
-        ));
+        workers.spawn(self.run_with_handler(servers, rx));
         workers.spawn(crate::server::rpc_server(tx, port));
 
         if let Some(res) = workers.join_next().await {
@@ -206,16 +185,39 @@ where
         Ok(())
     }
 
+    /// Runs the node with an external command handler.
+    /// Useful for custom RPC implementations (e.g., Maelstrom integration).
+    pub async fn run_with_handler(
+        mut self,
+        servers: Vec<SocketAddr>,
+        cmd_rx: mpsc::Receiver<Command>,
+    ) -> anyhow::Result<()> {
+        self.setup(servers).await?;
+
+        let state = Arc::clone(&self.state);
+        let heartbeat_tx = self.c.heartbeat_tx.clone();
+        let client_request_tx = self.c.client_request_tx.clone();
+
+        tokio::spawn(Self::rpc_handler(
+            state,
+            cmd_rx,
+            heartbeat_tx,
+            client_request_tx,
+        ));
+
+        self.main(vec![]).await
+    }
+
     /// Dispatches RPC commands to appropriate handlers.
     /// Runs in a separate task to avoid blocking the main consensus loop.
     pub(crate) async fn rpc_handler(
         state: Arc<Mutex<RaftState<T, SM>>>,
         mut rx: mpsc::Receiver<Command>,
         heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
-        client_tx: mpsc::Sender<T>,
-        config: Config,
-        last_heartbeat_majority: Arc<Mutex<Option<u32>>>,
-        peer_count: usize,
+        client_request_tx: mpsc::UnboundedSender<(
+            CommandRequest,
+            oneshot::Sender<CommandResponse>,
+        )>,
     ) -> anyhow::Result<()> {
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -256,23 +258,31 @@ where
                 }
                 Command::ClientRequest(req, resp_tx) => {
                     let state_clone = Arc::clone(&state);
-                    let client_tx = client_tx.clone();
-                    let timeout = config.rpc_timeout;
-                    let last_heartbeat_majority =
-                        Arc::clone(&last_heartbeat_majority);
+                    let client_request_tx_clone = client_request_tx.clone();
                     tokio::spawn(async move {
-                        let heartbeat_term =
-                            *last_heartbeat_majority.lock().await;
-                        let resp = handlers::handle_client_request_impl(
-                            &req,
-                            state_clone,
-                            client_tx,
-                            timeout,
-                            heartbeat_term,
-                            peer_count,
-                        )
-                        .await;
-                        let _ = resp_tx.send(resp);
+                        // Check if this node is the leader
+                        let role = {
+                            let state = state_clone.lock().await;
+                            state.role
+                        };
+
+                        if matches!(role, crate::raft::Role::Leader) {
+                            // Send to leader loop for processing
+                            let _ =
+                                client_request_tx_clone.send((req, resp_tx));
+                        } else {
+                            // Not a leader, return error with leader hint
+                            let leader_hint = {
+                                let state = state_clone.lock().await;
+                                state.leader_id
+                            };
+                            let _ = resp_tx.send(CommandResponse {
+                                success: false,
+                                leader_hint,
+                                data: None,
+                                error: Some("Not the leader".to_string()),
+                            });
+                        }
                     });
                 }
             }
@@ -312,96 +322,5 @@ where
             }
         }
         Ok(())
-    }
-
-    /// Handles client command synchronously within the leader loop.
-    /// This ensures all client requests are processed in-order with proper leadership validation.
-    pub async fn handle_client_command(
-        &mut self,
-        command: T,
-    ) -> anyhow::Result<Option<SM::Response>>
-    where
-        SM::Response: Clone + serde::Serialize,
-    {
-        let heartbeat_term = *self.last_heartbeat_majority.lock().await;
-        let peer_count = self.peers.len();
-
-        let (log_index, result_rx) = {
-            let mut state_guard = self.state.lock().await;
-
-            if handlers::validate_leadership(&state_guard, heartbeat_term)
-                .is_err()
-            {
-                return Ok(None);
-            }
-
-            if state_guard.commit_index > state_guard.last_applied {
-                state_guard.apply_committed().await?;
-            }
-
-            let term = state_guard.persistent.current_term;
-            let log_index = state_guard.persistent.log.len() as u32 + 1;
-            state_guard.persistent.log.push(crate::raft::Entry {
-                term,
-                command: command.clone(),
-            });
-
-            state_guard.persist().await?;
-
-            let (result_tx, result_rx) = oneshot::channel();
-            state_guard.pending_responses.insert(log_index, result_tx);
-
-            (log_index, result_rx)
-        };
-
-        self.broadcast_heartbeat().await?;
-        self.update_commit_index().await?;
-
-        let start = std::time::Instant::now();
-        let timeout =
-            self.config.rpc_timeout + std::time::Duration::from_millis(100);
-        let poll_interval = std::time::Duration::from_millis(10);
-
-        loop {
-            if start.elapsed() > timeout {
-                return Ok(None);
-            }
-
-            let is_replicated = {
-                let state_guard = self.state.lock().await;
-
-                if !matches!(state_guard.role, crate::raft::Role::Leader) {
-                    return Ok(None);
-                }
-
-                let total_nodes = peer_count + 1;
-                let majority = total_nodes / 2;
-                let mut count = 1;
-
-                for match_idx in state_guard.match_index.values() {
-                    if *match_idx >= log_index {
-                        count += 1;
-                    }
-                }
-
-                count > majority
-            };
-
-            if is_replicated {
-                break;
-            }
-
-            tokio::time::sleep(poll_interval).await;
-        }
-
-        let mut state = self.state.lock().await;
-        if state.commit_index > state.last_applied {
-            state.apply_committed().await?;
-        }
-
-        match tokio::time::timeout(timeout, result_rx).await {
-            Ok(Ok(response)) => Ok(Some(response)),
-            _ => Ok(None),
-        }
     }
 }
