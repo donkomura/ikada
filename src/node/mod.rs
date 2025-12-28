@@ -76,6 +76,9 @@ pub struct Node<
     pub state: Arc<Mutex<RaftState<T, SM>>>,
     pub c: Chan<T>,
     pub network_factory: NF,
+    /// Tracks whether the last heartbeat received majority responses.
+    /// Used for Raft Section 8 leadership confirmation.
+    pub last_heartbeat_majority: Arc<Mutex<bool>>,
 }
 
 impl<T, SM, NF> Node<T, SM, NF>
@@ -103,6 +106,7 @@ where
             state: Arc::new(Mutex::new(RaftState::new(id, storage, sm))),
             c: Chan::new(),
             network_factory,
+            last_heartbeat_majority: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -119,6 +123,7 @@ where
             state,
             c: Chan::new(),
             network_factory,
+            last_heartbeat_majority: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -164,9 +169,18 @@ where
         let state = Arc::clone(&self.state);
         let heartbeat_tx = self.c.heartbeat_tx.clone();
         let client_tx = self.c.client_tx.clone();
+        let config = self.config.clone();
+        let last_heartbeat_majority = self.last_heartbeat_majority.clone();
         let mut workers = JoinSet::new();
         workers.spawn(self.main(servers));
-        workers.spawn(Self::rpc_handler(state, rx, heartbeat_tx, client_tx));
+        workers.spawn(Self::rpc_handler(
+            state,
+            rx,
+            heartbeat_tx,
+            client_tx,
+            config,
+            last_heartbeat_majority,
+        ));
         workers.spawn(crate::server::rpc_server(tx, port));
 
         if let Some(res) = workers.join_next().await {
@@ -186,6 +200,8 @@ where
         mut rx: mpsc::Receiver<Command>,
         heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
         client_tx: mpsc::Sender<T>,
+        config: Config,
+        last_heartbeat_majority: Arc<Mutex<bool>>,
     ) -> anyhow::Result<()> {
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -227,11 +243,18 @@ where
                 Command::ClientRequest(req, resp_tx) => {
                     let state_clone = Arc::clone(&state);
                     let client_tx = client_tx.clone();
+                    let timeout = config.rpc_timeout;
+                    let last_heartbeat_majority =
+                        Arc::clone(&last_heartbeat_majority);
                     tokio::spawn(async move {
-                        let resp = handlers::handle_client_request(
+                        let leadership_confirmed =
+                            *last_heartbeat_majority.lock().await;
+                        let resp = handlers::handle_client_request_impl(
                             &req,
                             state_clone,
                             client_tx,
+                            timeout,
+                            leadership_confirmed,
                         )
                         .await;
                         let _ = resp_tx.send(resp);

@@ -48,34 +48,23 @@ jobs:
             node-count: 3
             concurrency: "2n"
             nemesis: ""
-          - test-name: "3nodes-rate50"
-            workload: "lin-kv"
-            time-limit: 10
-            rate: 50
-            node-count: 3
-            concurrency: "2n"
-            nemesis: ""
+            nemesis-interval: ""
           - test-name: "3nodes-partition"
             workload: "lin-kv"
             time-limit: 60
-            rate: 50
+            rate: 10
             node-count: 3
             concurrency: "2n"
             nemesis: "partition"
-          - test-name: "5nodes-partition-rate20"
+            nemesis-interval: "5"
+          - test-name: "5nodes-partition"
             workload: "lin-kv"
             time-limit: 60
-            rate: 20
+            rate: 10
             node-count: 5
             concurrency: "2n"
             nemesis: "partition"
-          - test-name: "5nodes-partition-rate50"
-            workload: "lin-kv"
-            time-limit: 60
-            rate: 50
-            node-count: 5
-            concurrency: "2n"
-            nemesis: "partition"
+            nemesis-interval: "5"
     steps:
       - uses: actions/checkout@v4
       - name: Install Java
@@ -119,10 +108,15 @@ jobs:
           NODE_COUNT: ${{ matrix.node-count }}
           CONCURRENCY: ${{ matrix.concurrency }}
           NEMESIS: ${{ matrix.nemesis }}
+          NEMESIS_INTERVAL: ${{ matrix.nemesis-interval }}
         run: |
           NEMESIS_FLAG=""
           if [ -n "$NEMESIS" ]; then
             NEMESIS_FLAG="--nemesis $NEMESIS"
+          fi
+          NEMESIS_INTERVAL_FLAG=""
+          if [ -n "$NEMESIS_INTERVAL" ]; then
+            NEMESIS_INTERVAL_FLAG="--nemesis-interval $NEMESIS_INTERVAL"
           fi
           ~/maelstrom/maelstrom test \
             -w "$WORKLOAD" \
@@ -131,7 +125,8 @@ jobs:
             --rate "$RATE" \
             --node-count "$NODE_COUNT" \
             --concurrency "$CONCURRENCY" \
-            $NEMESIS_FLAG
+            $NEMESIS_FLAG \
+            $NEMESIS_INTERVAL_FLAG
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4

@@ -1,6 +1,7 @@
 use rand::Rng;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct Config {
     pub heartbeat_interval: tokio::time::Duration,
     pub election_timeout: tokio::time::Duration,
@@ -18,7 +19,7 @@ impl Default for Config {
         Self {
             heartbeat_interval: tokio::time::Duration::from_millis(1000),
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
-            rpc_timeout: tokio::time::Duration::from_millis(5000),
+            rpc_timeout: tokio::time::Duration::from_millis(2000),
             heartbeat_failure_retry_limit: 1,
         }
     }

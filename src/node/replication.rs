@@ -156,6 +156,9 @@ where
             );
         }
 
+        // Cache the heartbeat result for Raft Section 8 leadership confirmation
+        *self.last_heartbeat_majority.lock().await = has_majority;
+
         Ok(has_majority)
     }
 
@@ -278,6 +281,14 @@ where
         }
 
         self.update_commit_index().await?;
+
+        // Apply committed entries to state machine
+        // We need to call after commit index is up to date
+        let mut state = self.state.lock().await;
+        if state.commit_index > state.last_applied {
+            state.apply_committed().await?;
+        }
+
         Ok(())
     }
 }

@@ -34,6 +34,7 @@ struct RaftContext {
     state: Option<RaftStateHandle>,
     cmd_tx: Option<mpsc::Sender<Command>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    last_heartbeat_majority: Option<Arc<Mutex<bool>>>,
 }
 
 /// Request forwarding management
@@ -93,6 +94,7 @@ impl MaelstromRaftNode {
                 state: None,
                 cmd_tx: None,
                 task_handle: None,
+                last_heartbeat_majority: None,
             })),
             network_factory: Arc::new(Mutex::new(None)),
             forward_manager: Arc::new(Mutex::new(ForwardManager::new())),
@@ -274,6 +276,7 @@ impl MaelstromRaftNode {
         };
 
         let node = Node::new_with_state(config, state, network_factory.clone());
+        let last_heartbeat_majority = Arc::clone(&node.last_heartbeat_majority);
 
         let task_handle = tokio::spawn(async move {
             let _ = run_raft_node(node, own_port, peers, cmd_rx).await;
@@ -282,6 +285,7 @@ impl MaelstromRaftNode {
         {
             let mut context = self.raft_context.lock().await;
             context.task_handle = Some(task_handle);
+            context.last_heartbeat_majority = Some(last_heartbeat_majority);
         }
 
         Ok(Some(Message {
@@ -375,40 +379,48 @@ impl MaelstromRaftNode {
         cmd: KVCommand,
         response: CommandResponse,
     ) -> anyhow::Result<KVResponse> {
-        let (leader_id, is_leader) = self.get_leader_info().await?;
-
-        // If we are the leader, don't forward to ourselves
-        if is_leader {
-            return Err(anyhow::anyhow!(
-                "Command failed on leader: {:?}",
-                response.error
-            ));
-        }
-
-        if let Some(leader_hint) = leader_id
-            && let Some(leader_node_id) =
-                self.get_node_id_by_hint(leader_hint).await
-        {
+        if let Some(leader_node_id) = self.should_forward_to_leader().await? {
             return self.forward_to_leader(leader_node_id, cmd).await;
         }
 
         Err(anyhow::anyhow!("Command failed: {:?}", response.error))
     }
 
-    async fn get_leader_info(&self) -> anyhow::Result<(Option<u32>, bool)> {
+    /// Check if we should forward to leader and return leader's node ID.
+    /// Returns None if:
+    /// - We are the leader ourselves
+    /// - No leader is known
+    /// - Leader ID points to ourselves (stale state after partition)
+    async fn should_forward_to_leader(&self) -> anyhow::Result<Option<String>> {
         let context = self.raft_context.lock().await;
         let state = context
             .state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
         let state_inner = state.lock().await;
-        let is_leader = state_inner.role == ikada::raft::Role::Leader;
-        Ok((state_inner.leader_id, is_leader))
-    }
 
-    async fn get_current_leader_id(&self) -> anyhow::Result<Option<u32>> {
-        let (leader_id, _) = self.get_leader_info().await?;
-        Ok(leader_id)
+        if state_inner.role == ikada::raft::Role::Leader {
+            return Ok(None);
+        }
+
+        let Some(leader_hint) = state_inner.leader_id else {
+            return Ok(None);
+        };
+
+        let my_node_id = self
+            .get_node_id()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Node ID not set"))?;
+        let leader_node_id = self.get_node_id_by_hint(leader_hint).await;
+
+        if leader_node_id.as_ref() == Some(&my_node_id) {
+            drop(state_inner);
+            let mut state_mut = state.lock().await;
+            state_mut.leader_id = None;
+            return Ok(None);
+        }
+
+        Ok(leader_node_id)
     }
 
     /// Forward client request to the leader
@@ -570,58 +582,54 @@ impl MaelstromRaftNode {
         src: String,
         body: ReadBody,
     ) -> anyhow::Result<Option<Message>> {
-        let (leader_id, is_leader) = self.get_leader_info().await?;
+        if let Some(leader_node_id) = self.should_forward_to_leader().await? {
+            let key_str = body.key.to_string().trim_matches('"').to_string();
+            let command = KVCommand::Get { key: key_str };
 
-        if !is_leader {
-            if let Some(leader_hint) = leader_id
-                && let Some(leader_node_id) =
-                    self.get_node_id_by_hint(leader_hint).await
-            {
-                let key_str =
-                    body.key.to_string().trim_matches('"').to_string();
-                let command = KVCommand::Get { key: key_str };
+            match self.forward_to_leader(leader_node_id, command).await {
+                Ok(KVResponse::Value(Some(value))) => {
+                    let json_value: serde_json::Value =
+                        serde_json::from_str(&value)
+                            .unwrap_or(serde_json::Value::String(value));
 
-                match self.forward_to_leader(leader_node_id, command).await {
-                    Ok(KVResponse::Value(Some(value))) => {
-                        let json_value: serde_json::Value =
-                            serde_json::from_str(&value)
-                                .unwrap_or(serde_json::Value::String(value));
-
-                        return Ok(Some(Message {
-                            src: self.get_node_id().await.unwrap(),
-                            dest: Some(src),
-                            body: Body::ReadOk(ReadOkBody {
-                                in_reply_to: body.msg_id,
-                                value: json_value,
-                            }),
-                        }));
-                    }
-                    Ok(KVResponse::Value(None)) => {
-                        return Ok(Some(Message {
-                            src: self.get_node_id().await.unwrap(),
-                            dest: Some(src),
-                            body: Body::Error(ErrorBody {
-                                in_reply_to: body.msg_id,
-                                code: ERROR_KEY_NOT_EXIST,
-                                text: Some("Key does not exist".to_string()),
-                            }),
-                        }));
-                    }
-                    Err(e) => {
-                        return Ok(Some(Message {
-                            src: self.get_node_id().await.unwrap(),
-                            dest: Some(src),
-                            body: Body::Error(ErrorBody {
-                                in_reply_to: body.msg_id,
-                                code: ERROR_GENERAL,
-                                text: Some(format!("Forward error: {}", e)),
-                            }),
-                        }));
-                    }
-                    _ => unreachable!(),
+                    return Ok(Some(Message {
+                        src: self.get_node_id().await.unwrap(),
+                        dest: Some(src),
+                        body: Body::ReadOk(ReadOkBody {
+                            in_reply_to: body.msg_id,
+                            value: json_value,
+                        }),
+                    }));
                 }
+                Ok(KVResponse::Value(None)) => {
+                    return Ok(Some(Message {
+                        src: self.get_node_id().await.unwrap(),
+                        dest: Some(src),
+                        body: Body::Error(ErrorBody {
+                            in_reply_to: body.msg_id,
+                            code: ERROR_KEY_NOT_EXIST,
+                            text: Some("Key does not exist".to_string()),
+                        }),
+                    }));
+                }
+                Err(e) => {
+                    return Ok(Some(Message {
+                        src: self.get_node_id().await.unwrap(),
+                        dest: Some(src),
+                        body: Body::Error(ErrorBody {
+                            in_reply_to: body.msg_id,
+                            code: ERROR_GENERAL,
+                            text: Some(format!("Forward error: {}", e)),
+                        }),
+                    }));
+                }
+                _ => unreachable!(),
             }
+        }
 
+        let leadership_confirmed = self.check_leadership_confirmed().await?;
+
+        if !leadership_confirmed {
             return Ok(Some(Message {
                 src: self.get_node_id().await.unwrap(),
                 dest: Some(src),
@@ -715,23 +723,35 @@ impl MaelstromRaftNode {
     ) -> anyhow::Result<Option<Message>> {
         let key_str = body.key.to_string().trim_matches('"').to_string();
 
-        let is_leader = self.check_is_leader().await?;
+        let leadership_confirmed = self.check_leadership_confirmed().await?;
 
-        if !is_leader {
+        if !leadership_confirmed {
             return self.forward_cas_if_possible(src, body, key_str).await;
         }
 
         self.execute_cas_as_leader(src, body, key_str).await
     }
 
-    async fn check_is_leader(&self) -> anyhow::Result<bool> {
+    async fn check_leadership_confirmed(&self) -> anyhow::Result<bool> {
         let context = self.raft_context.lock().await;
+
         let state = context
             .state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
         let state_inner = state.lock().await;
-        Ok(state_inner.role == ikada::raft::Role::Leader)
+
+        if state_inner.role != ikada::raft::Role::Leader {
+            return Ok(false);
+        }
+
+        let last_heartbeat_majority =
+            context.last_heartbeat_majority.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("last_heartbeat_majority not initialized")
+            })?;
+
+        let has_majority = *last_heartbeat_majority.lock().await;
+        Ok(has_majority)
     }
 
     async fn forward_cas_if_possible(
@@ -740,12 +760,7 @@ impl MaelstromRaftNode {
         body: CasBody,
         key_str: String,
     ) -> anyhow::Result<Option<Message>> {
-        let leader_id = self.get_current_leader_id().await?;
-
-        if let Some(leader_hint) = leader_id
-            && let Some(leader_node_id) =
-                self.get_node_id_by_hint(leader_hint).await
-        {
+        if let Some(leader_node_id) = self.should_forward_to_leader().await? {
             return match self
                 .forward_cas_to_leader(
                     leader_node_id,
@@ -976,12 +991,17 @@ where
     let heartbeat_tx = node.c.heartbeat_tx.clone();
     let client_tx = node.c.client_tx.clone();
     let state = Arc::clone(&node.state);
+    let rpc_timeout = node.config.rpc_timeout;
+    let last_heartbeat_majority = Arc::clone(&node.last_heartbeat_majority);
 
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let state_clone = Arc::clone(&state);
             let heartbeat_tx_clone = heartbeat_tx.clone();
             let client_tx_clone = client_tx.clone();
+            let timeout = rpc_timeout;
+            let last_heartbeat_majority_clone =
+                Arc::clone(&last_heartbeat_majority);
 
             tokio::spawn(async move {
                 use ikada::rpc::*;
@@ -1018,11 +1038,25 @@ where
                         let _ = resp_tx.send(resp);
                     }
                     Command::ClientRequest(req, resp_tx) => {
+                        // Raft Section 8: Check leadership confirmation before serving reads
+                        let state_inner = state_clone.lock().await;
+                        let is_leader =
+                            state_inner.role == ikada::raft::Role::Leader;
+                        drop(state_inner);
+
+                        let leadership_confirmed = if is_leader {
+                            *last_heartbeat_majority_clone.lock().await
+                        } else {
+                            false
+                        };
+
                         let resp =
-                            ikada::node::handlers::handle_client_request(
+                            ikada::node::handlers::handle_client_request_impl(
                                 &req,
                                 state_clone.clone(),
                                 client_tx_clone.clone(),
+                                timeout,
+                                leadership_confirmed,
                             )
                             .await;
 
