@@ -264,16 +264,11 @@ impl MaelstromRaftNode {
         // Maelstrom-optimized timeouts
         let timeout_ms = {
             use rand::Rng;
-            let base_ms = 500;
-            let max_ms = 1500;
+            let base_ms = 100;
+            let max_ms = 500;
             rand::rng().random_range(base_ms..=max_ms)
         };
-        let config = Config {
-            heartbeat_interval: tokio::time::Duration::from_millis(50),
-            election_timeout: tokio::time::Duration::from_millis(timeout_ms),
-            rpc_timeout: std::time::Duration::from_millis(500),
-            heartbeat_failure_retry_limit: 1,
-        };
+        let config = Config::new(10, timeout_ms, 500, 1);
 
         let node = Node::new_with_state(config, state, network_factory.clone());
         let last_heartbeat_majority = Arc::clone(&node.last_heartbeat_majority);

@@ -51,7 +51,7 @@ jobs:
             nemesis-interval: ""
           - test-name: "3nodes-partition"
             workload: "lin-kv"
-            time-limit: 60
+            time-limit: 30
             rate: 10
             node-count: 3
             concurrency: "2n"
@@ -59,9 +59,17 @@ jobs:
             nemesis-interval: "5"
           - test-name: "5nodes-partition"
             workload: "lin-kv"
-            time-limit: 60
+            time-limit: 30
             rate: 10
             node-count: 5
+            concurrency: "2n"
+            nemesis: "partition"
+            nemesis-interval: "5"
+          - test-name: "9nodes-partition"
+            workload: "lin-kv"
+            time-limit: 30
+            rate: 10
+            node-count: 9
             concurrency: "2n"
             nemesis: "partition"
             nemesis-interval: "5"

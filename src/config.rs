@@ -1,11 +1,10 @@
 use rand::Rng;
-use std::time::Duration;
 
 #[derive(Clone)]
 pub struct Config {
     pub heartbeat_interval: tokio::time::Duration,
     pub election_timeout: tokio::time::Duration,
-    pub rpc_timeout: Duration,
+    pub rpc_timeout: std::time::Duration,
     pub heartbeat_failure_retry_limit: u32,
 }
 
@@ -21,6 +20,26 @@ impl Default for Config {
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
             rpc_timeout: tokio::time::Duration::from_millis(2000),
             heartbeat_failure_retry_limit: 1,
+        }
+    }
+}
+
+impl Config {
+    pub fn new(
+        heartbeat_interval_ms: u64,
+        election_timeout_ms: u64,
+        rpc_timeout_ms: u64,
+        retry_limit_count: u32,
+    ) -> Self {
+        Self {
+            heartbeat_interval: tokio::time::Duration::from_millis(
+                heartbeat_interval_ms,
+            ),
+            election_timeout: tokio::time::Duration::from_millis(
+                election_timeout_ms,
+            ),
+            rpc_timeout: std::time::Duration::from_millis(rpc_timeout_ms),
+            heartbeat_failure_retry_limit: retry_limit_count,
         }
     }
 }
