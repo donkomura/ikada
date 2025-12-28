@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, mpsc};
 /// This function handles two scenarios:
 /// - Initial replication (Steps 4-5): Follower appends new entries to local log (uncommitted)
 /// - Commit propagation (Steps 10-11): Follower applies committed entries to state machine
+///
 /// Both can happen in the same RPC (entries + commit_index update)
 pub async fn handle_append_entries<T, SM>(
     req: &AppendEntriesRequest,
@@ -522,18 +523,18 @@ where
         }
 
         // Apply any previously committed entries before processing new request
-        if state_guard.commit_index > state_guard.last_applied {
-            if let Err(e) = state_guard.apply_committed().await {
-                return CommandResponse {
-                    success: false,
-                    leader_hint: None,
-                    data: None,
-                    error: Some(format!(
-                        "Failed to apply committed entries: {}",
-                        e
-                    )),
-                };
-            }
+        if state_guard.commit_index > state_guard.last_applied
+            && let Err(e) = state_guard.apply_committed().await
+        {
+            return CommandResponse {
+                success: false,
+                leader_hint: None,
+                data: None,
+                error: Some(format!(
+                    "Failed to apply committed entries: {}",
+                    e
+                )),
+            };
         }
 
         let command: T = match bincode::deserialize(&req.command) {

@@ -124,7 +124,9 @@ where
                     };
 
                     if !still_leader {
-                        tracing::info!("Stepped down from leader, aborting broadcast");
+                        tracing::info!(
+                            "Stepped down from leader, aborting broadcast"
+                        );
                         break;
                     }
 

@@ -329,9 +329,7 @@ where
         let (log_index, result_rx) = {
             let mut state_guard = self.state.lock().await;
 
-            if let Err(_) =
-                handlers::validate_leadership(&state_guard, heartbeat_term)
-            {
+            if handlers::validate_leadership(&state_guard, heartbeat_term).is_err() {
                 return Ok(None);
             }
 
