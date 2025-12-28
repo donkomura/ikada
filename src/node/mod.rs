@@ -81,9 +81,7 @@ pub struct Node<
     pub state: Arc<Mutex<RaftState<T, SM>>>,
     pub c: Chan<T>,
     pub network_factory: NF,
-    /// Tracks whether the last heartbeat received majority responses and the term at that time.
-    /// Used for Raft Section 8 leadership confirmation.
-    pub last_heartbeat_majority: Arc<Mutex<Option<u32>>>,
+    heartbeat_failure_count: usize,
 }
 
 impl<T, SM, NF> Node<T, SM, NF>
@@ -111,7 +109,7 @@ where
             state: Arc::new(Mutex::new(RaftState::new(id, storage, sm))),
             c: Chan::new(),
             network_factory,
-            last_heartbeat_majority: Arc::new(Mutex::new(None)),
+            heartbeat_failure_count: 0,
         }
     }
 
@@ -128,7 +126,7 @@ where
             state,
             c: Chan::new(),
             network_factory,
-            last_heartbeat_majority: Arc::new(Mutex::new(None)),
+            heartbeat_failure_count: 0,
         }
     }
 
