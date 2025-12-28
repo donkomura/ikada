@@ -973,4 +973,3 @@ impl MaelstromRaftNode {
         }))
     }
 }
-
