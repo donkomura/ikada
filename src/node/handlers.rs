@@ -429,8 +429,7 @@ where
         let mut state_guard = state.lock().await;
 
         // Validate that this node is the leader
-        if let Err(response) = validate_leadership(&state_guard)
-        {
+        if let Err(response) = validate_leadership(&state_guard) {
             return response;
         }
 
