@@ -127,9 +127,6 @@ where
                 Some((req, resp_tx)) = self.c.client_request_rx.recv() => {
                     // Step 1: Client sends a write entry (data or command) to the leader
                     // Step 2-9 are handled asynchronously in handle_client_request_impl
-                    // Process client request asynchronously within leader context
-                    let heartbeat_term = *self.last_heartbeat_majority.lock().await;
-                    let peer_count = self.peers.len();
                     let rpc_timeout = self.config.rpc_timeout;
                     let state = self.state.clone();
 
@@ -138,8 +135,6 @@ where
                             &req,
                             state,
                             rpc_timeout + std::time::Duration::from_millis(100),
-                            heartbeat_term,
-                            peer_count,
                         )
                         .await;
 
@@ -151,7 +146,26 @@ where
                     // (includes current commit_index for Step 10)
                     // Step 6-7: Receive Acks from followers
                     // (handled in broadcast_heartbeat -> handle_heartbeat)
-                    self.broadcast_heartbeat().await?;
+                    let has_majority = self.broadcast_heartbeat().await?;
+
+                    if !has_majority {
+                        self.heartbeat_failure_count += 1;
+                        tracing::warn!(
+                            failure_count = self.heartbeat_failure_count,
+                            limit = self.config.heartbeat_failure_retry_limit,
+                            "Failed to achieve majority in heartbeat"
+                        );
+
+                        if self.heartbeat_failure_count >= self.config.heartbeat_failure_retry_limit as usize {
+                            tracing::warn!(
+                                "Consecutive heartbeat failures exceeded limit, stepping down from leader"
+                            );
+                            self.become_follower().await?;
+                            break;
+                        }
+                    } else {
+                        self.heartbeat_failure_count = 0;
+                    }
 
                     // Step 8 (Part 1): Leader calculates new commit_index based on majority Acks
                     self.update_commit_index().await?;

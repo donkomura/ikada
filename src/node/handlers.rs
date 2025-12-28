@@ -103,12 +103,17 @@ where
 
             if existing_term != rpc_entry.term {
                 state.persistent.log.truncate((log_index - 1) as usize);
+
+                // Clear pending responses for truncated entries
+                state.pending_responses.retain(|&idx, _| idx < log_index);
+
                 log_modified = true;
                 tracing::info!(
                     id=?state.id,
                     conflict_index=log_index,
                     old_term=existing_term,
                     new_term=rpc_entry.term,
+                    pending_responses_cleared=state.pending_responses.len(),
                     "Truncated log due to conflict"
                 );
                 break;
@@ -292,7 +297,6 @@ where
 
 pub(crate) fn validate_leadership<T, SM>(
     state: &RaftState<T, SM>,
-    heartbeat_term: Option<u32>,
 ) -> Result<(), CommandResponse>
 where
     T: Send + Sync + Clone,
@@ -304,29 +308,6 @@ where
             leader_hint: state.leader_id,
             data: None,
             error: Some("Not the leader".to_string()),
-        });
-    }
-
-    let Some(confirmed_term) = heartbeat_term else {
-        return Err(CommandResponse {
-            success: false,
-            leader_hint: None,
-            data: None,
-            error: Some(
-                "Failed to confirm leadership via heartbeat".to_string(),
-            ),
-        });
-    };
-
-    if confirmed_term != state.persistent.current_term {
-        return Err(CommandResponse {
-            success: false,
-            leader_hint: state.leader_id,
-            data: None,
-            error: Some(format!(
-                "Leadership term mismatch: heartbeat at term {}, current term {}",
-                confirmed_term, state.persistent.current_term
-            )),
         });
     }
 
@@ -377,72 +358,6 @@ where
     );
 
     Ok((log_index, result_rx))
-}
-
-/// Waits for a log entry to be replicated to a majority of nodes.
-///
-/// Raft Algorithm - Log Replication Steps 3-7 (monitoring):
-/// This function polls match_index to detect when majority replication is achieved.
-/// The actual Steps 3-7 happen asynchronously in the leader loop:
-/// - Step 3: broadcast_heartbeat sends AppendEntries RPC
-/// - Step 4-5: Followers append to their logs
-/// - Step 6-7: Followers send Acks, updating match_index
-async fn wait_for_majority_replication<T, SM>(
-    state: Arc<Mutex<RaftState<T, SM>>>,
-    log_index: u32,
-    peer_count: usize,
-    timeout: std::time::Duration,
-) -> Result<(), CommandResponse>
-where
-    T: Send + Sync + Clone,
-    SM: StateMachine<Command = T>,
-{
-    let start = std::time::Instant::now();
-    let poll_interval = std::time::Duration::from_millis(10);
-
-    loop {
-        if start.elapsed() > timeout {
-            return Err(CommandResponse {
-                success: false,
-                leader_hint: None,
-                data: None,
-                error: Some(
-                    "Timeout waiting for majority replication".to_string(),
-                ),
-            });
-        }
-
-        let is_replicated = {
-            let state_guard = state.lock().await;
-
-            if !matches!(state_guard.role, Role::Leader) {
-                return Err(CommandResponse {
-                    success: false,
-                    leader_hint: state_guard.leader_id,
-                    data: None,
-                    error: Some("No longer the leader".to_string()),
-                });
-            }
-
-            let total_nodes = peer_count + 1;
-            let majority = total_nodes / 2;
-            let mut count = 1;
-
-            for match_idx in state_guard.match_index.values() {
-                if *match_idx >= log_index {
-                    count += 1;
-                }
-            }
-
-            count > majority
-        };
-
-        if is_replicated {
-            return Ok(());
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
 }
 
 /// Waits for the state machine to apply a command and return the result.
@@ -504,19 +419,17 @@ pub async fn handle_client_request_impl<T, SM>(
     req: &CommandRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
     timeout: std::time::Duration,
-    heartbeat_term: Option<u32>,
-    peer_count: usize,
 ) -> CommandResponse
 where
     T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned,
     SM: StateMachine<Command = T>,
     SM::Response: Clone + serde::Serialize,
 {
-    let (log_index, result_rx) = {
+    let (_log_index, result_rx) = {
         let mut state_guard = state.lock().await;
 
-        // Validate that this node is the leader and has confirmed leadership via majority heartbeat
-        if let Err(response) = validate_leadership(&state_guard, heartbeat_term)
+        // Validate that this node is the leader
+        if let Err(response) = validate_leadership(&state_guard)
         {
             return response;
         }
@@ -558,25 +471,12 @@ where
         }
     };
 
-    // Step 3-7 (indirect): Wait for majority of followers to replicate the entry
-    // Note: AppendEntries RPC is actually sent by broadcast_heartbeat in the leader loop,
-    //       not directly here. This function polls match_index until majority is achieved.
-    // Step 3: broadcast_heartbeat sends AppendEntries RPC with the new log entry
-    // Step 4-5: Followers append to their logs
-    // Step 6-7: Followers respond with Ack, updating match_index via handle_heartbeat
-    if let Err(response) = wait_for_majority_replication(
-        state.clone(),
-        log_index,
-        peer_count,
-        timeout,
-    )
-    .await
-    {
-        return response;
-    }
-
-    // Step 8 (partial): Entry has been replicated to majority, waiting for state machine application
-    // Step 9: Return success response to client (after state machine applies the entry)
+    // Step 3-9: Wait for entry to be committed and applied to state machine
+    // The periodic heartbeat loop will:
+    // - Step 3: Replicate the entry to followers via broadcast_heartbeat
+    // - Step 8: Update commit_index when majority replication is achieved
+    // - Apply committed entries to state machine
+    // We simply wait for the state machine to apply the entry and return the result
     wait_for_command_result::<SM>(result_rx, timeout).await
 }
 

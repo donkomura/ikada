@@ -183,6 +183,8 @@ where
             state.next_index.insert(*peer_addr, last_log_idx + 1);
             state.match_index.insert(*peer_addr, 0);
         }
+
+        self.heartbeat_failure_count = 0;
         Ok(())
     }
 
@@ -192,6 +194,8 @@ where
         state.role = Role::Follower;
         state.persistent.voted_for = None;
         state.leader_id = None;
+
+        self.heartbeat_failure_count = 0;
         Ok(())
     }
 
