@@ -29,6 +29,9 @@ where
     NF: NetworkFactory + Clone + 'static,
 {
     /// Initiates an election by requesting votes from all peers.
+    ///
+    /// Raft Algorithm - Leader Election Step 2:
+    /// Step 2: Candidate sends RequestVote RPC to all other nodes in parallel
     pub(super) async fn start_election(&mut self) -> anyhow::Result<()> {
         let mut responses: Vec<RequestVoteResponse> = Vec::new();
         let (
@@ -118,6 +121,10 @@ where
     }
 
     /// Processes election results and transitions to leader if majority achieved.
+    ///
+    /// Raft Algorithm - Leader Election Steps 3-4:
+    /// Step 3: Each node evaluates the RequestVote and grants vote based on log up-to-dateness
+    /// Step 4: Candidate becomes leader if it receives votes from a majority of nodes
     async fn handle_election(
         &mut self,
         responses: Vec<RequestVoteResponse>,
@@ -162,6 +169,9 @@ where
     }
 
     /// Transitions to leader and initializes next_index/match_index.
+    ///
+    /// Raft Algorithm - Leader Election Step 4 (continued):
+    /// Step 4: Node transitions to leader role and initializes replication state for each follower
     pub(super) async fn become_leader(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         tracing::info!(id=?state.id, term=state.persistent.current_term, "BECOMING LEADER");
@@ -186,6 +196,9 @@ where
     }
 
     /// Transitions to candidate, increments term, and votes for self.
+    ///
+    /// Raft Algorithm - Leader Election Step 1:
+    /// Step 1: Follower becomes candidate, increments term, and votes for itself
     pub(super) async fn become_candidate(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         state.role = Role::Candidate;

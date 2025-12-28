@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 impl<T, SM, NF> Node<T, SM, NF>
 where
@@ -29,8 +29,13 @@ where
     NF: NetworkFactory + Clone + 'static,
 {
     /// Broadcasts AppendEntries RPCs to all followers.
-    /// Called periodically by the leader to replicate log entries and maintain authority.
-    /// Returns true if majority of peers responded successfully, false otherwise.
+    /// Uses JoinSet to process completed tasks as they arrive and returns immediately
+    /// once majority is achieved, without waiting for all tasks to complete.
+    /// Individual RPCs timeout via tarpc deadline, overall broadcast times out via tokio::time::timeout.
+    ///
+    /// Raft Algorithm - Log Replication Step 3, 6-7:
+    /// Step 3: Leader sends AppendEntries RPC to all followers in parallel
+    /// Step 6-7: Receives Acks from followers, stops as soon as majority is achieved
     pub(super) async fn broadcast_heartbeat(&mut self) -> anyhow::Result<bool> {
         // Lock once and copy all needed data
         let (leader_term, leader_id, leader_commit, log_data, peer_data) = {
@@ -56,7 +61,13 @@ where
         };
 
         let peer_count = peer_data.len();
-        let mut requests = Vec::new();
+        let total_nodes = peer_count + 1; // peers + self
+        let majority_needed = total_nodes / 2; // Need > majority
+
+        let rpc_timeout = self.config.rpc_timeout;
+        let mut tasks = JoinSet::new();
+
+        // Step 3: Spawn AppendEntries RPC tasks for all followers
         for (addr, next_idx) in peer_data {
             let client = self.peers.get(&addr).unwrap().clone();
 
@@ -67,7 +78,7 @@ where
             };
             let entries: Vec<LogEntry> = log_data
                 .iter()
-                .skip((next_idx - 1) as usize) // send logs after next_idx
+                .skip((next_idx - 1) as usize)
                 .map(|e| {
                     let command =
                         bincode::serialize(&e.command).unwrap_or_default();
@@ -79,85 +90,97 @@ where
                 .collect();
             let sent_up_to_index = prev_log_idx + entries.len() as u32;
 
-            requests.push((
-                addr,
-                client,
-                prev_log_idx,
-                prev_log_term,
-                entries,
-                sent_up_to_index,
-            ));
-        }
-        let rpc_timeout = self.config.rpc_timeout;
-
-        // TODO: optimize algorithm: should be gossip?
-        let (result_tx, mut result_rx) = mpsc::channel(requests.len());
-
-        for (
-            addr,
-            client,
-            prev_log_index,
-            prev_log_term,
-            entries,
-            sent_up_to_index,
-        ) in requests
-        {
             let req = AppendEntriesRequest {
                 term: leader_term,
                 leader_id,
-                prev_log_index,
+                prev_log_index: prev_log_idx,
                 prev_log_term,
                 entries,
                 leader_commit,
             };
-            let result_tx = result_tx.clone();
 
-            tokio::spawn(async move {
-                let result = Self::send_heartbeat(
-                    addr,
-                    client,
-                    req,
-                    sent_up_to_index,
-                    rpc_timeout,
-                )
-                .await;
-                let _ = result_tx.send(result).await;
-            });
+            tasks.spawn(Self::send_heartbeat(
+                addr,
+                client,
+                req,
+                sent_up_to_index,
+                rpc_timeout,
+            ));
         }
-        drop(result_tx); // Drop the original sender so the receiver knows when all tasks are done
 
-        let mut success_count = 0;
-        while let Some(result) = result_rx.recv().await {
+        // Step 6-7: Process Acks as they arrive, stop when majority is achieved
+        let mut success_count = 0; // Leader already counts as 1 in match_index logic
+        let mut failure_count = 0;
+
+        while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((server, res, sent_up_to_index)) => {
+                Ok(Ok((server, res, sent_up_to_index))) => {
                     self.handle_heartbeat(server, res, sent_up_to_index)
                         .await?;
+
+                    let still_leader = {
+                        let state = self.state.lock().await;
+                        matches!(state.role, Role::Leader)
+                    };
+
+                    if !still_leader {
+                        tracing::info!("Stepped down from leader, aborting broadcast");
+                        break;
+                    }
+
                     success_count += 1;
+
+                    if success_count > majority_needed {
+                        tracing::debug!(
+                            success_count = success_count,
+                            majority_needed = majority_needed,
+                            "Achieved majority of Acks, proceeding immediately"
+                        );
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to send heartbeat: {:?}", e);
+                    failure_count += 1;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to send heartbeat: {:?}", e);
+                    tracing::warn!("Task join error: {:?}", e);
+                    failure_count += 1;
                 }
+            }
+
+            let remaining = tasks.len();
+            if success_count + remaining <= majority_needed {
+                tracing::warn!(
+                    success_count = success_count,
+                    remaining = remaining,
+                    majority_needed = majority_needed,
+                    "Cannot achieve majority, aborting"
+                );
+                break;
             }
         }
 
-        // Check if we have connectivity to majority of peers
-        // total_nodes = peer_count + 1 (self)
-        // We need responses from at least majority - 1 peers (since leader counts as 1)
-        let total_nodes = peer_count + 1;
-        let majority = total_nodes / 2;
-        let has_majority = success_count > majority;
+        // Abort remaining tasks if we already have majority or can't reach it
+        tasks.abort_all();
+
+        let has_majority = success_count > majority_needed;
 
         if !has_majority {
             tracing::warn!(
-                "Leader only has {} successful responses out of {} peers (need > {} for majority)",
-                success_count,
-                peer_count,
-                majority
+                success_count = success_count,
+                failure_count = failure_count,
+                peer_count = peer_count,
+                majority_needed = majority_needed,
+                "Failed to achieve majority of Acks"
             );
         }
 
-        // Cache the heartbeat result for Raft Section 8 leadership confirmation
-        *self.last_heartbeat_majority.lock().await = has_majority;
+        *self.last_heartbeat_majority.lock().await = if has_majority {
+            Some(leader_term)
+        } else {
+            None
+        };
 
         Ok(has_majority)
     }
@@ -209,6 +232,10 @@ where
 
     /// Updates commit_index if a majority of nodes have replicated an entry.
     /// Only the leader can advance commit_index this way (Raft Figure 2).
+    /// This is part of Step 8 (commit index calculation only, not state machine application).
+    ///
+    /// Raft Algorithm - Log Replication Step 8 (Part 1):
+    /// Step 8 (Part 1): Calculate new commit_index based on majority replication
     pub(super) async fn update_commit_index(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
 
@@ -229,6 +256,33 @@ where
         // Update commit_index if we found a higher value
         if new_commit_index > current_commit_index {
             state.commit_index = new_commit_index;
+            tracing::info!(
+                id = state.id,
+                old_commit = current_commit_index,
+                new_commit = new_commit_index,
+                "Leader advanced commit_index"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Applies committed entries to the leader's state machine.
+    ///
+    /// Raft Algorithm - Log Replication Step 8 (Part 2):
+    /// Step 8 (Part 2): Leader applies committed entries to its own state machine
+    pub(super) async fn apply_committed_entries_on_leader(
+        &mut self,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+
+        // Only leaders should call this
+        if !matches!(state.role, Role::Leader) {
+            return Ok(());
+        }
+
+        if state.commit_index > state.last_applied {
+            state.apply_committed().await?;
         }
 
         Ok(())
@@ -236,6 +290,9 @@ where
 
     /// Handles AppendEntries response from a follower.
     /// Updates next_index and match_index based on success/failure (Raft §5.3).
+    ///
+    /// Raft Algorithm - Log Replication Steps 6-7:
+    /// Step 6-7: Processes Ack (acknowledgment) from followers after they append entries
     pub(super) async fn handle_heartbeat(
         &mut self,
         addr: SocketAddr,
@@ -267,6 +324,7 @@ where
             return Ok(());
         }
 
+        // Step 6-7: Update replication state based on follower's response
         {
             let mut state = self.state.lock().await;
             if res.success {
@@ -280,14 +338,8 @@ where
             }
         }
 
-        self.update_commit_index().await?;
-
-        // Apply committed entries to state machine
-        // We need to call after commit index is up to date
-        let mut state = self.state.lock().await;
-        if state.commit_index > state.last_applied {
-            state.apply_committed().await?;
-        }
+        // Note: Step 8 (commit_index update and state machine application) is now
+        // performed once after all Acks are collected in run_leader(), not here
 
         Ok(())
     }
