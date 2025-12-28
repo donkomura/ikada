@@ -171,17 +171,8 @@ where
         servers: Vec<SocketAddr>,
     ) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel::<Command>(32);
-        let state = Arc::clone(&self.state);
-        let heartbeat_tx = self.c.heartbeat_tx.clone();
-        let client_request_tx = self.c.client_request_tx.clone();
         let mut workers = JoinSet::new();
-        workers.spawn(self.main(servers));
-        workers.spawn(Self::rpc_handler(
-            state,
-            rx,
-            heartbeat_tx,
-            client_request_tx,
-        ));
+        workers.spawn(self.run_with_handler(servers, rx));
         workers.spawn(crate::server::rpc_server(tx, port));
 
         if let Some(res) = workers.join_next().await {
@@ -192,6 +183,29 @@ where
         while workers.join_next().await.is_some() {}
 
         Ok(())
+    }
+
+    /// Runs the node with an external command handler.
+    /// Useful for custom RPC implementations (e.g., Maelstrom integration).
+    pub async fn run_with_handler(
+        mut self,
+        servers: Vec<SocketAddr>,
+        cmd_rx: mpsc::Receiver<Command>,
+    ) -> anyhow::Result<()> {
+        self.setup(servers).await?;
+
+        let state = Arc::clone(&self.state);
+        let heartbeat_tx = self.c.heartbeat_tx.clone();
+        let client_request_tx = self.c.client_request_tx.clone();
+
+        tokio::spawn(Self::rpc_handler(
+            state,
+            cmd_rx,
+            heartbeat_tx,
+            client_request_tx,
+        ));
+
+        self.main(vec![]).await
     }
 
     /// Dispatches RPC commands to appropriate handlers.
