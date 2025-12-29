@@ -176,10 +176,12 @@ where
                 Ok(cmd) => cmd,
                 Err(e) => {
                     tracing::error!(id=?state.id, error=?e, "Failed to deserialize command");
-                    return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
-                        term: state.persistent.current_term,
-                        success: false,
-                    }));
+                    return Err(AppendEntriesError::Rejected(
+                        AppendEntriesResponse {
+                            term: state.persistent.current_term,
+                            success: false,
+                        },
+                    ));
                 }
             };
             let log_entry = raft::Entry {
@@ -218,18 +220,18 @@ where
     T: Send + Sync + Clone + serde::de::DeserializeOwned,
     SM: StateMachine<Command = T>,
 {
-    let conflict_modified = detect_and_truncate_conflicts(entries, start_index, state);
-    let append_modified = deserialize_and_append(entries, start_index, sender_id, state)?;
+    let conflict_modified =
+        detect_and_truncate_conflicts(entries, start_index, state);
+    let append_modified =
+        deserialize_and_append(entries, start_index, sender_id, state)?;
     let log_modified = conflict_modified || append_modified;
 
-    if log_modified {
-        if let Err(e) = state.persist().await {
-            tracing::error!(id=?state.id, error=?e, "Failed to persist state after log modification");
-            return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
-                term: state.persistent.current_term,
-                success: false,
-            }));
-        }
+    if log_modified && let Err(e) = state.persist().await {
+        tracing::error!(id=?state.id, error=?e, "Failed to persist state after log modification");
+        return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
+            term: state.persistent.current_term,
+            success: false,
+        }));
     }
 
     Ok(())
@@ -289,9 +291,16 @@ where
     let mut state = state.lock().await;
 
     let result = async {
-        validate_term_and_step_down(req.term, req.leader_id, &mut state).await?;
+        validate_term_and_step_down(req.term, req.leader_id, &mut state)
+            .await?;
         verify_log_match(req.prev_log_index, req.prev_log_term, &state)?;
-        synchronize_log(&req.entries, req.prev_log_index + 1, req.leader_id, &mut state).await?;
+        synchronize_log(
+            &req.entries,
+            req.prev_log_index + 1,
+            req.leader_id,
+            &mut state,
+        )
+        .await?;
         advance_commit_index(req.leader_commit, &mut state).await?;
         Ok(())
     }
@@ -1084,11 +1093,8 @@ mod tests {
         let state_machine = RecordingStateMachine::new();
         let applied_commands = state_machine.applied_commands.clone();
 
-        let mut follower_state = RaftState::new(
-            1,
-            create_test_storage(),
-            state_machine,
-        );
+        let mut follower_state =
+            RaftState::new(1, create_test_storage(), state_machine);
         follower_state.persistent.current_term = 2;
         follower_state.persistent.log.push(raft::Entry {
             term: 1,
@@ -1169,8 +1175,10 @@ mod tests {
             prev_log_term: 1,
             entries: vec![LogEntry {
                 term: 3,
-                command: bincode::serialize(&bytes::Bytes::from(&b"cmd2_new"[..]))
-                    .unwrap(),
+                command: bincode::serialize(&bytes::Bytes::from(
+                    &b"cmd2_new"[..],
+                ))
+                .unwrap(),
             }],
             leader_commit: 0,
         };
@@ -1339,11 +1347,8 @@ mod tests {
         let state_machine = RecordingStateMachine::new();
         let applied_commands = state_machine.applied_commands.clone();
 
-        let mut follower_state = RaftState::new(
-            1,
-            create_test_storage(),
-            state_machine,
-        );
+        let mut follower_state =
+            RaftState::new(1, create_test_storage(), state_machine);
         follower_state.persistent.current_term = 2;
         follower_state.persistent.log.push(raft::Entry {
             term: 1,
@@ -1396,11 +1401,8 @@ mod tests {
         let state_machine = RecordingStateMachine::new();
         let applied_commands = state_machine.applied_commands.clone();
 
-        let mut follower_state = RaftState::new(
-            1,
-            create_test_storage(),
-            state_machine,
-        );
+        let mut follower_state =
+            RaftState::new(1, create_test_storage(), state_machine);
         follower_state.persistent.current_term = 2;
         follower_state.persistent.log.push(raft::Entry {
             term: 1,
@@ -1503,13 +1505,17 @@ mod tests {
             entries: vec![
                 LogEntry {
                     term: 1,
-                    command: bincode::serialize(&bytes::Bytes::from(&b"cmd1"[..]))
-                        .unwrap(),
+                    command: bincode::serialize(&bytes::Bytes::from(
+                        &b"cmd1"[..],
+                    ))
+                    .unwrap(),
                 },
                 LogEntry {
                     term: 1,
-                    command: bincode::serialize(&bytes::Bytes::from(&b"cmd2"[..]))
-                        .unwrap(),
+                    command: bincode::serialize(&bytes::Bytes::from(
+                        &b"cmd2"[..],
+                    ))
+                    .unwrap(),
                 },
             ],
             leader_commit: 0,
