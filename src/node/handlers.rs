@@ -118,10 +118,14 @@ fn detect_and_truncate_conflicts<T, SM>(
     entries: &[LogEntry],
     start_index: u32,
     state: &mut RaftState<T, SM>,
+    client_manager: Option<
+        Arc<Mutex<crate::client_manager::ClientResponseManager<SM::Response>>>,
+    >,
 ) -> bool
 where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
+    SM::Response: 'static,
 {
     let mut log_modified = false;
     for (i, entry) in entries.iter().enumerate() {
@@ -135,6 +139,13 @@ where
                 state.persistent.log.truncate((log_index - 1) as usize);
 
                 state.pending_responses.retain(|&idx, _| idx < log_index);
+
+                if let Some(manager) = client_manager {
+                    let manager_clone = Arc::clone(&manager);
+                    tokio::spawn(async move {
+                        manager_clone.lock().await.clear_from(log_index);
+                    });
+                }
 
                 log_modified = true;
                 tracing::info!(
@@ -215,13 +226,21 @@ async fn synchronize_log<T, SM>(
     start_index: u32,
     sender_id: u32,
     state: &mut RaftState<T, SM>,
+    client_manager: Option<
+        Arc<Mutex<crate::client_manager::ClientResponseManager<SM::Response>>>,
+    >,
 ) -> Result<(), AppendEntriesError>
 where
     T: Send + Sync + Clone + serde::de::DeserializeOwned,
     SM: StateMachine<Command = T>,
+    SM::Response: 'static,
 {
-    let conflict_modified =
-        detect_and_truncate_conflicts(entries, start_index, state);
+    let conflict_modified = detect_and_truncate_conflicts(
+        entries,
+        start_index,
+        state,
+        client_manager,
+    );
     let append_modified =
         deserialize_and_append(entries, start_index, sender_id, state)?;
     let log_modified = conflict_modified || append_modified;
@@ -283,10 +302,14 @@ where
 pub async fn handle_append_entries<T, SM>(
     req: &AppendEntriesRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
+    client_manager: Option<
+        Arc<Mutex<crate::client_manager::ClientResponseManager<SM::Response>>>,
+    >,
 ) -> anyhow::Result<AppendEntriesResponse>
 where
     T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned,
     SM: StateMachine<Command = T>,
+    SM::Response: 'static,
 {
     let mut state = state.lock().await;
 
@@ -299,6 +322,7 @@ where
             req.prev_log_index + 1,
             req.leader_id,
             &mut state,
+            client_manager,
         )
         .await?;
         advance_commit_index(req.leader_commit, &mut state).await?;
@@ -502,6 +526,9 @@ where
 async fn append_command_to_log<T, SM>(
     state: &mut RaftState<T, SM>,
     command: T,
+    client_manager: Arc<
+        Mutex<crate::client_manager::ClientResponseManager<SM::Response>>,
+    >,
 ) -> Result<(u32, tokio::sync::oneshot::Receiver<SM::Response>), CommandResponse>
 where
     T: Send + Sync + Clone,
@@ -528,7 +555,7 @@ where
 
     // Register a response channel for this log entry
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    state.pending_responses.insert(log_index, result_tx);
+    client_manager.lock().await.register(log_index, result_tx);
 
     tracing::debug!(
         id = state.id,
@@ -600,6 +627,9 @@ pub async fn handle_client_request_impl<T, SM>(
     state: Arc<Mutex<RaftState<T, SM>>>,
     timeout: std::time::Duration,
     peer_count: usize,
+    client_manager: Arc<
+        Mutex<crate::client_manager::ClientResponseManager<SM::Response>>,
+    >,
 ) -> CommandResponse
 where
     T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned,
@@ -645,7 +675,13 @@ where
         };
 
         // Step 2: Leader appends entry to its local log (not yet committed to state machine)
-        match append_command_to_log(&mut state_guard, command.clone()).await {
+        match append_command_to_log(
+            &mut state_guard,
+            command.clone(),
+            client_manager.clone(),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(response) => return response,
         }
@@ -735,9 +771,10 @@ mod tests {
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 if let Command::AppendEntries(req, resp_tx) = cmd {
-                    let resp = handle_append_entries(&req, state_clone.clone())
-                        .await
-                        .unwrap();
+                    let resp =
+                        handle_append_entries(&req, state_clone.clone(), None)
+                            .await
+                            .unwrap();
                     let _ = resp_tx.send(resp);
                 }
             }
@@ -993,7 +1030,7 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
 
         // レスポンスは成功
         assert!(response.success);
@@ -1071,7 +1108,7 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
 
         // レスポンスは成功
         assert!(response.success);
@@ -1121,7 +1158,7 @@ mod tests {
             leader_commit: 2,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
@@ -1183,7 +1220,7 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
@@ -1227,7 +1264,7 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(!response.success);
         assert_eq!(response.term, 3);
 
@@ -1256,7 +1293,7 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(!response.success);
         assert_eq!(response.term, 5);
 
@@ -1294,7 +1331,7 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(!response.success);
         assert_eq!(response.term, 3);
 
@@ -1332,7 +1369,7 @@ mod tests {
             leader_commit: 999,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
@@ -1379,7 +1416,7 @@ mod tests {
             leader_commit: 3,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
@@ -1423,7 +1460,8 @@ mod tests {
             leader_commit: 2,
         };
 
-        let response1 = handle_append_entries(&req, state.clone()).await?;
+        let response1 =
+            handle_append_entries(&req, state.clone(), None).await?;
         assert!(response1.success);
 
         {
@@ -1433,7 +1471,8 @@ mod tests {
             assert_eq!(commands[1].as_ref(), b"cmd2");
         }
 
-        let response2 = handle_append_entries(&req, state.clone()).await?;
+        let response2 =
+            handle_append_entries(&req, state.clone(), None).await?;
         assert!(response2.success);
 
         {
@@ -1475,7 +1514,7 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
@@ -1521,7 +1560,7 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
@@ -1589,7 +1628,7 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
@@ -1638,7 +1677,7 @@ mod tests {
             leader_commit: 5,
         };
 
-        let response = handle_append_entries(&req, state.clone()).await?;
+        let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(!response.success);
         assert_eq!(response.term, 3);
 

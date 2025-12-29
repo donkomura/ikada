@@ -2,12 +2,18 @@ use crate::statemachine::StateMachine;
 use crate::storage::Storage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub struct Entry<T: Send + Sync> {
     pub term: u32,
     pub command: T,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppliedEntry<R> {
+    pub log_index: u32,
+    pub response: R,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +52,9 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
 
     // Pending client responses (log_index -> response sender)
     pub pending_responses: HashMap<u32, oneshot::Sender<SM::Response>>,
+
+    // Event notifier for applied entries
+    apply_notifier: Option<mpsc::UnboundedSender<AppliedEntry<SM::Response>>>,
 }
 
 impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
@@ -66,7 +75,15 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             storage,
             sm,
             pending_responses: HashMap::new(),
+            apply_notifier: None,
         }
+    }
+
+    pub fn set_apply_notifier(
+        &mut self,
+        notifier: mpsc::UnboundedSender<AppliedEntry<SM::Response>>,
+    ) {
+        self.apply_notifier = Some(notifier);
     }
 
     pub async fn persist(&mut self) -> anyhow::Result<()> {
@@ -96,6 +113,14 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             if let Some(tx) = self.pending_responses.remove(&self.last_applied)
             {
                 let _ = tx.send(response.clone());
+            }
+
+            // Notify via event channel if notifier is set
+            if let Some(notifier) = &self.apply_notifier {
+                let _ = notifier.send(AppliedEntry {
+                    log_index: self.last_applied,
+                    response: response.clone(),
+                });
             }
 
             responses.push(response);

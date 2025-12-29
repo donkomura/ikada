@@ -1,4 +1,5 @@
 pub mod client;
+pub mod client_manager;
 pub mod config;
 pub mod network;
 pub mod node;
