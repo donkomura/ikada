@@ -537,9 +537,13 @@ where
     // Step 3-7: Wait for majority replication
     // The periodic heartbeat loop replicates entries asynchronously
     // We poll match_index to detect when majority replication is achieved
-    if let Err(response) =
-        wait_for_majority_replication(state.clone(), log_index, peer_count, timeout)
-            .await
+    if let Err(response) = wait_for_majority_replication(
+        state.clone(),
+        log_index,
+        peer_count,
+        timeout,
+    )
+    .await
     {
         return response;
     }
