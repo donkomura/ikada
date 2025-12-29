@@ -113,21 +113,16 @@ where
 }
 
 /// Detects and resolves log conflicts by truncating conflicting entries.
-/// Returns true if log was modified.
+/// Returns the log index where conflict occurred, or None if no conflict.
 fn detect_and_truncate_conflicts<T, SM>(
     entries: &[LogEntry],
     start_index: u32,
     state: &mut RaftState<T, SM>,
-    client_manager: Option<
-        Arc<Mutex<crate::client_manager::ClientResponseManager<SM::Response>>>,
-    >,
-) -> bool
+) -> Option<u32>
 where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
-    SM::Response: 'static,
 {
-    let mut log_modified = false;
     for (i, entry) in entries.iter().enumerate() {
         let log_index = start_index + i as u32;
 
@@ -137,15 +132,6 @@ where
 
             if existing_term != entry.term {
                 state.persistent.log.truncate((log_index - 1) as usize);
-
-                if let Some(manager) = client_manager {
-                    let manager_clone = Arc::clone(&manager);
-                    tokio::spawn(async move {
-                        manager_clone.lock().await.clear_from(log_index);
-                    });
-                }
-
-                log_modified = true;
                 tracing::info!(
                     id=?state.id,
                     conflict_index=log_index,
@@ -153,12 +139,12 @@ where
                     new_term=entry.term,
                     "Truncated log due to conflict"
                 );
-                break;
+                return Some(log_index);
             }
         }
     }
 
-    log_modified
+    None
 }
 
 /// Deserializes and appends new log entries that don't exist yet.
@@ -232,15 +218,18 @@ where
     SM: StateMachine<Command = T>,
     SM::Response: 'static,
 {
-    let conflict_modified = detect_and_truncate_conflicts(
-        entries,
-        start_index,
-        state,
-        client_manager,
-    );
+    let conflict_at =
+        detect_and_truncate_conflicts(entries, start_index, state);
+
+    if let Some(log_index) = conflict_at
+        && let Some(manager) = &client_manager
+    {
+        manager.lock().await.clear_from(log_index);
+    }
+
     let append_modified =
         deserialize_and_append(entries, start_index, sender_id, state)?;
-    let log_modified = conflict_modified || append_modified;
+    let log_modified = conflict_at.is_some() || append_modified;
 
     if log_modified && let Err(e) = state.persist().await {
         tracing::error!(id=?state.id, error=?e, "Failed to persist state after log modification");
@@ -1197,8 +1186,8 @@ mod tests {
         let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
 
         let (tx1, _rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let (tx3, rx3) = tokio::sync::oneshot::channel();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        let (tx3, mut rx3) = tokio::sync::oneshot::channel();
         client_manager.lock().await.register(1, tx1);
         client_manager.lock().await.register(2, tx2);
         client_manager.lock().await.register(3, tx3);
@@ -1232,15 +1221,22 @@ mod tests {
         assert_eq!(final_state.persistent.log.len(), 2);
         assert_eq!(final_state.persistent.log[1].term, 3);
         assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2_new");
+        drop(final_state);
 
-        // Verify that pending responses 2 and 3 were cleared (channels should be dropped/closed)
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        drop(client_manager);
+
         assert!(
-            rx2.await.is_err(),
+            matches!(
+                rx2.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
             "Channel for log index 2 should be closed"
         );
         assert!(
-            rx3.await.is_err(),
+            matches!(
+                rx3.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
             "Channel for log index 3 should be closed"
         );
 
