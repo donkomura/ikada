@@ -138,8 +138,6 @@ where
             if existing_term != entry.term {
                 state.persistent.log.truncate((log_index - 1) as usize);
 
-                state.pending_responses.retain(|&idx, _| idx < log_index);
-
                 if let Some(manager) = client_manager {
                     let manager_clone = Arc::clone(&manager);
                     tokio::spawn(async move {
@@ -153,7 +151,6 @@ where
                     conflict_index=log_index,
                     old_term=existing_term,
                     new_term=entry.term,
-                    pending_responses_cleared=state.pending_responses.len(),
                     "Truncated log due to conflict"
                 );
                 break;
@@ -1176,6 +1173,8 @@ mod tests {
     #[tokio::test]
     async fn test_append_entries_clears_pending_responses_on_conflict()
     -> anyhow::Result<()> {
+        use crate::client_manager::ClientResponseManager;
+
         let mut follower_state = RaftState::new(
             1,
             create_test_storage(),
@@ -1195,13 +1194,14 @@ mod tests {
             command: bytes::Bytes::from(&b"cmd3_old"[..]),
         });
 
+        let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
+
         let (tx1, _rx1) = tokio::sync::oneshot::channel();
-        let (tx2, _rx2) = tokio::sync::oneshot::channel();
-        let (tx3, _rx3) = tokio::sync::oneshot::channel();
-        follower_state.pending_responses.insert(1, tx1);
-        follower_state.pending_responses.insert(2, tx2);
-        follower_state.pending_responses.insert(3, tx3);
-        assert_eq!(follower_state.pending_responses.len(), 3);
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let (tx3, rx3) = tokio::sync::oneshot::channel();
+        client_manager.lock().await.register(1, tx1);
+        client_manager.lock().await.register(2, tx2);
+        client_manager.lock().await.register(3, tx3);
 
         let state = Arc::new(Mutex::new(follower_state));
 
@@ -1220,7 +1220,12 @@ mod tests {
             leader_commit: 0,
         };
 
-        let response = handle_append_entries(&req, state.clone(), None).await?;
+        let response = handle_append_entries(
+            &req,
+            state.clone(),
+            Some(client_manager.clone()),
+        )
+        .await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
@@ -1228,10 +1233,16 @@ mod tests {
         assert_eq!(final_state.persistent.log[1].term, 3);
         assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2_new");
 
-        assert_eq!(final_state.pending_responses.len(), 1);
-        assert!(final_state.pending_responses.contains_key(&1));
-        assert!(!final_state.pending_responses.contains_key(&2));
-        assert!(!final_state.pending_responses.contains_key(&3));
+        // Verify that pending responses 2 and 3 were cleared (channels should be dropped/closed)
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert!(
+            rx2.await.is_err(),
+            "Channel for log index 2 should be closed"
+        );
+        assert!(
+            rx3.await.is_err(),
+            "Channel for log index 3 should be closed"
+        );
 
         Ok(())
     }
