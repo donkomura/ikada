@@ -178,12 +178,6 @@ where
             );
         }
 
-        *self.last_heartbeat_majority.lock().await = if has_majority {
-            Some(leader_term)
-        } else {
-            None
-        };
-
         Ok(has_majority)
     }
 

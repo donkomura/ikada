@@ -34,7 +34,6 @@ struct RaftContext {
     state: Option<RaftStateHandle>,
     cmd_tx: Option<mpsc::Sender<Command>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
-    last_heartbeat_majority: Option<Arc<Mutex<Option<u32>>>>,
 }
 
 /// Request forwarding management
@@ -94,7 +93,6 @@ impl MaelstromRaftNode {
                 state: None,
                 cmd_tx: None,
                 task_handle: None,
-                last_heartbeat_majority: None,
             })),
             network_factory: Arc::new(Mutex::new(None)),
             forward_manager: Arc::new(Mutex::new(ForwardManager::new())),
@@ -272,11 +270,10 @@ impl MaelstromRaftNode {
             heartbeat_interval: tokio::time::Duration::from_millis(10),
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
             rpc_timeout: std::time::Duration::from_millis(100),
-            heartbeat_failure_retry_limit: 1,
+            heartbeat_failure_retry_limit: 5,
         };
 
         let node = Node::new_with_state(config, state, network_factory.clone());
-        let last_heartbeat_majority = Arc::clone(&node.last_heartbeat_majority);
 
         let task_handle = tokio::spawn(async move {
             let _ = node.run_with_handler(peers, cmd_rx).await;
@@ -285,7 +282,6 @@ impl MaelstromRaftNode {
         {
             let mut context = self.raft_context.lock().await;
             context.task_handle = Some(task_handle);
-            context.last_heartbeat_majority = Some(last_heartbeat_majority);
         }
 
         Ok(Some(Message {
@@ -741,17 +737,7 @@ impl MaelstromRaftNode {
             .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
         let state_inner = state.lock().await;
 
-        if state_inner.role != ikada::raft::Role::Leader {
-            return Ok(false);
-        }
-
-        let last_heartbeat_majority =
-            context.last_heartbeat_majority.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("last_heartbeat_majority not initialized")
-            })?;
-
-        let heartbeat_term = *last_heartbeat_majority.lock().await;
-        Ok(heartbeat_term.is_some())
+        Ok(state_inner.role == ikada::raft::Role::Leader)
     }
 
     async fn forward_cas_if_possible(

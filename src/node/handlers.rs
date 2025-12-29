@@ -103,12 +103,17 @@ where
 
             if existing_term != rpc_entry.term {
                 state.persistent.log.truncate((log_index - 1) as usize);
+
+                // Clear pending responses for truncated entries
+                state.pending_responses.retain(|&idx, _| idx < log_index);
+
                 log_modified = true;
                 tracing::info!(
                     id=?state.id,
                     conflict_index=log_index,
                     old_term=existing_term,
                     new_term=rpc_entry.term,
+                    pending_responses_cleared=state.pending_responses.len(),
                     "Truncated log due to conflict"
                 );
                 break;
@@ -292,7 +297,6 @@ where
 
 pub(crate) fn validate_leadership<T, SM>(
     state: &RaftState<T, SM>,
-    heartbeat_term: Option<u32>,
 ) -> Result<(), CommandResponse>
 where
     T: Send + Sync + Clone,
@@ -307,86 +311,14 @@ where
         });
     }
 
-    let Some(confirmed_term) = heartbeat_term else {
-        return Err(CommandResponse {
-            success: false,
-            leader_hint: None,
-            data: None,
-            error: Some(
-                "Failed to confirm leadership via heartbeat".to_string(),
-            ),
-        });
-    };
-
-    if confirmed_term != state.persistent.current_term {
-        return Err(CommandResponse {
-            success: false,
-            leader_hint: state.leader_id,
-            data: None,
-            error: Some(format!(
-                "Leadership term mismatch: heartbeat at term {}, current term {}",
-                confirmed_term, state.persistent.current_term
-            )),
-        });
-    }
-
     Ok(())
-}
-
-/// Appends a command to the leader's log.
-///
-/// Raft Algorithm - Log Replication Step 2:
-/// Step 2: Leader receives the entry and appends it to its local log
-///         (not yet committed to state machine)
-async fn append_command_to_log<T, SM>(
-    state: &mut RaftState<T, SM>,
-    command: T,
-) -> Result<(u32, tokio::sync::oneshot::Receiver<SM::Response>), CommandResponse>
-where
-    T: Send + Sync + Clone,
-    SM: StateMachine<Command = T>,
-{
-    let term = state.persistent.current_term;
-    let log_index = state.persistent.log.len() as u32 + 1;
-
-    // Append entry to log
-    state.persistent.log.push(crate::raft::Entry {
-        term,
-        command: command.clone(),
-    });
-
-    // Persist the log entry
-    if let Err(e) = state.persist().await {
-        return Err(CommandResponse {
-            success: false,
-            leader_hint: None,
-            data: None,
-            error: Some(format!("Failed to persist log: {}", e)),
-        });
-    }
-
-    // Register a response channel for this log entry
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    state.pending_responses.insert(log_index, result_tx);
-
-    tracing::debug!(
-        id = state.id,
-        log_index = log_index,
-        term = term,
-        "Leader appended command to log"
-    );
-
-    Ok((log_index, result_rx))
 }
 
 /// Waits for a log entry to be replicated to a majority of nodes.
 ///
-/// Raft Algorithm - Log Replication Steps 3-7 (monitoring):
-/// This function polls match_index to detect when majority replication is achieved.
-/// The actual Steps 3-7 happen asynchronously in the leader loop:
-/// - Step 3: broadcast_heartbeat sends AppendEntries RPC
-/// - Step 4-5: Followers append to their logs
-/// - Step 6-7: Followers send Acks, updating match_index
+/// Raft Algorithm - Log Replication Steps 6-7:
+/// This function polls match_index to check if a majority of nodes have replicated the entry.
+/// The actual replication happens asynchronously via periodic heartbeats.
 async fn wait_for_majority_replication<T, SM>(
     state: Arc<Mutex<RaftState<T, SM>>>,
     log_index: u32,
@@ -443,6 +375,52 @@ where
 
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Appends a command to the leader's log.
+///
+/// Raft Algorithm - Log Replication Step 2:
+/// Step 2: Leader receives the entry and appends it to its local log
+///         (not yet committed to state machine)
+async fn append_command_to_log<T, SM>(
+    state: &mut RaftState<T, SM>,
+    command: T,
+) -> Result<(u32, tokio::sync::oneshot::Receiver<SM::Response>), CommandResponse>
+where
+    T: Send + Sync + Clone,
+    SM: StateMachine<Command = T>,
+{
+    let term = state.persistent.current_term;
+    let log_index = state.persistent.log.len() as u32 + 1;
+
+    // Append entry to log
+    state.persistent.log.push(crate::raft::Entry {
+        term,
+        command: command.clone(),
+    });
+
+    // Persist the log entry
+    if let Err(e) = state.persist().await {
+        return Err(CommandResponse {
+            success: false,
+            leader_hint: None,
+            data: None,
+            error: Some(format!("Failed to persist log: {}", e)),
+        });
+    }
+
+    // Register a response channel for this log entry
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    state.pending_responses.insert(log_index, result_tx);
+
+    tracing::debug!(
+        id = state.id,
+        log_index = log_index,
+        term = term,
+        "Leader appended command to log"
+    );
+
+    Ok((log_index, result_rx))
 }
 
 /// Waits for the state machine to apply a command and return the result.
@@ -504,7 +482,6 @@ pub async fn handle_client_request_impl<T, SM>(
     req: &CommandRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
     timeout: std::time::Duration,
-    heartbeat_term: Option<u32>,
     peer_count: usize,
 ) -> CommandResponse
 where
@@ -515,9 +492,8 @@ where
     let (log_index, result_rx) = {
         let mut state_guard = state.lock().await;
 
-        // Validate that this node is the leader and has confirmed leadership via majority heartbeat
-        if let Err(response) = validate_leadership(&state_guard, heartbeat_term)
-        {
+        // Validate that this node is the leader
+        if let Err(response) = validate_leadership(&state_guard) {
             return response;
         }
 
@@ -558,12 +534,9 @@ where
         }
     };
 
-    // Step 3-7 (indirect): Wait for majority of followers to replicate the entry
-    // Note: AppendEntries RPC is actually sent by broadcast_heartbeat in the leader loop,
-    //       not directly here. This function polls match_index until majority is achieved.
-    // Step 3: broadcast_heartbeat sends AppendEntries RPC with the new log entry
-    // Step 4-5: Followers append to their logs
-    // Step 6-7: Followers respond with Ack, updating match_index via handle_heartbeat
+    // Step 3-7: Wait for majority replication
+    // The periodic heartbeat loop replicates entries asynchronously
+    // We poll match_index to detect when majority replication is achieved
     if let Err(response) = wait_for_majority_replication(
         state.clone(),
         log_index,
