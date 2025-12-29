@@ -569,6 +569,33 @@ mod tests {
         crate::statemachine::NoOpStateMachine::default()
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingStateMachine {
+        applied_commands: Arc<Mutex<Vec<bytes::Bytes>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::statemachine::StateMachine for RecordingStateMachine {
+        type Command = bytes::Bytes;
+        type Response = ();
+
+        async fn apply(
+            &mut self,
+            command: &Self::Command,
+        ) -> anyhow::Result<Self::Response> {
+            self.applied_commands.lock().await.push(command.clone());
+            Ok(())
+        }
+    }
+
+    impl RecordingStateMachine {
+        fn new() -> Self {
+            Self {
+                applied_commands: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_append_entries_with_higher_term_converts_to_follower()
     -> anyhow::Result<()> {
@@ -578,6 +605,7 @@ mod tests {
             create_test_state_machine(),
         );
         initial_state.persistent.current_term = 50;
+        initial_state.persistent.voted_for = Some(1);
         initial_state.role = Role::Leader;
         let state = Arc::new(Mutex::new(initial_state));
 
@@ -612,10 +640,11 @@ mod tests {
 
         let _response = resp_rx.await?;
 
-        // termが更新され、followerに転向しているべき
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.current_term, 100);
         assert_eq!(final_state.role, Role::Follower);
+        assert_eq!(final_state.persistent.voted_for, None);
+        assert_eq!(final_state.leader_id, Some(99999));
 
         Ok(())
     }
@@ -937,6 +966,606 @@ mod tests {
         assert_eq!(final_state.persistent.log[2].command.as_ref(), b"cmd3");
         assert_eq!(final_state.persistent.log[3].term, 2);
         assert_eq!(final_state.persistent.log[3].command.as_ref(), b"cmd4");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_updates_commit_index_and_applies_entries()
+    -> anyhow::Result<()> {
+        let state_machine = RecordingStateMachine::new();
+        let applied_commands = state_machine.applied_commands.clone();
+
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            state_machine,
+        );
+        follower_state.persistent.current_term = 2;
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd1"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd2"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd3"[..]),
+        });
+        assert_eq!(follower_state.commit_index, 0);
+        assert_eq!(follower_state.last_applied, 0);
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 3,
+            prev_log_term: 2,
+            entries: vec![],
+            leader_commit: 2,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(response.success);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.commit_index, 2);
+        assert_eq!(final_state.last_applied, 2);
+
+        let commands = applied_commands.lock().await;
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].as_ref(), b"cmd1");
+        assert_eq!(commands[1].as_ref(), b"cmd2");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_clears_pending_responses_on_conflict()
+    -> anyhow::Result<()> {
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        follower_state.persistent.current_term = 3;
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd1"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd2_old"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd3_old"[..]),
+        });
+
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        let (tx3, _rx3) = tokio::sync::oneshot::channel();
+        follower_state.pending_responses.insert(1, tx1);
+        follower_state.pending_responses.insert(2, tx2);
+        follower_state.pending_responses.insert(3, tx3);
+        assert_eq!(follower_state.pending_responses.len(), 3);
+
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 1,
+            prev_log_term: 1,
+            entries: vec![LogEntry {
+                term: 3,
+                command: bincode::serialize(&bytes::Bytes::from(&b"cmd2_new"[..]))
+                    .unwrap(),
+            }],
+            leader_commit: 0,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(response.success);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.persistent.log.len(), 2);
+        assert_eq!(final_state.persistent.log[1].term, 3);
+        assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2_new");
+
+        assert_eq!(final_state.pending_responses.len(), 1);
+        assert!(final_state.pending_responses.contains_key(&1));
+        assert!(!final_state.pending_responses.contains_key(&2));
+        assert!(!final_state.pending_responses.contains_key(&3));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_rejects_prev_log_term_mismatch()
+    -> anyhow::Result<()> {
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        follower_state.persistent.current_term = 3;
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd1"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd2"[..]),
+        });
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 2,
+            prev_log_term: 1,
+            entries: vec![],
+            leader_commit: 0,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(!response.success);
+        assert_eq!(response.term, 3);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.persistent.log.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_rejects_older_term() -> anyhow::Result<()> {
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        follower_state.persistent.current_term = 5;
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(!response.success);
+        assert_eq!(response.term, 5);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.persistent.current_term, 5);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_rejects_prev_log_index_exceeds_log_length()
+    -> anyhow::Result<()> {
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        follower_state.persistent.current_term = 3;
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd1"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd2"[..]),
+        });
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 5,
+            prev_log_term: 2,
+            entries: vec![],
+            leader_commit: 0,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(!response.success);
+        assert_eq!(response.term, 3);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.persistent.log.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_commit_index_capped_by_log_length()
+    -> anyhow::Result<()> {
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        follower_state.persistent.current_term = 2;
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd1"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd2"[..]),
+        });
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 2,
+            prev_log_term: 2,
+            entries: vec![],
+            leader_commit: 999,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(response.success);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.commit_index, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_does_not_reapply_already_applied_entries()
+    -> anyhow::Result<()> {
+        let state_machine = RecordingStateMachine::new();
+        let applied_commands = state_machine.applied_commands.clone();
+
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            state_machine,
+        );
+        follower_state.persistent.current_term = 2;
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd1"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd2"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd3"[..]),
+        });
+        follower_state.commit_index = 1;
+        follower_state.last_applied = 0;
+        follower_state.apply_committed().await?;
+
+        assert_eq!(applied_commands.lock().await.len(), 1);
+
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 3,
+            prev_log_term: 2,
+            entries: vec![],
+            leader_commit: 3,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(response.success);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.commit_index, 3);
+        assert_eq!(final_state.last_applied, 3);
+
+        let commands = applied_commands.lock().await;
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].as_ref(), b"cmd1");
+        assert_eq!(commands[1].as_ref(), b"cmd2");
+        assert_eq!(commands[2].as_ref(), b"cmd3");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_idempotent_duplicate_request()
+    -> anyhow::Result<()> {
+        let state_machine = RecordingStateMachine::new();
+        let applied_commands = state_machine.applied_commands.clone();
+
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            state_machine,
+        );
+        follower_state.persistent.current_term = 2;
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd1"[..]),
+        });
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 1,
+            prev_log_term: 1,
+            entries: vec![LogEntry {
+                term: 2,
+                command: bincode::serialize(&bytes::Bytes::from(&b"cmd2"[..]))
+                    .unwrap(),
+            }],
+            leader_commit: 2,
+        };
+
+        let response1 = handle_append_entries(&req, state.clone()).await?;
+        assert!(response1.success);
+
+        {
+            let commands = applied_commands.lock().await;
+            assert_eq!(commands.len(), 2);
+            assert_eq!(commands[0].as_ref(), b"cmd1");
+            assert_eq!(commands[1].as_ref(), b"cmd2");
+        }
+
+        let response2 = handle_append_entries(&req, state.clone()).await?;
+        assert!(response2.success);
+
+        {
+            let final_state = state.lock().await;
+            assert_eq!(final_state.persistent.log.len(), 2);
+            assert_eq!(final_state.persistent.log[0].term, 1);
+            assert_eq!(final_state.persistent.log[0].command.as_ref(), b"cmd1");
+            assert_eq!(final_state.persistent.log[1].term, 2);
+            assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2");
+            assert_eq!(final_state.commit_index, 2);
+            assert_eq!(final_state.last_applied, 2);
+        }
+
+        let commands = applied_commands.lock().await;
+        assert_eq!(commands.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_candidate_receives_same_term_current_behavior_does_not_step_down()
+    -> anyhow::Result<()> {
+        let mut candidate_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        candidate_state.persistent.current_term = 5;
+        candidate_state.role = Role::Candidate;
+        candidate_state.persistent.voted_for = Some(1);
+        let state = Arc::new(Mutex::new(candidate_state));
+
+        let req = AppendEntriesRequest {
+            term: 5,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(response.success);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.role, Role::Candidate);
+        assert_eq!(final_state.persistent.current_term, 5);
+        assert_eq!(final_state.leader_id, Some(2));
+        assert_eq!(final_state.persistent.voted_for, Some(1));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_candidate_receives_same_term_should_become_follower()
+    -> anyhow::Result<()> {
+        let mut candidate_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        candidate_state.persistent.current_term = 5;
+        candidate_state.role = Role::Candidate;
+        candidate_state.persistent.voted_for = Some(1);
+        let state = Arc::new(Mutex::new(candidate_state));
+
+        let req = AppendEntriesRequest {
+            term: 5,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(response.success);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.role, Role::Follower);
+        assert_eq!(final_state.persistent.current_term, 5);
+        assert_eq!(final_state.leader_id, Some(2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_prev_log_index_zero_success()
+    -> anyhow::Result<()> {
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        follower_state.persistent.current_term = 1;
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![
+                LogEntry {
+                    term: 1,
+                    command: bincode::serialize(&bytes::Bytes::from(&b"cmd1"[..]))
+                        .unwrap(),
+                },
+                LogEntry {
+                    term: 1,
+                    command: bincode::serialize(&bytes::Bytes::from(&b"cmd2"[..]))
+                        .unwrap(),
+                },
+            ],
+            leader_commit: 0,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(response.success);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.persistent.log.len(), 2);
+        assert_eq!(final_state.persistent.log[0].term, 1);
+        assert_eq!(final_state.persistent.log[0].command.as_ref(), b"cmd1");
+        assert_eq!(final_state.persistent.log[1].term, 1);
+        assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_partial_match_overwrites_from_conflict_point()
+    -> anyhow::Result<()> {
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        follower_state.persistent.current_term = 3;
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd1"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd2"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd3"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd4_old"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd5_old"[..]),
+        });
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 3,
+            prev_log_term: 2,
+            entries: vec![
+                LogEntry {
+                    term: 3,
+                    command: bincode::serialize(&bytes::Bytes::from(
+                        &b"cmd4_new"[..],
+                    ))
+                    .unwrap(),
+                },
+                LogEntry {
+                    term: 3,
+                    command: bincode::serialize(&bytes::Bytes::from(
+                        &b"cmd5_new"[..],
+                    ))
+                    .unwrap(),
+                },
+            ],
+            leader_commit: 0,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(response.success);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.persistent.log.len(), 5);
+        assert_eq!(final_state.persistent.log[0].term, 1);
+        assert_eq!(final_state.persistent.log[0].command.as_ref(), b"cmd1");
+        assert_eq!(final_state.persistent.log[1].term, 1);
+        assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2");
+        assert_eq!(final_state.persistent.log[2].term, 2);
+        assert_eq!(final_state.persistent.log[2].command.as_ref(), b"cmd3");
+        assert_eq!(final_state.persistent.log[3].term, 3);
+        assert_eq!(final_state.persistent.log[3].command.as_ref(), b"cmd4_new");
+        assert_eq!(final_state.persistent.log[4].term, 3);
+        assert_eq!(final_state.persistent.log[4].command.as_ref(), b"cmd5_new");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_rejection_does_not_change_commit_index()
+    -> anyhow::Result<()> {
+        let mut follower_state = RaftState::new(
+            1,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        follower_state.persistent.current_term = 3;
+        follower_state.persistent.log.push(raft::Entry {
+            term: 1,
+            command: bytes::Bytes::from(&b"cmd1"[..]),
+        });
+        follower_state.persistent.log.push(raft::Entry {
+            term: 2,
+            command: bytes::Bytes::from(&b"cmd2"[..]),
+        });
+        follower_state.commit_index = 1;
+        follower_state.last_applied = 1;
+        let state = Arc::new(Mutex::new(follower_state));
+
+        let req = AppendEntriesRequest {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 2,
+            prev_log_term: 1,
+            entries: vec![],
+            leader_commit: 5,
+        };
+
+        let response = handle_append_entries(&req, state.clone()).await?;
+        assert!(!response.success);
+        assert_eq!(response.term, 3);
+
+        let final_state = state.lock().await;
+        assert_eq!(final_state.persistent.log.len(), 2);
+        assert_eq!(final_state.commit_index, 1);
+        assert_eq!(final_state.last_applied, 1);
 
         Ok(())
     }
