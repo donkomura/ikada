@@ -314,6 +314,69 @@ where
     Ok(())
 }
 
+/// Waits for a log entry to be replicated to a majority of nodes.
+///
+/// Raft Algorithm - Log Replication Steps 6-7:
+/// This function polls match_index to check if a majority of nodes have replicated the entry.
+/// The actual replication happens asynchronously via periodic heartbeats.
+async fn wait_for_majority_replication<T, SM>(
+    state: Arc<Mutex<RaftState<T, SM>>>,
+    log_index: u32,
+    peer_count: usize,
+    timeout: std::time::Duration,
+) -> Result<(), CommandResponse>
+where
+    T: Send + Sync + Clone,
+    SM: StateMachine<Command = T>,
+{
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_millis(10);
+
+    loop {
+        if start.elapsed() > timeout {
+            return Err(CommandResponse {
+                success: false,
+                leader_hint: None,
+                data: None,
+                error: Some(
+                    "Timeout waiting for majority replication".to_string(),
+                ),
+            });
+        }
+
+        let is_replicated = {
+            let state_guard = state.lock().await;
+
+            if !matches!(state_guard.role, Role::Leader) {
+                return Err(CommandResponse {
+                    success: false,
+                    leader_hint: state_guard.leader_id,
+                    data: None,
+                    error: Some("No longer the leader".to_string()),
+                });
+            }
+
+            let total_nodes = peer_count + 1;
+            let majority = total_nodes / 2;
+            let mut count = 1;
+
+            for match_idx in state_guard.match_index.values() {
+                if *match_idx >= log_index {
+                    count += 1;
+                }
+            }
+
+            count > majority
+        };
+
+        if is_replicated {
+            return Ok(());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 /// Appends a command to the leader's log.
 ///
 /// Raft Algorithm - Log Replication Step 2:
@@ -419,13 +482,14 @@ pub async fn handle_client_request_impl<T, SM>(
     req: &CommandRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
     timeout: std::time::Duration,
+    peer_count: usize,
 ) -> CommandResponse
 where
     T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned,
     SM: StateMachine<Command = T>,
     SM::Response: Clone + serde::Serialize,
 {
-    let (_log_index, result_rx) = {
+    let (log_index, result_rx) = {
         let mut state_guard = state.lock().await;
 
         // Validate that this node is the leader
@@ -470,12 +534,18 @@ where
         }
     };
 
-    // Step 3-9: Wait for entry to be committed and applied to state machine
-    // The periodic heartbeat loop will:
-    // - Step 3: Replicate the entry to followers via broadcast_heartbeat
-    // - Step 8: Update commit_index when majority replication is achieved
-    // - Apply committed entries to state machine
-    // We simply wait for the state machine to apply the entry and return the result
+    // Step 3-7: Wait for majority replication
+    // The periodic heartbeat loop replicates entries asynchronously
+    // We poll match_index to detect when majority replication is achieved
+    if let Err(response) =
+        wait_for_majority_replication(state.clone(), log_index, peer_count, timeout)
+            .await
+    {
+        return response;
+    }
+
+    // Step 8 (partial): Entry has been replicated to majority, waiting for state machine application
+    // Step 9: Return success response to client (after state machine applies the entry)
     wait_for_command_result::<SM>(result_rx, timeout).await
 }
 

@@ -129,12 +129,14 @@ where
                     // Step 2-9 are handled asynchronously in handle_client_request_impl
                     let rpc_timeout = self.config.rpc_timeout;
                     let state = self.state.clone();
+                    let peer_count = self.peers.len();
 
                     tokio::spawn(async move {
                         let resp = handlers::handle_client_request_impl(
                             &req,
                             state,
                             rpc_timeout + std::time::Duration::from_millis(100),
+                            peer_count,
                         )
                         .await;
 
