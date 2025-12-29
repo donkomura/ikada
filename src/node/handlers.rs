@@ -58,8 +58,10 @@ where
             });
         }
     } else if req.term == state.persistent.current_term {
-        // Track leader even for heartbeats to enable client redirection
         state.leader_id = Some(req.leader_id);
+        if matches!(state.role, Role::Candidate | Role::Leader) {
+            state.role = Role::Follower;
+        }
     }
 
     if req.prev_log_index > 0 {
@@ -1344,41 +1346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_entries_candidate_receives_same_term_current_behavior_does_not_step_down()
-    -> anyhow::Result<()> {
-        let mut candidate_state = RaftState::new(
-            1,
-            create_test_storage(),
-            create_test_state_machine(),
-        );
-        candidate_state.persistent.current_term = 5;
-        candidate_state.role = Role::Candidate;
-        candidate_state.persistent.voted_for = Some(1);
-        let state = Arc::new(Mutex::new(candidate_state));
-
-        let req = AppendEntriesRequest {
-            term: 5,
-            leader_id: 2,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![],
-            leader_commit: 0,
-        };
-
-        let response = handle_append_entries(&req, state.clone()).await?;
-        assert!(response.success);
-
-        let final_state = state.lock().await;
-        assert_eq!(final_state.role, Role::Candidate);
-        assert_eq!(final_state.persistent.current_term, 5);
-        assert_eq!(final_state.leader_id, Some(2));
-        assert_eq!(final_state.persistent.voted_for, Some(1));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_append_entries_candidate_receives_same_term_should_become_follower()
+    async fn test_append_entries_candidate_receives_same_term_becomes_follower()
     -> anyhow::Result<()> {
         let mut candidate_state = RaftState::new(
             1,
