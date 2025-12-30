@@ -163,21 +163,21 @@ jobs:
             CAS_COUNT=$(echo "$CAS_STATS" | grep ":count" | grep -oP "\d+" || echo "0")
             CAS_OK=$(echo "$CAS_STATS" | grep ":ok-count" | grep -oP "\d+" || echo "0")
             CAS_FAIL=$(echo "$CAS_STATS" | grep ":fail-count" | grep -oP "\d+" || echo "0")
-            CAS_INFO=$(echo "$CAS_STATS" | grep ":info-count" | grep -oP "\d+" || echo "0")
+            CAS_INFO=$(echo "$CAS_STATS" | grep ":info-count" | grep -oP "\d+" || echo "-")
 
             # Read stats
             READ_STATS=$(echo "$BY_F" | grep -A 4 ":read {")
             READ_COUNT=$(echo "$READ_STATS" | grep ":count" | grep -oP "\d+" || echo "0")
             READ_OK=$(echo "$READ_STATS" | grep ":ok-count" | grep -oP "\d+" || echo "0")
             READ_FAIL=$(echo "$READ_STATS" | grep ":fail-count" | grep -oP "\d+" || echo "0")
-            READ_INFO=$(echo "$READ_STATS" | grep ":info-count" | grep -oP "\d+" || echo "0")
+            READ_INFO=$(echo "$READ_STATS" | grep ":info-count" | grep -oP "\d+" || echo "-")
 
             # Write stats
             WRITE_STATS=$(echo "$BY_F" | grep -A 4 ":write {")
             WRITE_COUNT=$(echo "$WRITE_STATS" | grep ":count" | grep -oP "\d+" || echo "0")
             WRITE_OK=$(echo "$WRITE_STATS" | grep ":ok-count" | grep -oP "\d+" || echo "0")
             WRITE_FAIL=$(echo "$WRITE_STATS" | grep ":fail-count" | grep -oP "\d+" || echo "0")
-            WRITE_INFO=$(echo "$WRITE_STATS" | grep ":info-count" | grep -oP "\d+" || echo "0")
+            WRITE_INFO=$(echo "$WRITE_STATS" | grep ":info-count" | grep -oP "\d+" || echo "-")
 
             echo "TOTAL_REQUESTS=$COUNT" >> $GITHUB_ENV
             echo "OK_REQUESTS=$OK_COUNT" >> $GITHUB_ENV
@@ -209,22 +209,22 @@ jobs:
             echo "CAS_COUNT=0" >> $GITHUB_ENV
             echo "CAS_OK=0" >> $GITHUB_ENV
             echo "CAS_FAIL=0" >> $GITHUB_ENV
-            echo "CAS_INFO=0" >> $GITHUB_ENV
+            echo "CAS_INFO=-" >> $GITHUB_ENV
             echo "READ_COUNT=0" >> $GITHUB_ENV
             echo "READ_OK=0" >> $GITHUB_ENV
             echo "READ_FAIL=0" >> $GITHUB_ENV
-            echo "READ_INFO=0" >> $GITHUB_ENV
+            echo "READ_INFO=-" >> $GITHUB_ENV
             echo "WRITE_COUNT=0" >> $GITHUB_ENV
             echo "WRITE_OK=0" >> $GITHUB_ENV
             echo "WRITE_FAIL=0" >> $GITHUB_ENV
-            echo "WRITE_INFO=0" >> $GITHUB_ENV
+            echo "WRITE_INFO=-" >> $GITHUB_ENV
           fi
       - name: Create test summary
         if: always()
         run: |
           mkdir -p test-summaries
           cat > test-summaries/${{ matrix.test-name }}.txt <<EOF
-          ${{ matrix.test-name }}|${{ env.TEST_STATUS }}|${{ matrix.workload }}|${{ env.AVAILABILITY }}%|${{ env.TOTAL_REQUESTS }}|${{ env.OK_REQUESTS }}|${{ env.FAIL_REQUESTS }}|${{ env.INFO_REQUESTS }}|${{ env.READ_COUNT }}|${{ env.READ_OK }}|${{ env.READ_FAIL }}|${{ env.WRITE_COUNT }}|${{ env.WRITE_OK }}|${{ env.WRITE_FAIL }}|${{ env.CAS_COUNT }}|${{ env.CAS_OK }}|${{ env.CAS_FAIL }}
+          ${{ matrix.test-name }}|${{ env.TEST_STATUS }}|${{ matrix.workload }}|${{ env.AVAILABILITY }}%|${{ env.TOTAL_REQUESTS }}|${{ env.OK_REQUESTS }}|${{ env.FAIL_REQUESTS }}|${{ env.INFO_REQUESTS }}|${{ env.READ_COUNT }}|${{ env.READ_OK }}|${{ env.READ_FAIL }}|${{ env.READ_INFO }}|${{ env.WRITE_COUNT }}|${{ env.WRITE_OK }}|${{ env.WRITE_FAIL }}|${{ env.WRITE_INFO }}|${{ env.CAS_COUNT }}|${{ env.CAS_OK }}|${{ env.CAS_FAIL }}|${{ env.CAS_INFO }}
           EOF
       - name: Upload test summary
         if: always()
@@ -269,7 +269,7 @@ jobs:
             if [ -d "$dir" ]; then
               for file in "$dir"/*.txt; do
                 if [ -f "$file" ]; then
-                  IFS='|' read -r TEST_NAME STATUS WORKLOAD AVAIL TOTAL OK FAIL INFO READ_CNT READ_OK READ_FAIL WRITE_CNT WRITE_OK WRITE_FAIL CAS_CNT CAS_OK CAS_FAIL < "$file"
+                  IFS='|' read -r TEST_NAME STATUS WORKLOAD AVAIL TOTAL OK FAIL INFO READ_CNT READ_OK READ_FAIL READ_INFO WRITE_CNT WRITE_OK WRITE_FAIL WRITE_INFO CAS_CNT CAS_OK CAS_FAIL CAS_INFO < "$file"
                   echo "| $TEST_NAME | $STATUS | $WORKLOAD | $AVAIL | $TOTAL | $OK | $FAIL | $INFO |" >> comment.md
                 fi
               done
@@ -287,15 +287,15 @@ jobs:
             if [ -d "$dir" ]; then
               for file in "$dir"/*.txt; do
                 if [ -f "$file" ]; then
-                  IFS='|' read -r TEST_NAME STATUS WORKLOAD AVAIL TOTAL OK FAIL INFO READ_CNT READ_OK READ_FAIL WRITE_CNT WRITE_OK WRITE_FAIL CAS_CNT CAS_OK CAS_FAIL < "$file"
+                  IFS='|' read -r TEST_NAME STATUS WORKLOAD AVAIL TOTAL OK FAIL INFO READ_CNT READ_OK READ_FAIL READ_INFO WRITE_CNT WRITE_OK WRITE_FAIL WRITE_INFO CAS_CNT CAS_OK CAS_FAIL CAS_INFO < "$file"
 
                   echo "### $TEST_NAME" >> comment.md
                   echo "" >> comment.md
                   echo "| Operation | Total | OK | Failed | Info |" >> comment.md
                   echo "|-----------|-------|----|----|------|" >> comment.md
-                  echo "| Read | $READ_CNT | $READ_OK | $READ_FAIL | 0 |" >> comment.md
-                  echo "| Write | $WRITE_CNT | $WRITE_OK | $WRITE_FAIL | 0 |" >> comment.md
-                  echo "| CAS | $CAS_CNT | $CAS_OK | $CAS_FAIL | 0 |" >> comment.md
+                  echo "| Read | $READ_CNT | $READ_OK | $READ_FAIL | $READ_INFO |" >> comment.md
+                  echo "| Write | $WRITE_CNT | $WRITE_OK | $WRITE_FAIL | $WRITE_INFO |" >> comment.md
+                  echo "| CAS | $CAS_CNT | $CAS_OK | $CAS_FAIL | $CAS_INFO |" >> comment.md
                   echo "" >> comment.md
                 fi
               done
