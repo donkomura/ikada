@@ -145,7 +145,7 @@ mod tests {
         Cas { key: String, from: i32, to: i32 },
     }
 
-    #[derive(Debug, Clone, serde::Serialize)]
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     enum KVResponse {
         Value(Option<i32>),
         Ok,
@@ -193,159 +193,220 @@ mod tests {
         }
     }
 
-    /// Regression test for linearizability violation bug:
-    /// Reading from a follower/stale node returns uncommitted or stale values
+    /// Test that followers reject read requests (linearizability protection)
     ///
-    /// Bug scenario from Maelstrom test (based on Raft Section 8 - Read-only operations):
-    /// 1. Node A is leader with commit_index=2, value=1
-    /// 2. Node B is follower with commit_index=1, value=0 (lagging behind)
-    /// 3. Client reads from Node B → gets stale value 0
-    /// 4. Client does CAS [0->2] on Node A → succeeds
+    /// Test scenario based on Raft Section 8 - Read-only operations:
+    /// 1. Create a leader node and a follower node
+    /// 2. Client sends read request to follower → should be rejected with "Not the leader"
+    /// 3. This prevents stale reads from followers
     ///
-    /// This violates linearizability because:
-    /// - The read saw value 0
-    /// - But a later CAS [0->2] succeeded, meaning value was still 0
-    /// - However, the value should have been 1 (already committed on leader)
-    ///
-    /// Root cause: Reads must go through leader with proper read index mechanism
+    /// This test verifies that the RPC handler correctly enforces:
+    /// - Followers reject client requests immediately
+    /// - Error message is "Not the leader"
+    /// - Leader hint is provided
     #[tokio::test]
-    #[should_panic(expected = "Stale read from follower")]
-    async fn test_stale_read_from_follower() {
-        // Simulate leader state
-        let mut leader_state = RaftState::new(
-            1,
+    async fn test_stale_read_from_follower() -> anyhow::Result<()> {
+        use crate::config::Config;
+        use crate::network::mock::MockNetworkFactory;
+        use crate::node::{Command, Node};
+        use crate::rpc::CommandRequest;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+        use tokio::sync::{Mutex, mpsc};
+
+        let _follower_addr: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10002);
+
+        let follower_state = Arc::new(Mutex::new(RaftState::new(
+            10002,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
-        );
-        leader_state.persistent.current_term = 1;
-        leader_state.role = Role::Leader;
-
-        // Leader commits and applies value 1
-        leader_state.persistent.log.push(Entry {
-            term: 1,
-            command: KVCommand::Put {
-                key: "test_key".to_string(),
-                value: 1,
-            },
-        });
-        leader_state.commit_index = 1;
-        leader_state.apply_committed().await.unwrap();
-
-        // Simulate follower state (lagging behind)
-        let mut follower_state = RaftState::new(
-            2,
-            Box::new(MemStorage::default()),
-            KVStateMachine::default(),
-        );
-        follower_state.persistent.current_term = 1;
-        follower_state.role = Role::Follower;
-
-        // Follower has old value 0 (hasn't received AppendEntries yet)
-        follower_state.persistent.log.push(Entry {
-            term: 1,
-            command: KVCommand::Put {
-                key: "test_key".to_string(),
-                value: 0,
-            },
-        });
-        follower_state.commit_index = 1;
-        follower_state.apply_committed().await.unwrap();
-
-        // BUG: Client reads from follower instead of leader
-        let read_result = follower_state
-            .sm
-            .apply(&KVCommand::Get {
-                key: "test_key".to_string(),
-            })
-            .await
-            .unwrap();
-
-        // This returns 0 (stale value) instead of 1 (committed value on leader)
-        if matches!(read_result, KVResponse::Value(Some(0))) {
-            panic!(
-                "Stale read from follower: got 0 but leader has committed 1"
-            );
+        )));
+        {
+            let mut state = follower_state.lock().await;
+            state.persistent.current_term = 1;
+            state.role = Role::Follower;
+            state.leader_id = Some(10001);
         }
+
+        let follower_network_factory = MockNetworkFactory::new();
+        let follower_node = Node::new_with_state(
+            Config::default(),
+            follower_state.clone(),
+            follower_network_factory,
+        );
+
+        let (follower_cmd_tx, follower_cmd_rx) = mpsc::channel::<Command>(32);
+
+        let follower_handle = tokio::spawn(async move {
+            follower_node
+                .run_with_handler(vec![], follower_cmd_rx)
+                .await
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let get_command = CommandRequest {
+            command: bincode::serialize(&KVCommand::Get {
+                key: "test_key".to_string(),
+            })?,
+        };
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        follower_cmd_tx
+            .send(Command::ClientRequest(get_command.clone(), resp_tx))
+            .await?;
+
+        let follower_response = resp_rx.await?;
+        assert!(!follower_response.success, "Follower should reject reads");
+        assert_eq!(
+            follower_response.error.as_deref(),
+            Some("Not the leader"),
+            "Follower should return 'Not the leader' error"
+        );
+        assert_eq!(
+            follower_response.leader_hint,
+            Some(10001),
+            "Follower should hint the leader"
+        );
+
+        follower_handle.abort();
+
+        Ok(())
     }
 
-    /// Regression test: Stale read from old leader after network partition recovery
+    /// Test that old leaders step down when they learn about higher terms
     ///
-    /// Bug scenario from Maelstrom test case 12 (network partition recovery):
-    /// 1. Network partition occurs, creating two separate groups
-    /// 2. Old leader (term 1) in minority partition commits value 2
-    /// 3. New leader (term 2) in majority partition commits value 0
-    /// 4. Partition heals, but old leader hasn't stepped down yet
-    /// 5. Client reads from old leader → gets stale value 2
-    /// 6. But the current committed value is 0 from new leader
+    /// Test scenario based on Raft Section 8 and network partition recovery:
+    /// 1. Node 1 is the old leader (term 1)
+    /// 2. Node 2 becomes the new leader (term 2) after partition
+    /// 3. When partition heals, Node 1 receives AppendEntries with higher term
+    /// 4. Node 1 steps down to follower role
+    /// 5. Subsequent client requests to Node 1 are rejected
     ///
-    /// This violates linearizability because:
-    /// - Process 89 writes 0 (success on new leader, term 2)
-    /// - Process 2 reads and gets 2 (from old leader, term 1)
-    /// - This is impossible: can't read 2 when register contains 0
-    ///
-    /// Root cause: Old leader serves reads without confirming leadership via heartbeat
-    /// Fix required: Raft Section 8 - leader must send heartbeat to majority before serving reads
+    /// This test verifies that:
+    /// - Old leaders detect higher terms via AppendEntries RPC
+    /// - Old leaders step down to follower immediately
+    /// - Old leaders reject client requests after stepping down
+    /// - This prevents stale reads from old leaders
     #[tokio::test]
-    #[should_panic(expected = "Stale read from old leader after partition")]
-    async fn test_stale_read_after_partition_recovery() {
-        // Simulate OLD leader (term 1) that was isolated during partition
-        let mut old_leader_state = RaftState::new(
-            1,
+    async fn test_stale_read_after_partition_recovery() -> anyhow::Result<()> {
+        use crate::config::Config;
+        use crate::network::mock::MockNetworkFactory;
+        use crate::node::{Command, Node};
+        use crate::rpc::{AppendEntriesRequest, CommandRequest};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+        use tokio::sync::{Mutex, mpsc};
+
+        let _old_leader_addr: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10011);
+        let new_leader_addr: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10012);
+
+        let old_leader_state = Arc::new(Mutex::new(RaftState::new(
+            10011,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
-        );
-        old_leader_state.persistent.current_term = 1;
-        old_leader_state.role = Role::Leader;
+        )));
+        {
+            let mut state = old_leader_state.lock().await;
+            state.persistent.current_term = 1;
+            state.role = Role::Leader;
+            state.persistent.log.push(Entry {
+                term: 1,
+                command: KVCommand::Put {
+                    key: "test_key".to_string(),
+                    value: 2,
+                },
+            });
+            state.commit_index = 1;
+            state.apply_committed().await?;
+        }
 
-        // Old leader commits and applies value 2 during partition
-        old_leader_state.persistent.log.push(Entry {
-            term: 1,
-            command: KVCommand::Put {
-                key: "test_key".to_string(),
-                value: 2,
-            },
+        let network_factory = MockNetworkFactory::new();
+        let old_leader_node = Node::new_with_state(
+            Config::default(),
+            old_leader_state.clone(),
+            network_factory,
+        );
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
+        let node_handle = tokio::spawn(async move {
+            old_leader_node
+                .run_with_handler(vec![new_leader_addr], cmd_rx)
+                .await
         });
-        old_leader_state.commit_index = 1;
-        old_leader_state.apply_committed().await.unwrap();
 
-        // Simulate NEW leader (term 2) that took over during partition
-        let mut new_leader_state = RaftState::new(
-            2,
-            Box::new(MemStorage::default()),
-            KVStateMachine::default(),
-        );
-        new_leader_state.persistent.current_term = 2;
-        new_leader_state.role = Role::Leader;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // New leader commits and applies value 0 (the current correct value)
-        new_leader_state.persistent.log.push(Entry {
+        let append_entries_from_new_leader = AppendEntriesRequest {
             term: 2,
-            command: KVCommand::Put {
-                key: "test_key".to_string(),
-                value: 0,
-            },
-        });
-        new_leader_state.commit_index = 1;
-        new_leader_state.apply_committed().await.unwrap();
+            leader_id: 10012,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
 
-        // BUG: After partition recovery, old leader hasn't learned about new term
-        // Client reads from old leader (thinking it's still valid)
-        let read_result = old_leader_state
-            .sm
-            .apply(&KVCommand::Get {
-                key: "test_key".to_string(),
-            })
-            .await
-            .unwrap();
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(Command::AppendEntries(
+                append_entries_from_new_leader,
+                resp_tx,
+            ))
+            .await?;
 
-        // This returns 2 (stale value from old leader)
-        // But new leader has committed value 0
-        // This violates linearizability: "can't read 2 from register 0"
-        if matches!(read_result, KVResponse::Value(Some(2))) {
-            panic!(
-                "Stale read from old leader after partition: got 2 but new leader has committed 0"
+        let ae_response = resp_rx.await?;
+        assert!(
+            ae_response.success,
+            "Old leader should accept AppendEntries from new leader"
+        );
+        assert_eq!(
+            ae_response.term, 2,
+            "Old leader should update its term to 2"
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        {
+            let state = old_leader_state.lock().await;
+            assert_eq!(
+                state.role,
+                Role::Follower,
+                "Old leader should have stepped down to follower"
+            );
+            assert_eq!(
+                state.persistent.current_term, 2,
+                "Old leader should have updated term"
             );
         }
+
+        let get_command = CommandRequest {
+            command: bincode::serialize(&KVCommand::Get {
+                key: "test_key".to_string(),
+            })?,
+        };
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(Command::ClientRequest(get_command, resp_tx))
+            .await?;
+
+        let response = resp_rx.await?;
+        assert!(
+            !response.success,
+            "Old leader (now follower) should reject client requests"
+        );
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Not the leader"),
+            "Should return 'Not the leader' error"
+        );
+
+        node_handle.abort();
+
+        Ok(())
     }
 
     /// Regression test: Linearizable reads must go through leader with read index
