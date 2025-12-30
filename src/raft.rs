@@ -240,8 +240,6 @@ mod tests {
                 .await
         });
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
         let get_command = CommandRequest {
             command: bincode::serialize(&KVCommand::Get {
                 key: "test_key".to_string(),
@@ -332,8 +330,6 @@ mod tests {
                 .await
         });
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
         let append_entries_from_new_leader = AppendEntriesRequest {
             term: 2,
             leader_id: 10012,
@@ -360,8 +356,6 @@ mod tests {
             ae_response.term, 2,
             "Old leader should update its term to 2"
         );
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         {
             let state = old_leader_state.lock().await;
