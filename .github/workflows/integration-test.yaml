@@ -56,20 +56,20 @@ jobs:
             nemesis-interval: ""
           - test-name: "3nodes-partition"
             workload: "lin-kv"
-            time-limit: 60
-            rate: 10
+            time-limit: 30
+            rate: 20
             node-count: 3
             concurrency: "2n"
             nemesis: "partition"
-            nemesis-interval: "5"
+            nemesis-interval: "3"
           - test-name: "5nodes-partition"
             workload: "lin-kv"
-            time-limit: 60
-            rate: 10
+            time-limit: 30
+            rate: 20
             node-count: 5
             concurrency: "2n"
             nemesis: "partition"
-            nemesis-interval: "5"
+            nemesis-interval: "3"
     steps:
       - uses: actions/checkout@v4
       - name: Install Java
@@ -132,6 +132,107 @@ jobs:
             --concurrency "$CONCURRENCY" \
             $NEMESIS_FLAG \
             $NEMESIS_INTERVAL_FLAG
+      - name: Extract test statistics
+        if: always()
+        run: |
+          RESULTS_FILE="store/latest/results.edn"
+          if [ -f "$RESULTS_FILE" ]; then
+            # Extract test status
+            if grep -q ":valid? true" "$RESULTS_FILE"; then
+              echo "TEST_STATUS=✅ Success" >> $GITHUB_ENV
+            else
+              echo "TEST_STATUS=❌ Failed" >> $GITHUB_ENV
+            fi
+
+            # Extract overall statistics
+            STATS=$(grep -A 10 ":stats {" "$RESULTS_FILE" | head -11)
+            COUNT=$(echo "$STATS" | grep ":count" | head -1 | grep -oP "\d+" || echo "0")
+            OK_COUNT=$(echo "$STATS" | grep ":ok-count" | head -1 | grep -oP "\d+" || echo "0")
+            FAIL_COUNT=$(echo "$STATS" | grep ":fail-count" | head -1 | grep -oP "\d+" || echo "0")
+            INFO_COUNT=$(echo "$STATS" | grep ":info-count" | head -1 | grep -oP "\d+" || echo "0")
+
+            # Extract availability
+            AVAILABILITY=$(grep ":ok-fraction" "$RESULTS_FILE" | grep -oP "[\d.]+" | head -1 || echo "0")
+            AVAILABILITY_PCT=$(echo "$AVAILABILITY * 100" | bc -l | xargs printf "%.2f")
+
+            # Extract operation-level statistics
+            BY_F=$(grep -A 20 ":by-f {" "$RESULTS_FILE")
+
+            # CAS stats
+            CAS_STATS=$(echo "$BY_F" | grep -A 4 ":cas {")
+            CAS_COUNT=$(echo "$CAS_STATS" | grep ":count" | grep -oP "\d+" || echo "0")
+            CAS_OK=$(echo "$CAS_STATS" | grep ":ok-count" | grep -oP "\d+" || echo "0")
+            CAS_FAIL=$(echo "$CAS_STATS" | grep ":fail-count" | grep -oP "\d+" || echo "0")
+            CAS_INFO=$(echo "$CAS_STATS" | grep ":info-count" | grep -oP "\d+" || echo "-")
+
+            # Read stats
+            READ_STATS=$(echo "$BY_F" | grep -A 4 ":read {")
+            READ_COUNT=$(echo "$READ_STATS" | grep ":count" | grep -oP "\d+" || echo "0")
+            READ_OK=$(echo "$READ_STATS" | grep ":ok-count" | grep -oP "\d+" || echo "0")
+            READ_FAIL=$(echo "$READ_STATS" | grep ":fail-count" | grep -oP "\d+" || echo "0")
+            READ_INFO=$(echo "$READ_STATS" | grep ":info-count" | grep -oP "\d+" || echo "-")
+
+            # Write stats
+            WRITE_STATS=$(echo "$BY_F" | grep -A 4 ":write {")
+            WRITE_COUNT=$(echo "$WRITE_STATS" | grep ":count" | grep -oP "\d+" || echo "0")
+            WRITE_OK=$(echo "$WRITE_STATS" | grep ":ok-count" | grep -oP "\d+" || echo "0")
+            WRITE_FAIL=$(echo "$WRITE_STATS" | grep ":fail-count" | grep -oP "\d+" || echo "0")
+            WRITE_INFO=$(echo "$WRITE_STATS" | grep ":info-count" | grep -oP "\d+" || echo "-")
+
+            echo "TOTAL_REQUESTS=$COUNT" >> $GITHUB_ENV
+            echo "OK_REQUESTS=$OK_COUNT" >> $GITHUB_ENV
+            echo "FAIL_REQUESTS=$FAIL_COUNT" >> $GITHUB_ENV
+            echo "INFO_REQUESTS=$INFO_COUNT" >> $GITHUB_ENV
+            echo "AVAILABILITY=$AVAILABILITY_PCT" >> $GITHUB_ENV
+
+            echo "CAS_COUNT=$CAS_COUNT" >> $GITHUB_ENV
+            echo "CAS_OK=$CAS_OK" >> $GITHUB_ENV
+            echo "CAS_FAIL=$CAS_FAIL" >> $GITHUB_ENV
+            echo "CAS_INFO=$CAS_INFO" >> $GITHUB_ENV
+
+            echo "READ_COUNT=$READ_COUNT" >> $GITHUB_ENV
+            echo "READ_OK=$READ_OK" >> $GITHUB_ENV
+            echo "READ_FAIL=$READ_FAIL" >> $GITHUB_ENV
+            echo "READ_INFO=$READ_INFO" >> $GITHUB_ENV
+
+            echo "WRITE_COUNT=$WRITE_COUNT" >> $GITHUB_ENV
+            echo "WRITE_OK=$WRITE_OK" >> $GITHUB_ENV
+            echo "WRITE_FAIL=$WRITE_FAIL" >> $GITHUB_ENV
+            echo "WRITE_INFO=$WRITE_INFO" >> $GITHUB_ENV
+          else
+            echo "TEST_STATUS=❌ No results" >> $GITHUB_ENV
+            echo "TOTAL_REQUESTS=0" >> $GITHUB_ENV
+            echo "OK_REQUESTS=0" >> $GITHUB_ENV
+            echo "FAIL_REQUESTS=0" >> $GITHUB_ENV
+            echo "INFO_REQUESTS=0" >> $GITHUB_ENV
+            echo "AVAILABILITY=0" >> $GITHUB_ENV
+            echo "CAS_COUNT=0" >> $GITHUB_ENV
+            echo "CAS_OK=0" >> $GITHUB_ENV
+            echo "CAS_FAIL=0" >> $GITHUB_ENV
+            echo "CAS_INFO=-" >> $GITHUB_ENV
+            echo "READ_COUNT=0" >> $GITHUB_ENV
+            echo "READ_OK=0" >> $GITHUB_ENV
+            echo "READ_FAIL=0" >> $GITHUB_ENV
+            echo "READ_INFO=-" >> $GITHUB_ENV
+            echo "WRITE_COUNT=0" >> $GITHUB_ENV
+            echo "WRITE_OK=0" >> $GITHUB_ENV
+            echo "WRITE_FAIL=0" >> $GITHUB_ENV
+            echo "WRITE_INFO=-" >> $GITHUB_ENV
+          fi
+      - name: Create test summary
+        if: always()
+        run: |
+          mkdir -p test-summaries
+          cat > test-summaries/${{ matrix.test-name }}.txt <<EOF
+          ${{ matrix.test-name }}|${{ env.TEST_STATUS }}|${{ matrix.workload }}|${{ env.AVAILABILITY }}%|${{ env.TOTAL_REQUESTS }}|${{ env.OK_REQUESTS }}|${{ env.FAIL_REQUESTS }}|${{ env.INFO_REQUESTS }}|${{ env.READ_COUNT }}|${{ env.READ_OK }}|${{ env.READ_FAIL }}|${{ env.READ_INFO }}|${{ env.WRITE_COUNT }}|${{ env.WRITE_OK }}|${{ env.WRITE_FAIL }}|${{ env.WRITE_INFO }}|${{ env.CAS_COUNT }}|${{ env.CAS_OK }}|${{ env.CAS_FAIL }}|${{ env.CAS_INFO }}
+          EOF
+      - name: Upload test summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-summary-${{ matrix.test-name }}
+          path: test-summaries/
+          retention-days: 7
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -139,3 +240,117 @@ jobs:
           name: maelstrom-results-${{ matrix.test-name }}
           path: store/
           retention-days: 7
+  comment:
+    name: Post test results to PR
+    runs-on: ubuntu-latest
+    needs: maelstrom
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download all test summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test-summary-*
+          path: summaries/
+      - name: Create PR comment
+        run: |
+          echo "# 🧪 Integration Test Results" > comment.md
+          echo "" >> comment.md
+          echo "Commit: \`${{ github.sha }}\`" >> comment.md
+          echo "" >> comment.md
+
+          # Table header
+          echo "| Test Name | Status | Workload | Availability | Total | OK | Failed | Info |" >> comment.md
+          echo "|-----------|--------|----------|--------------|-------|----|----|------|" >> comment.md
+
+          # Collect all test summaries for main table
+          for dir in summaries/test-summary-*; do
+            if [ -d "$dir" ]; then
+              for file in "$dir"/*.txt; do
+                if [ -f "$file" ]; then
+                  IFS='|' read -r TEST_NAME STATUS WORKLOAD AVAIL TOTAL OK FAIL INFO READ_CNT READ_OK READ_FAIL READ_INFO WRITE_CNT WRITE_OK WRITE_FAIL WRITE_INFO CAS_CNT CAS_OK CAS_FAIL CAS_INFO < "$file"
+                  echo "| $TEST_NAME | $STATUS | $WORKLOAD | $AVAIL | $TOTAL | $OK | $FAIL | $INFO |" >> comment.md
+                fi
+              done
+            fi
+          done
+
+          echo "" >> comment.md
+
+          # Single collapsible section with all operation details
+          echo "<details>" >> comment.md
+          echo "<summary>📊 Operation Details</summary>" >> comment.md
+          echo "" >> comment.md
+
+          for dir in summaries/test-summary-*; do
+            if [ -d "$dir" ]; then
+              for file in "$dir"/*.txt; do
+                if [ -f "$file" ]; then
+                  IFS='|' read -r TEST_NAME STATUS WORKLOAD AVAIL TOTAL OK FAIL INFO READ_CNT READ_OK READ_FAIL READ_INFO WRITE_CNT WRITE_OK WRITE_FAIL WRITE_INFO CAS_CNT CAS_OK CAS_FAIL CAS_INFO < "$file"
+
+                  echo "### $TEST_NAME" >> comment.md
+                  echo "" >> comment.md
+                  echo "| Operation | Total | OK | Failed | Info |" >> comment.md
+                  echo "|-----------|-------|----|----|------|" >> comment.md
+                  echo "| Read | $READ_CNT | $READ_OK | $READ_FAIL | $READ_INFO |" >> comment.md
+                  echo "| Write | $WRITE_CNT | $WRITE_OK | $WRITE_FAIL | $WRITE_INFO |" >> comment.md
+                  echo "| CAS | $CAS_CNT | $CAS_OK | $CAS_FAIL | $CAS_INFO |" >> comment.md
+                  echo "" >> comment.md
+                fi
+              done
+            fi
+          done
+
+          echo "</details>" >> comment.md
+          echo "" >> comment.md
+          echo "---" >> comment.md
+          echo "*Generated by Integration Test workflow*" >> comment.md
+      - name: Post comment to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('comment.md', 'utf8');
+
+            // Find all existing Integration Test Results comments
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComments = comments.filter(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('🧪 Integration Test Results')
+            );
+
+            // Hide all old comments using GraphQL API
+            if (botComments.length > 0) {
+              for (const oldComment of botComments) {
+                try {
+                  await github.graphql(`
+                    mutation {
+                      minimizeComment(input: {
+                        subjectId: "${oldComment.node_id}",
+                        classifier: OUTDATED
+                      }) {
+                        minimizedComment {
+                          isMinimized
+                        }
+                      }
+                    }
+                  `);
+                } catch (error) {
+                  console.log(`Failed to minimize comment ${oldComment.id}: ${error.message}`);
+                }
+              }
+            }
+
+            // Create new comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
