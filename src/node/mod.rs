@@ -112,9 +112,14 @@ where
 
         let manager_clone = Arc::clone(&client_manager);
         tokio::spawn(async move {
-            let manager_owned =
-                std::mem::take(&mut *manager_clone.lock().await);
-            manager_owned.run(apply_event_rx).await;
+            let mut rx: mpsc::UnboundedReceiver<AppliedEntry<SM::Response>> =
+                apply_event_rx;
+            while let Some(event) = rx.recv().await {
+                manager_clone
+                    .lock()
+                    .await
+                    .resolve(event.log_index, event.response);
+            }
         });
 
         let mut raft_state = RaftState::new(id, storage, sm);
@@ -144,9 +149,14 @@ where
 
         let manager_clone = Arc::clone(&client_manager);
         tokio::spawn(async move {
-            let manager_owned =
-                std::mem::take(&mut *manager_clone.lock().await);
-            manager_owned.run(apply_event_rx).await;
+            let mut rx: mpsc::UnboundedReceiver<AppliedEntry<SM::Response>> =
+                apply_event_rx;
+            while let Some(event) = rx.recv().await {
+                manager_clone
+                    .lock()
+                    .await
+                    .resolve(event.log_index, event.response);
+            }
         });
 
         tokio::spawn({
