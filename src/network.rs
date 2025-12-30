@@ -12,17 +12,11 @@ pub trait NetworkFactory: Send + Sync {
         addr: SocketAddr,
     ) -> Result<Arc<dyn RaftRpcTrait>, NetworkError>;
 
-    async fn partition(&self, _from: SocketAddr, _to: SocketAddr) {
-        // Default implementation: no-op for production use
-    }
+    async fn partition(&self, _from: SocketAddr, _to: SocketAddr) {}
 
-    async fn heal(&self, _from: SocketAddr, _to: SocketAddr) {
-        // Default implementation: no-op for production use
-    }
+    async fn heal(&self, _from: SocketAddr, _to: SocketAddr) {}
 
-    async fn heal_all(&self) {
-        // Default implementation: no-op for production use
-    }
+    async fn heal_all(&self) {}
 }
 
 #[derive(Debug, thiserror::Error)]
