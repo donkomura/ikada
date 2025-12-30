@@ -197,7 +197,7 @@ mod tests {
     ///
     /// Test scenario based on Raft Section 8 - Read-only operations:
     /// 1. Create a leader node and a follower node
-    /// 2. Client sends read request to follower → should be rejected with "Not the leader"
+    /// 2. Client sends read request to follower: should be rejected with "Not the leader"
     /// 3. This prevents stale reads from followers
     ///
     /// This test verifies that the RPC handler correctly enforces:
@@ -210,12 +210,8 @@ mod tests {
         use crate::network::mock::MockNetworkFactory;
         use crate::node::{Command, Node};
         use crate::rpc::CommandRequest;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         use std::sync::Arc;
         use tokio::sync::{Mutex, mpsc};
-
-        let _follower_addr: SocketAddr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10002);
 
         let follower_state = Arc::new(Mutex::new(RaftState::new(
             10002,
@@ -299,8 +295,6 @@ mod tests {
         use std::sync::Arc;
         use tokio::sync::{Mutex, mpsc};
 
-        let _old_leader_addr: SocketAddr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10011);
         let new_leader_addr: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10012);
 
