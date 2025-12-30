@@ -56,20 +56,20 @@ jobs:
             nemesis-interval: ""
           - test-name: "3nodes-partition"
             workload: "lin-kv"
-            time-limit: 60
-            rate: 10
+            time-limit: 30
+            rate: 20
             node-count: 3
             concurrency: "2n"
             nemesis: "partition"
-            nemesis-interval: "5"
+            nemesis-interval: "3"
           - test-name: "5nodes-partition"
             workload: "lin-kv"
-            time-limit: 60
-            rate: 10
+            time-limit: 30
+            rate: 20
             node-count: 5
             concurrency: "2n"
             nemesis: "partition"
-            nemesis-interval: "5"
+            nemesis-interval: "3"
     steps:
       - uses: actions/checkout@v4
       - name: Install Java
@@ -132,6 +132,58 @@ jobs:
             --concurrency "$CONCURRENCY" \
             $NEMESIS_FLAG \
             $NEMESIS_INTERVAL_FLAG
+      - name: Extract test statistics
+        if: always()
+        run: |
+          RESULTS_FILE="store/latest/results.edn"
+          if [ -f "$RESULTS_FILE" ]; then
+            # Extract test status
+            if grep -q ":valid? true" "$RESULTS_FILE"; then
+              echo "TEST_STATUS=✅ Success" >> $GITHUB_ENV
+            else
+              echo "TEST_STATUS=❌ Failed" >> $GITHUB_ENV
+            fi
+
+            # Extract statistics
+            STATS=$(grep -A 10 ":stats {" "$RESULTS_FILE" | head -11)
+
+            # Extract count, ok-count, fail-count, info-count
+            COUNT=$(echo "$STATS" | grep ":count" | head -1 | grep -oP "\d+" || echo "0")
+            OK_COUNT=$(echo "$STATS" | grep ":ok-count" | head -1 | grep -oP "\d+" || echo "0")
+            FAIL_COUNT=$(echo "$STATS" | grep ":fail-count" | head -1 | grep -oP "\d+" || echo "0")
+            INFO_COUNT=$(echo "$STATS" | grep ":info-count" | head -1 | grep -oP "\d+" || echo "0")
+
+            # Extract availability
+            AVAILABILITY=$(grep ":ok-fraction" "$RESULTS_FILE" | grep -oP "[\d.]+" | head -1 || echo "0")
+            AVAILABILITY_PCT=$(echo "$AVAILABILITY * 100" | bc -l | xargs printf "%.2f")
+
+            echo "TOTAL_REQUESTS=$COUNT" >> $GITHUB_ENV
+            echo "OK_REQUESTS=$OK_COUNT" >> $GITHUB_ENV
+            echo "FAIL_REQUESTS=$FAIL_COUNT" >> $GITHUB_ENV
+            echo "INFO_REQUESTS=$INFO_COUNT" >> $GITHUB_ENV
+            echo "AVAILABILITY=$AVAILABILITY_PCT" >> $GITHUB_ENV
+          else
+            echo "TEST_STATUS=❌ No results" >> $GITHUB_ENV
+            echo "TOTAL_REQUESTS=0" >> $GITHUB_ENV
+            echo "OK_REQUESTS=0" >> $GITHUB_ENV
+            echo "FAIL_REQUESTS=0" >> $GITHUB_ENV
+            echo "INFO_REQUESTS=0" >> $GITHUB_ENV
+            echo "AVAILABILITY=0" >> $GITHUB_ENV
+          fi
+      - name: Create test summary
+        if: always()
+        run: |
+          mkdir -p test-summaries
+          cat > test-summaries/${{ matrix.test-name }}.txt <<EOF
+          ${{ matrix.test-name }}|${{ env.TEST_STATUS }}|${{ matrix.workload }}|${{ env.AVAILABILITY }}%|${{ env.TOTAL_REQUESTS }}|${{ env.OK_REQUESTS }}|${{ env.FAIL_REQUESTS }}|${{ env.INFO_REQUESTS }}
+          EOF
+      - name: Upload test summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-summary-${{ matrix.test-name }}
+          path: test-summaries/
+          retention-days: 7
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -139,3 +191,79 @@ jobs:
           name: maelstrom-results-${{ matrix.test-name }}
           path: store/
           retention-days: 7
+  comment:
+    name: Post test results to PR
+    runs-on: ubuntu-latest
+    needs: maelstrom
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download all test summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test-summary-*
+          path: summaries/
+      - name: Create PR comment
+        run: |
+          echo "# 🧪 Integration Test Results" > comment.md
+          echo "" >> comment.md
+          echo "Commit: \`${{ github.sha }}\`" >> comment.md
+          echo "" >> comment.md
+
+          # Table header
+          echo "| Test Name | Status | Workload | Availability | Total | OK | Failed | Info |" >> comment.md
+          echo "|-----------|--------|----------|--------------|-------|----|----|------|" >> comment.md
+
+          # Combine all test summaries
+          for dir in summaries/test-summary-*; do
+            if [ -d "$dir" ]; then
+              for file in "$dir"/*.txt; do
+                if [ -f "$file" ]; then
+                  # Read the line and convert | to table format
+                  line=$(cat "$file")
+                  echo "| $line |" | sed 's/|/ | /g' >> comment.md
+                fi
+              done
+            fi
+          done
+
+          echo "" >> comment.md
+          echo "---" >> comment.md
+          echo "*Generated by Integration Test workflow*" >> comment.md
+      - name: Post comment to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('comment.md', 'utf8');
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('🧪 Integration Test Results')
+            );
+
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
