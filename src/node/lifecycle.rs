@@ -82,6 +82,11 @@ where
     pub async fn run_candidate(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.election_timeout;
         let watchdog = WatchDog::default();
+
+        // Start first election immediately
+        self.start_election().await?;
+        watchdog.reset(timeout).await;
+
         loop {
             if !matches!(self.state.lock().await.role, Role::Candidate) {
                 break;

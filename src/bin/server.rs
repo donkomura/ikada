@@ -5,6 +5,7 @@ use ikada::network::TarpcNetworkFactory;
 use ikada::node::Node;
 use ikada::statemachine::KVStateMachine;
 use ikada::trace::init_tracing;
+use rand::Rng;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,26 +17,61 @@ async fn main() -> anyhow::Result<()> {
         SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port + 1)),
         SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port + 2)),
     ];
+
     let network_factory = TarpcNetworkFactory::new();
+
+    let config1 = {
+        let base_ms = 300;
+        let max_ms = 600;
+        let timeout_ms = rand::rng().random_range(base_ms..=max_ms);
+        Config {
+            heartbeat_interval: tokio::time::Duration::from_millis(10),
+            election_timeout: tokio::time::Duration::from_millis(timeout_ms),
+            rpc_timeout: std::time::Duration::from_millis(100),
+            heartbeat_failure_retry_limit: 5,
+        }
+    };
     let mut node1 = Node::new(
         port,
-        Config::default(),
+        config1,
         KVStateMachine::default(),
         network_factory.clone(),
     );
     node1.restore().await?;
 
+    let config2 = {
+        let base_ms = 300;
+        let max_ms = 600;
+        let timeout_ms = rand::rng().random_range(base_ms..=max_ms);
+        Config {
+            heartbeat_interval: tokio::time::Duration::from_millis(10),
+            election_timeout: tokio::time::Duration::from_millis(timeout_ms),
+            rpc_timeout: std::time::Duration::from_millis(100),
+            heartbeat_failure_retry_limit: 5,
+        }
+    };
     let mut node2 = Node::new(
         port + 1,
-        Config::default(),
+        config2,
         KVStateMachine::default(),
         network_factory.clone(),
     );
     node2.restore().await?;
 
+    let config3 = {
+        let base_ms = 300;
+        let max_ms = 600;
+        let timeout_ms = rand::rng().random_range(base_ms..=max_ms);
+        Config {
+            heartbeat_interval: tokio::time::Duration::from_millis(10),
+            election_timeout: tokio::time::Duration::from_millis(timeout_ms),
+            rpc_timeout: std::time::Duration::from_millis(100),
+            heartbeat_failure_retry_limit: 5,
+        }
+    };
     let mut node3 = Node::new(
         port + 2,
-        Config::default(),
+        config3,
         KVStateMachine::default(),
         network_factory.clone(),
     );
