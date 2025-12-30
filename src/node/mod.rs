@@ -10,9 +10,10 @@ pub mod handlers;
 mod lifecycle;
 mod replication;
 
+use crate::client_manager::ClientResponseManager;
 use crate::config::Config;
 use crate::network::NetworkFactory;
-use crate::raft::RaftState;
+use crate::raft::{AppliedEntry, RaftState};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::collections::HashMap;
@@ -82,6 +83,9 @@ pub struct Node<
     pub c: Chan<T>,
     pub network_factory: NF,
     heartbeat_failure_count: usize,
+    pub client_manager: Arc<Mutex<ClientResponseManager<SM::Response>>>,
+    #[allow(dead_code)]
+    apply_event_tx: mpsc::UnboundedSender<AppliedEntry<SM::Response>>,
 }
 
 impl<T, SM, NF> Node<T, SM, NF>
@@ -103,13 +107,33 @@ where
         let storage = Box::new(MemStorage::default());
         let id = port as u32;
 
+        let (apply_event_tx, apply_event_rx) = mpsc::unbounded_channel();
+        let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
+
+        let manager_clone = Arc::clone(&client_manager);
+        tokio::spawn(async move {
+            let mut rx: mpsc::UnboundedReceiver<AppliedEntry<SM::Response>> =
+                apply_event_rx;
+            while let Some(event) = rx.recv().await {
+                manager_clone
+                    .lock()
+                    .await
+                    .resolve(event.log_index, event.response);
+            }
+        });
+
+        let mut raft_state = RaftState::new(id, storage, sm);
+        raft_state.set_apply_notifier(apply_event_tx.clone());
+
         Node {
             config,
             peers: HashMap::default(),
-            state: Arc::new(Mutex::new(RaftState::new(id, storage, sm))),
+            state: Arc::new(Mutex::new(raft_state)),
             c: Chan::new(),
             network_factory,
             heartbeat_failure_count: 0,
+            client_manager,
+            apply_event_tx,
         }
     }
 
@@ -120,6 +144,30 @@ where
         state: Arc<Mutex<RaftState<T, SM>>>,
         network_factory: NF,
     ) -> Self {
+        let (apply_event_tx, apply_event_rx) = mpsc::unbounded_channel();
+        let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
+
+        let manager_clone = Arc::clone(&client_manager);
+        tokio::spawn(async move {
+            let mut rx: mpsc::UnboundedReceiver<AppliedEntry<SM::Response>> =
+                apply_event_rx;
+            while let Some(event) = rx.recv().await {
+                manager_clone
+                    .lock()
+                    .await
+                    .resolve(event.log_index, event.response);
+            }
+        });
+
+        tokio::spawn({
+            let state_clone = Arc::clone(&state);
+            let apply_event_tx_clone = apply_event_tx.clone();
+            async move {
+                let mut state = state_clone.lock().await;
+                state.set_apply_notifier(apply_event_tx_clone);
+            }
+        });
+
         Node {
             config,
             peers: HashMap::default(),
@@ -127,6 +175,8 @@ where
             c: Chan::new(),
             network_factory,
             heartbeat_failure_count: 0,
+            client_manager,
+            apply_event_tx,
         }
     }
 
@@ -195,12 +245,14 @@ where
         let state = Arc::clone(&self.state);
         let heartbeat_tx = self.c.heartbeat_tx.clone();
         let client_request_tx = self.c.client_request_tx.clone();
+        let client_manager = Arc::clone(&self.client_manager);
 
         tokio::spawn(Self::rpc_handler(
             state,
             cmd_rx,
             heartbeat_tx,
             client_request_tx,
+            client_manager,
         ));
 
         self.main(vec![]).await
@@ -216,16 +268,18 @@ where
             CommandRequest,
             oneshot::Sender<CommandResponse>,
         )>,
+        client_manager: Arc<Mutex<ClientResponseManager<SM::Response>>>,
     ) -> anyhow::Result<()> {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 Command::AppendEntries(req, resp_tx) => {
                     let state_clone = Arc::clone(&state);
                     let heartbeat_tx = heartbeat_tx.clone();
+                    let client_manager_clone = Arc::clone(&client_manager);
                     tokio::spawn(async move {
                         let current_term =
                             state_clone.lock().await.persistent.current_term;
-                        let resp = handlers::handle_append_entries(&req, state_clone.clone())
+                        let resp = handlers::handle_append_entries(&req, state_clone.clone(), Some(client_manager_clone))
                             .await
                             .unwrap_or_else(|e| {
                                 tracing::error!(error=?e, "Failed to handle AppendEntries");
