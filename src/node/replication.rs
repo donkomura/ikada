@@ -431,4 +431,111 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_network_partition_blocks_communication() -> anyhow::Result<()>
+    {
+        use crate::network::mock::MockNetworkFactory;
+        use crate::rpc::*;
+
+        let addr1: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10201);
+        let addr2: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10202);
+
+        struct MockRpcClient;
+
+        #[async_trait::async_trait]
+        impl RaftRpcTrait for MockRpcClient {
+            async fn append_entries(
+                &self,
+                _ctx: tarpc::context::Context,
+                _req: AppendEntriesRequest,
+            ) -> anyhow::Result<AppendEntriesResponse> {
+                Ok(AppendEntriesResponse {
+                    term: 1,
+                    success: true,
+                })
+            }
+
+            async fn request_vote(
+                &self,
+                _ctx: tarpc::context::Context,
+                _req: RequestVoteRequest,
+            ) -> anyhow::Result<RequestVoteResponse> {
+                Ok(RequestVoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                })
+            }
+
+            async fn client_request(
+                &self,
+                _ctx: tarpc::context::Context,
+                _req: CommandRequest,
+            ) -> anyhow::Result<CommandResponse> {
+                Ok(CommandResponse {
+                    success: true,
+                    leader_hint: None,
+                    data: None,
+                    error: None,
+                })
+            }
+        }
+
+        let factory = MockNetworkFactory::new();
+        factory.set_local_addr(addr1).await;
+        factory
+            .register_mock_client(addr2, Arc::new(MockRpcClient))
+            .await;
+
+        let client = factory.connect(addr2).await?;
+
+        let req = AppendEntriesRequest {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
+
+        let result = client
+            .append_entries(tarpc::context::current(), req.clone())
+            .await;
+        assert!(
+            result.is_ok(),
+            "Expected success before partition, got error: {:?}",
+            result
+        );
+
+        factory.partition(addr1, addr2).await;
+
+        let result = client
+            .append_entries(tarpc::context::current(), req.clone())
+            .await;
+        assert!(
+            result.is_err(),
+            "Expected network partition error after partition"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("partition"),
+            "Error should mention network partition, got: {}",
+            err_msg
+        );
+
+        factory.heal(addr1, addr2).await;
+
+        let result =
+            client.append_entries(tarpc::context::current(), req).await;
+        assert!(
+            result.is_ok(),
+            "Expected success after healing, got error: {:?}",
+            result
+        );
+
+        Ok(())
+    }
 }
