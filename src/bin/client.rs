@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use ikada::client::KVStore;
 use ikada::trace::init_tracing;
@@ -7,11 +7,10 @@ use ikada::trace::init_tracing;
 async fn main() -> anyhow::Result<()> {
     let tracer_provider = init_tracing("ikada-client")?;
 
-    let port = 1111;
-    let cluster_addrs = vec![
-        SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port)),
-        SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port + 1)),
-        SocketAddr::from((IpAddr::V4(Ipv4Addr::LOCALHOST), port + 2)),
+    let cluster_addrs: Vec<SocketAddr> = vec![
+        "127.0.0.1:1111".parse()?,
+        "127.0.0.1:1112".parse()?,
+        "127.0.0.1:1113".parse()?,
     ];
 
     let mut store = KVStore::connect(cluster_addrs).await?;

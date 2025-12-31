@@ -37,59 +37,37 @@ impl<NF: NetworkFactory> RaftClient<NF> {
         &mut self,
         command: Vec<u8>,
     ) -> anyhow::Result<Vec<u8>> {
-        const MAX_RETRIES: usize = 3;
         const TIMEOUT: Duration = Duration::from_secs(10);
-        let mut retries = 0;
 
-        loop {
-            let mut ctx = context::current();
-            ctx.deadline = std::time::Instant::now() + TIMEOUT;
+        let mut ctx = context::current();
+        ctx.deadline = std::time::Instant::now() + TIMEOUT;
 
-            let request = CommandRequest {
-                command: command.clone(),
-            };
-            let response = self.client.client_request(ctx, request).await?;
+        let request = CommandRequest {
+            command: command.clone(),
+        };
+        let response = self.client.client_request(ctx, request).await?;
 
-            if response.success {
-                return response
-                    .data
-                    .ok_or_else(|| anyhow::anyhow!("No response data"));
-            }
+        if response.success {
+            response
+                .data
+                .ok_or_else(|| anyhow::anyhow!("No response data"))
+        } else if let Some(leader_id) = response.leader_hint {
+            let leader_port = leader_id as u16;
+            let leader_addr =
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, leader_port));
 
-            if let Some(leader_id) = response.leader_hint {
-                let leader_port = leader_id as u16;
-                let leader_addr = SocketAddr::from((
-                    std::net::Ipv4Addr::LOCALHOST,
-                    leader_port,
-                ));
-
-                self.reconnect(leader_addr).await?;
-                retries += 1;
-
-                if retries >= MAX_RETRIES {
-                    return Err(anyhow::anyhow!(
-                        "Max retries ({}) exceeded while finding leader",
-                        MAX_RETRIES
-                    ));
-                }
-
-                continue;
-            } else {
-                retries += 1;
-
-                if retries >= MAX_RETRIES {
-                    return Err(anyhow::anyhow!(
-                        "Command failed: {}. Max retries exceeded.",
-                        response
-                            .error
-                            .unwrap_or_else(|| "Unknown error".to_string())
-                    ));
-                }
-
-                tokio::time::sleep(tokio::time::Duration::from_millis(100))
-                    .await;
-                continue;
-            }
+            self.reconnect(leader_addr).await?;
+            Err(anyhow::anyhow!(
+                "Not the leader, reconnected to {}",
+                leader_addr
+            ))
+        } else {
+            Err(anyhow::anyhow!(
+                "Command failed: {}",
+                response
+                    .error
+                    .unwrap_or_else(|| "Unknown error".to_string())
+            ))
         }
     }
 }
