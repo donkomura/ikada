@@ -48,27 +48,52 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn repl(store: &mut KVStore) -> anyhow::Result<()> {
-    use std::io::{self, Write};
+    use rustyline::DefaultEditor;
+    use rustyline::error::ReadlineError;
+
+    let mut rl = DefaultEditor::new()?;
+
+    let history_file = dirs::home_dir()
+        .map(|p| p.join(".ikada_history"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".ikada_history"));
+
+    if rl.load_history(&history_file).is_err() {
+        tracing::debug!("No previous history found");
+    }
 
     loop {
-        print!("> ");
-        io::stdout().flush()?;
+        let readline = rl.readline("> ");
+        match readline {
+            Ok(line) => {
+                let input = line.trim();
+                if input.is_empty() {
+                    continue;
+                }
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
+                let _ = rl.add_history_entry(input);
 
-        if input.is_empty() {
-            continue;
-        }
-
-        match process_command(store, input).await {
-            Ok(Some(output)) => println!("{}", output),
-            Ok(None) => break,
-            Err(e) => eprintln!("Error: {}", e),
+                match process_command(store, input).await {
+                    Ok(Some(output)) => println!("{}", output),
+                    Ok(None) => break,
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("CTRL-C");
+                break;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("CTRL-D");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error: {:?}", err);
+                break;
+            }
         }
     }
 
+    rl.save_history(&history_file)?;
     Ok(())
 }
 
