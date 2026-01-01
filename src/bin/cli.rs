@@ -76,49 +76,67 @@ async fn process_command(
     store: &mut KVStore,
     input: &str,
 ) -> anyhow::Result<Option<String>> {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    if parts.is_empty() {
-        return Ok(Some(String::new()));
-    }
+    let mut parts = input.split_whitespace();
+    let command = match parts.next() {
+        Some(cmd) => cmd,
+        None => return Ok(Some(String::new())),
+    };
 
-    match parts[0] {
+    match command {
         "help" => Ok(Some(format_help())),
         "set" => {
-            if parts.len() < 3 {
+            let key = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Usage: set <key> <value>"))?
+                .to_string();
+            let value = parts.collect::<Vec<_>>().join(" ");
+            if value.is_empty() {
                 return Err(anyhow::anyhow!("Usage: set <key> <value>"));
             }
-            let key = parts[1].to_string();
-            let value = parts[2..].join(" ");
             store.set(key, value).await?;
             Ok(Some("OK".to_string()))
         }
         "get" => {
-            if parts.len() != 2 {
+            let key = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Usage: get <key>"))?
+                .to_string();
+            if parts.next().is_some() {
                 return Err(anyhow::anyhow!("Usage: get <key>"));
             }
-            let value = store.get(parts[1].to_string()).await?;
+            let value = store.get(key).await?;
             match value {
                 Some(v) => Ok(Some(v)),
                 None => Ok(Some("(nil)".to_string())),
             }
         }
         "delete" | "del" => {
-            if parts.len() != 2 {
+            let key = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Usage: delete <key>"))?
+                .to_string();
+            if parts.next().is_some() {
                 return Err(anyhow::anyhow!("Usage: delete <key>"));
             }
-            let value = store.delete(parts[1].to_string()).await?;
+            let value = store.delete(key).await?;
             match value {
                 Some(v) => Ok(Some(v)),
                 None => Ok(Some("(nil)".to_string())),
             }
         }
         "cas" => {
-            if parts.len() < 4 {
+            let key = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Usage: cas <key> <from> <to>"))?
+                .to_string();
+            let from = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Usage: cas <key> <from> <to>"))?
+                .to_string();
+            let to = parts.collect::<Vec<_>>().join(" ");
+            if to.is_empty() {
                 return Err(anyhow::anyhow!("Usage: cas <key> <from> <to>"));
             }
-            let key = parts[1].to_string();
-            let from = parts[2].to_string();
-            let to = parts[3..].join(" ");
             let success = store.compare_and_set(key, from, to).await?;
             if success {
                 Ok(Some("OK".to_string()))
@@ -129,7 +147,7 @@ async fn process_command(
         "exit" | "quit" => Ok(None),
         _ => Err(anyhow::anyhow!(
             "Unknown command: {}. Type 'help' for available commands.",
-            parts[0]
+            command
         )),
     }
 }
