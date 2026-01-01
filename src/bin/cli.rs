@@ -5,8 +5,8 @@ use ikada::client::KVStore;
 use ikada::trace::init_tracing;
 
 #[derive(Parser, Debug)]
-#[command(name = "ikada-cli")]
-#[command(about = "Interactive CLI for ikada KVS cluster", long_about = None)]
+#[command(name = "ikada-repl")]
+#[command(about = "Interactive REPL for ikada KVS cluster", long_about = None)]
 struct Cli {
     #[arg(
         short,
@@ -33,7 +33,7 @@ impl Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let tracer_provider = init_tracing("ikada-cli")?;
+    let tracer_provider = init_tracing("ikada-repl")?;
 
     let cli = Cli::parse();
     let cluster_addrs = cli.parse_addresses()?;
