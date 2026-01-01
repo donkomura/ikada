@@ -84,12 +84,12 @@ async fn process_command(
     match parts[0] {
         "help" => Ok(Some(format_help())),
         "set" => {
-            if parts.len() != 3 {
+            if parts.len() < 3 {
                 return Err(anyhow::anyhow!("Usage: set <key> <value>"));
             }
-            store
-                .set(parts[1].to_string(), parts[2].to_string())
-                .await?;
+            let key = parts[1].to_string();
+            let value = parts[2..].join(" ");
+            store.set(key, value).await?;
             Ok(Some("OK".to_string()))
         }
         "get" => {
@@ -113,16 +113,13 @@ async fn process_command(
             }
         }
         "cas" => {
-            if parts.len() != 4 {
+            if parts.len() < 4 {
                 return Err(anyhow::anyhow!("Usage: cas <key> <from> <to>"));
             }
-            let success = store
-                .compare_and_set(
-                    parts[1].to_string(),
-                    parts[2].to_string(),
-                    parts[3].to_string(),
-                )
-                .await?;
+            let key = parts[1].to_string();
+            let from = parts[2].to_string();
+            let to = parts[3..].join(" ");
+            let success = store.compare_and_set(key, from, to).await?;
             if success {
                 Ok(Some("OK".to_string()))
             } else {
@@ -248,6 +245,17 @@ mod tests {
         }
 
         #[test]
+        fn test_parse_set_command_with_spaces() {
+            let parts: Vec<&str> =
+                "set name Alice Bob".split_whitespace().collect();
+            assert_eq!(parts.len(), 4);
+            assert_eq!(parts[0], "set");
+            assert_eq!(parts[1], "name");
+            let value = parts[2..].join(" ");
+            assert_eq!(value, "Alice Bob");
+        }
+
+        #[test]
         fn test_parse_get_command() {
             let parts: Vec<&str> = "get name".split_whitespace().collect();
             assert_eq!(parts.len(), 2);
@@ -272,6 +280,18 @@ mod tests {
             assert_eq!(parts[1], "key");
             assert_eq!(parts[2], "old");
             assert_eq!(parts[3], "new");
+        }
+
+        #[test]
+        fn test_parse_cas_command_with_spaces() {
+            let parts: Vec<&str> =
+                "cas key old new value".split_whitespace().collect();
+            assert_eq!(parts.len(), 5);
+            assert_eq!(parts[0], "cas");
+            assert_eq!(parts[1], "key");
+            assert_eq!(parts[2], "old");
+            let to_value = parts[3..].join(" ");
+            assert_eq!(to_value, "new value");
         }
 
         #[test]
