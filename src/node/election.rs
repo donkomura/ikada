@@ -67,7 +67,12 @@ where
                 id = candidate_id,
                 "vote not granted, become follower"
             );
-            self.become_follower().await?;
+            {
+                let mut state = self.state.lock().await;
+                let current_term = state.persistent.current_term;
+                state.become_follower(current_term, None);
+            }
+            self.heartbeat_failure_count = 0;
             return Ok(());
         }
 
@@ -148,9 +153,13 @@ where
                 term = &current_term,
                 "newer term was discovered"
             );
-            self.state.lock().await.persistent.current_term =
-                new_terms.first().unwrap().term;
-            self.become_follower().await?;
+            {
+                let mut state = self.state.lock().await;
+                let new_term = new_terms.first().unwrap().term;
+                state.persistent.current_term = new_term;
+                state.become_follower(new_term, None);
+            }
+            self.heartbeat_failure_count = 0;
             return Ok(());
         }
 
@@ -167,68 +176,37 @@ where
                 "vote granted, become leader"
             );
 
-            self.become_leader().await?;
+            // Transition to leader role
+            {
+                let mut state = self.state.lock().await;
+                tracing::info!(id=?state.id, term=state.persistent.current_term, "BECOMING LEADER");
+
+                let peers: Vec<_> = self.peers.keys().copied().collect();
+                state.become_leader(&peers);
+
+                // Append no-op entry for ReadIndex optimization
+                let current_term = state.persistent.current_term;
+                let noop_entry = crate::raft::Entry {
+                    term: current_term,
+                    command: T::default(),
+                };
+                state.persistent.log.push(noop_entry);
+                let noop_idx = state.get_last_log_idx();
+                if let Some(leader_state) = state.role.leader_state_mut() {
+                    leader_state.noop_index = Some(noop_idx);
+                }
+                state.persist().await?;
+
+                tracing::info!(
+                    id = ?state.id,
+                    noop_index = noop_idx,
+                    "Appended no-op entry for ReadIndex"
+                );
+            }
+
+            self.heartbeat_failure_count = 0;
         }
 
-        Ok(())
-    }
-
-    /// Transitions to leader and initializes next_index/match_index.
-    ///
-    /// Raft Algorithm - Leader Election Step 4 (continued):
-    /// Step 4: Node transitions to leader role and initializes replication state for each follower
-    pub(super) async fn become_leader(&mut self) -> anyhow::Result<()>
-    where
-        // T::default() is used to create a noop command that has no side effects.
-        T: Default,
-    {
-        let mut state = self.state.lock().await;
-        tracing::info!(id=?state.id, term=state.persistent.current_term, "BECOMING LEADER");
-
-        let peers: Vec<_> = self.peers.keys().copied().collect();
-        state.become_leader(&peers);
-
-        // Append no-op entry for ReadIndex optimization
-        let current_term = state.persistent.current_term;
-        let noop_entry = crate::raft::Entry {
-            term: current_term,
-            command: T::default(),
-        };
-        state.persistent.log.push(noop_entry);
-        let noop_idx = state.get_last_log_idx();
-        if let Some(leader_state) = state.role.leader_state_mut() {
-            leader_state.noop_index = Some(noop_idx);
-        }
-        state.persist().await?;
-
-        tracing::info!(
-            id = ?state.id,
-            noop_index = noop_idx,
-            "Appended no-op entry for ReadIndex"
-        );
-
-        self.heartbeat_failure_count = 0;
-        Ok(())
-    }
-
-    /// Transitions to follower and clears vote.
-    pub(super) async fn become_follower(&mut self) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        let current_term = state.persistent.current_term;
-        state.become_follower(current_term, None);
-
-        self.heartbeat_failure_count = 0;
-        Ok(())
-    }
-
-    /// Transitions to candidate, increments term, and votes for self.
-    ///
-    /// Raft Algorithm - Leader Election Step 1:
-    /// Step 1: Follower becomes candidate, increments term, and votes for itself
-    pub(super) async fn become_candidate(&mut self) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        state.become_candidate();
-        state.persist().await?;
         Ok(())
     }
 
@@ -285,8 +263,12 @@ mod tests {
 
     #[tokio::test]
     async fn check_leader_state_after_become_leader() -> anyhow::Result<()> {
-        let mut node = create_test_node();
-        node.become_leader().await?;
+        let node = create_test_node();
+        {
+            let mut state = node.state.lock().await;
+            let peers: Vec<_> = vec![];
+            state.become_leader(&peers);
+        }
         let state = node.state.lock().await;
         assert!(state.role.is_leader());
         assert_eq!(state.leader_id, Some(state.id));
@@ -295,9 +277,12 @@ mod tests {
 
     #[tokio::test]
     async fn check_leader_state_after_become_candidate() -> anyhow::Result<()> {
-        let mut node = create_test_node();
+        let node = create_test_node();
         let term = node.state.lock().await.persistent.current_term;
-        node.become_candidate().await?;
+        {
+            let mut state = node.state.lock().await;
+            state.become_candidate();
+        }
         let state = node.state.lock().await;
         assert!(state.role.is_candidate());
         assert_eq!(state.persistent.current_term, term + 1);
@@ -306,8 +291,12 @@ mod tests {
 
     #[tokio::test]
     async fn check_leader_state_after_become_follower() -> anyhow::Result<()> {
-        let mut node = create_test_node();
-        node.become_follower().await?;
+        let node = create_test_node();
+        {
+            let mut state = node.state.lock().await;
+            let current_term = state.persistent.current_term;
+            state.become_follower(current_term, None);
+        }
         let state = node.state.lock().await;
         assert!(state.role.is_follower());
         Ok(())

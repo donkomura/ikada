@@ -323,7 +323,7 @@ where
                 state.become_follower(res.term, None);
                 let _ = state.persist().await;
             }
-            self.become_follower().await?;
+            self.heartbeat_failure_count = 0;
             return Ok(());
         }
 

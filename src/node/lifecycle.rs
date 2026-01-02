@@ -72,7 +72,11 @@ where
                 }
                 _ = watchdog.wait() => {
                     watchdog.reset(timeout).await;
-                    self.become_candidate().await?;
+                    {
+                        let mut state = self.state.lock().await;
+                        state.become_candidate();
+                        state.persist().await?;
+                    }
                     break;
                 }
             }
@@ -102,8 +106,12 @@ where
                     let current_term = self.state.lock().await.persistent.current_term;
                     if term >= current_term {
                         // Accept heartbeat: requester is the new leader
-                        self.state.lock().await.leader_id = Some(id);
-                        self.become_follower().await?;
+                        {
+                            let mut state = self.state.lock().await;
+                            state.leader_id = Some(id);
+                            state.become_follower(current_term, Some(id));
+                        }
+                        self.heartbeat_failure_count = 0;
                     }
                 },
                 _ = watchdog.wait() => {
@@ -175,7 +183,12 @@ where
                             tracing::warn!(
                                 "Consecutive heartbeat failures exceeded limit, stepping down from leader"
                             );
-                            self.become_follower().await?;
+                            {
+                                let mut state = self.state.lock().await;
+                                let current_term = state.persistent.current_term;
+                                state.become_follower(current_term, None);
+                            }
+                            self.heartbeat_failure_count = 0;
                             break;
                         }
                     } else {
@@ -265,7 +278,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn election_must_be_done_with_not_candidate() -> anyhow::Result<()> {
         let mut node = create_test_node(Config::default());
-        node.become_candidate().await?;
+        {
+            let mut state = node.state.lock().await;
+            state.become_candidate();
+            state.persist().await?;
+        }
         node.run_candidate().await?;
         assert!(!node.state.lock().await.role.is_candidate());
         Ok(())
@@ -295,7 +312,11 @@ mod tests {
             ..Default::default()
         };
         let mut node = create_test_node(config);
-        node.become_candidate().await?;
+        {
+            let mut state = node.state.lock().await;
+            state.become_candidate();
+            state.persist().await?;
+        }
         let result = tokio::spawn(async move { node.run_candidate().await });
         // 100ms進めてstart_electionが呼ばれる時間を与える
         tokio::time::advance(Duration::from_millis(100)).await;
