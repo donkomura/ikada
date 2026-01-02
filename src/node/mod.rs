@@ -90,8 +90,6 @@ pub struct Node<
     pub network_factory: NF,
     heartbeat_failure_count: usize,
     pub client_manager: Arc<Mutex<ClientResponseManager<SM::Response>>>,
-    #[allow(dead_code)]
-    apply_event_tx: mpsc::UnboundedSender<AppliedEntry<SM::Response>>,
     pub raft_event_rx: mpsc::UnboundedReceiver<RaftEvent>,
 }
 
@@ -142,7 +140,6 @@ where
             network_factory,
             heartbeat_failure_count: 0,
             client_manager,
-            apply_event_tx,
             raft_event_rx,
         }
     }
@@ -188,7 +185,6 @@ where
             network_factory,
             heartbeat_failure_count: 0,
             client_manager,
-            apply_event_tx,
             raft_event_rx,
         }
     }
