@@ -24,14 +24,7 @@ pub struct PersistentState<T: Send + Sync> {
     pub log: Vec<Entry<T>>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub enum Role {
-    #[default]
-    Follower,
-    Candidate,
-    Leader,
-}
-
+#[derive(Debug, Clone)]
 pub struct LeaderState {
     pub next_index: HashMap<SocketAddr, u32>,
     pub match_index: HashMap<SocketAddr, u32>,
@@ -56,6 +49,7 @@ impl LeaderState {
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum RoleState {
     Follower,
     Candidate,
@@ -63,14 +57,6 @@ pub enum RoleState {
 }
 
 impl RoleState {
-    pub fn role(&self) -> Role {
-        match self {
-            RoleState::Follower => Role::Follower,
-            RoleState::Candidate => Role::Candidate,
-            RoleState::Leader(_) => Role::Leader,
-        }
-    }
-
     pub fn is_leader(&self) -> bool {
         matches!(self, RoleState::Leader(_))
     }

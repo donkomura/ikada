@@ -7,7 +7,7 @@
 
 use super::{Node, handlers};
 use crate::network::NetworkFactory;
-use crate::raft::Role;
+use crate::raft::RoleState;
 use crate::statemachine::StateMachine;
 use crate::watchdog::WatchDog;
 use std::net::SocketAddr;
@@ -38,12 +38,12 @@ where
         loop {
             let role = {
                 let state = self.state.lock().await;
-                state.role.role()
+                state.role.clone()
             };
             match role {
-                Role::Follower => self.run_follower().await,
-                Role::Candidate => self.run_candidate().await,
-                Role::Leader => self.run_leader().await,
+                RoleState::Follower => self.run_follower().await,
+                RoleState::Candidate => self.run_candidate().await,
+                RoleState::Leader(_) => self.run_leader().await,
             }?
         }
     }
