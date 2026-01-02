@@ -50,35 +50,35 @@ impl LeaderState {
 }
 
 #[derive(Debug, Clone)]
-pub enum RoleState {
+pub enum Role {
     Follower,
     Candidate,
     Leader(LeaderState),
 }
 
-impl RoleState {
+impl Role {
     pub fn is_leader(&self) -> bool {
-        matches!(self, RoleState::Leader(_))
+        matches!(self, Role::Leader(_))
     }
 
     pub fn is_follower(&self) -> bool {
-        matches!(self, RoleState::Follower)
+        matches!(self, Role::Follower)
     }
 
     pub fn is_candidate(&self) -> bool {
-        matches!(self, RoleState::Candidate)
+        matches!(self, Role::Candidate)
     }
 
     pub fn leader_state(&self) -> Option<&LeaderState> {
         match self {
-            RoleState::Leader(state) => Some(state),
+            Role::Leader(state) => Some(state),
             _ => None,
         }
     }
 
     pub fn leader_state_mut(&mut self) -> Option<&mut LeaderState> {
         match self {
-            RoleState::Leader(state) => Some(state),
+            Role::Leader(state) => Some(state),
             _ => None,
         }
     }
@@ -92,7 +92,7 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     pub commit_index: u32,
     pub last_applied: u32,
 
-    pub role: RoleState,
+    pub role: Role,
 
     pub leader_id: Option<u32>,
     pub id: u32,
@@ -115,7 +115,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
                 voted_for: None,
                 log: Vec::new(),
             },
-            role: RoleState::Follower,
+            role: Role::Follower,
             commit_index: 0,
             last_applied: 0,
             leader_id: None,
@@ -191,21 +191,21 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     pub fn become_follower(&mut self, term: u32, leader_id: Option<u32>) {
         self.persistent.current_term = term;
         self.persistent.voted_for = None;
-        self.role = RoleState::Follower;
+        self.role = Role::Follower;
         self.leader_id = leader_id;
     }
 
     pub fn become_candidate(&mut self) {
         self.persistent.current_term += 1;
         self.persistent.voted_for = Some(self.id);
-        self.role = RoleState::Candidate;
+        self.role = Role::Candidate;
         self.leader_id = None;
     }
 
     pub fn become_leader(&mut self, peers: &[SocketAddr]) {
         let last_log_index = self.get_last_log_idx();
         let leader_state = LeaderState::new(peers, last_log_index);
-        self.role = RoleState::Leader(leader_state);
+        self.role = Role::Leader(leader_state);
         self.leader_id = Some(self.id);
     }
 }
@@ -389,10 +389,8 @@ mod tests {
         {
             let mut state = old_leader_state.lock().await;
             state.persistent.current_term = 1;
-            state.role = RoleState::Leader(LeaderState::new(
-                &[],
-                state.get_last_log_idx(),
-            ));
+            state.role =
+                Role::Leader(LeaderState::new(&[], state.get_last_log_idx()));
             state.persistent.log.push(Entry {
                 term: 1,
                 command: KVCommand::Put {
@@ -500,7 +498,7 @@ mod tests {
             KVStateMachine::default(),
         );
         leader_state.persistent.current_term = 1;
-        leader_state.role = RoleState::Leader(LeaderState::new(
+        leader_state.role = Role::Leader(LeaderState::new(
             &[],
             leader_state.get_last_log_idx(),
         ));

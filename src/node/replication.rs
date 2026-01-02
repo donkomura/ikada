@@ -405,7 +405,7 @@ mod tests {
         {
             let mut state = node.state.lock().await;
             state.persistent.current_term = 5;
-            state.role = raft::RoleState::Leader(raft::LeaderState::new(
+            state.role = raft::Role::Leader(raft::LeaderState::new(
                 &[peer1, peer2],
                 state.get_last_log_idx(),
             ));

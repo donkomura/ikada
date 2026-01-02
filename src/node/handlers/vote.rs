@@ -114,7 +114,7 @@ mod tests {
         );
         initial_state.persistent.current_term = 50;
         initial_state.role =
-            crate::raft::RoleState::Leader(crate::raft::LeaderState::new(
+            crate::raft::Role::Leader(crate::raft::LeaderState::new(
                 &[],
                 initial_state.get_last_log_idx(),
             ));

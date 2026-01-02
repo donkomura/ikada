@@ -353,7 +353,7 @@ mod tests {
         initial_state.persistent.voted_for = Some(1);
         // Set to Leader role directly for test
         initial_state.role =
-            crate::raft::RoleState::Leader(crate::raft::LeaderState::new(
+            crate::raft::Role::Leader(crate::raft::LeaderState::new(
                 &[],
                 initial_state.get_last_log_idx(),
             ));
@@ -940,7 +940,7 @@ mod tests {
             create_test_state_machine(),
         );
         candidate_state.persistent.current_term = 5;
-        candidate_state.role = crate::raft::RoleState::Candidate;
+        candidate_state.role = crate::raft::Role::Candidate;
         candidate_state.persistent.voted_for = Some(1);
         let state = Arc::new(Mutex::new(candidate_state));
 
