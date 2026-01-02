@@ -38,7 +38,7 @@ where
         loop {
             let role = {
                 let state = self.state.lock().await;
-                state.role
+                state.role.role()
             };
             match role {
                 Role::Follower => self.run_follower().await,
@@ -63,7 +63,7 @@ where
         watchdog.reset(timeout).await;
 
         loop {
-            if !matches!(self.state.lock().await.role, Role::Follower) {
+            if !self.state.lock().await.role.is_follower() {
                 break;
             }
             tokio::select! {
@@ -94,7 +94,7 @@ where
         watchdog.reset(timeout).await;
 
         loop {
-            if !matches!(self.state.lock().await.role, Role::Candidate) {
+            if !self.state.lock().await.role.is_candidate() {
                 break;
             }
             tokio::select! {
@@ -142,7 +142,7 @@ where
             .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            if !matches!(self.state.lock().await.role, Role::Leader) {
+            if !self.state.lock().await.role.is_leader() {
                 break;
             }
             tokio::select! {
@@ -267,7 +267,7 @@ mod tests {
         let mut node = create_test_node(Config::default());
         node.become_candidate().await?;
         node.run_candidate().await?;
-        assert_ne!(node.state.lock().await.role, Role::Candidate);
+        assert!(!node.state.lock().await.role.is_candidate());
         Ok(())
     }
 

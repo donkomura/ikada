@@ -196,7 +196,9 @@ where
         };
         state.persistent.log.push(noop_entry);
         let noop_idx = state.get_last_log_idx();
-        state.noop_index = Some(noop_idx);
+        if let Some(leader_state) = state.role.leader_state_mut() {
+            leader_state.noop_index = Some(noop_idx);
+        }
         state.persist().await?;
 
         tracing::info!(
@@ -263,7 +265,6 @@ where
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::raft::Role;
 
     fn create_test_state_machine() -> crate::statemachine::NoOpStateMachine {
         crate::statemachine::NoOpStateMachine::default()
@@ -287,7 +288,7 @@ mod tests {
         let mut node = create_test_node();
         node.become_leader().await?;
         let state = node.state.lock().await;
-        assert_eq!(state.role, Role::Leader);
+        assert!(state.role.is_leader());
         assert_eq!(state.leader_id, Some(state.id));
         Ok(())
     }
@@ -298,7 +299,7 @@ mod tests {
         let term = node.state.lock().await.persistent.current_term;
         node.become_candidate().await?;
         let state = node.state.lock().await;
-        assert_eq!(state.role, Role::Candidate);
+        assert!(state.role.is_candidate());
         assert_eq!(state.persistent.current_term, term + 1);
         Ok(())
     }
@@ -308,7 +309,7 @@ mod tests {
         let mut node = create_test_node();
         node.become_follower().await?;
         let state = node.state.lock().await;
-        assert_eq!(state.role, Role::Follower);
+        assert!(state.role.is_follower());
         Ok(())
     }
 }

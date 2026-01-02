@@ -93,7 +93,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{self, Role};
+    use crate::raft;
 
     fn create_test_storage<T: Send + Sync + Clone + 'static>()
     -> Box<dyn crate::storage::Storage<T>> {
@@ -113,7 +113,11 @@ mod tests {
             create_test_state_machine(),
         );
         initial_state.persistent.current_term = 50;
-        initial_state.role = Role::Leader;
+        initial_state.role =
+            crate::raft::RoleState::Leader(crate::raft::LeaderState::new(
+                &[],
+                initial_state.get_last_log_idx(),
+            ));
         let state = Arc::new(Mutex::new(initial_state));
 
         let req = RequestVoteRequest {
@@ -127,7 +131,7 @@ mod tests {
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.current_term, 100);
-        assert_eq!(final_state.role, Role::Follower);
+        assert!(final_state.role.is_follower());
 
         Ok(())
     }

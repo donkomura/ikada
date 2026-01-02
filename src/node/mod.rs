@@ -324,12 +324,12 @@ where
                     let client_request_tx_clone = client_request_tx.clone();
                     tokio::spawn(async move {
                         // Check if this node is the leader
-                        let role = {
+                        let is_leader = {
                             let state = state_clone.lock().await;
-                            state.role
+                            state.role.is_leader()
                         };
 
-                        if matches!(role, crate::raft::Role::Leader) {
+                        if is_leader {
                             // Send to leader loop for processing
                             let _ =
                                 client_request_tx_clone.send((req, resp_tx));
@@ -353,16 +353,20 @@ where
                     let _client_manager_clone = Arc::clone(&client_manager);
                     tokio::spawn(async move {
                         // Check if this node is the leader
-                        let role = {
+                        let is_leader = {
                             let state = state_clone.lock().await;
-                            state.role
+                            state.role.is_leader()
                         };
 
-                        if matches!(role, crate::raft::Role::Leader) {
+                        if is_leader {
                             // Use ReadIndex optimization for reads
                             let peer_count = {
                                 let state = state_clone.lock().await;
-                                state.match_index.len()
+                                state
+                                    .role
+                                    .leader_state()
+                                    .map(|ls| ls.match_index.len())
+                                    .unwrap_or(0)
                             };
                             let resp = handlers::handle_read_index_request(
                                 &req,

@@ -1,4 +1,4 @@
-use crate::raft::{self, RaftState, Role};
+use crate::raft::{self, RaftState};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::sync::Arc;
@@ -48,7 +48,7 @@ where
         }
     } else if request_term == state.persistent.current_term {
         state.leader_id = Some(sender_id);
-        if matches!(state.role, Role::Candidate | Role::Leader) {
+        if state.role.is_candidate() || state.role.is_leader() {
             state.become_follower(request_term, Some(sender_id));
         }
     }
@@ -351,7 +351,12 @@ mod tests {
         );
         initial_state.persistent.current_term = 50;
         initial_state.persistent.voted_for = Some(1);
-        initial_state.role = Role::Leader;
+        // Set to Leader role directly for test
+        initial_state.role =
+            crate::raft::RoleState::Leader(crate::raft::LeaderState::new(
+                &[],
+                initial_state.get_last_log_idx(),
+            ));
         let state = Arc::new(Mutex::new(initial_state));
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(32);
@@ -388,7 +393,7 @@ mod tests {
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.current_term, 100);
-        assert_eq!(final_state.role, Role::Follower);
+        assert!(final_state.role.is_follower());
         assert_eq!(final_state.persistent.voted_for, None);
         assert_eq!(final_state.leader_id, Some(99999));
 
@@ -935,7 +940,7 @@ mod tests {
             create_test_state_machine(),
         );
         candidate_state.persistent.current_term = 5;
-        candidate_state.role = Role::Candidate;
+        candidate_state.role = crate::raft::RoleState::Candidate;
         candidate_state.persistent.voted_for = Some(1);
         let state = Arc::new(Mutex::new(candidate_state));
 
@@ -952,7 +957,7 @@ mod tests {
         assert!(response.success);
 
         let final_state = state.lock().await;
-        assert_eq!(final_state.role, Role::Follower);
+        assert!(final_state.role.is_follower());
         assert_eq!(final_state.persistent.current_term, 5);
         assert_eq!(final_state.leader_id, Some(2));
 

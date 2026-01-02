@@ -75,6 +75,14 @@ impl RoleState {
         matches!(self, RoleState::Leader(_))
     }
 
+    pub fn is_follower(&self) -> bool {
+        matches!(self, RoleState::Follower)
+    }
+
+    pub fn is_candidate(&self) -> bool {
+        matches!(self, RoleState::Candidate)
+    }
+
     pub fn leader_state(&self) -> Option<&LeaderState> {
         match self {
             RoleState::Leader(state) => Some(state),
@@ -98,15 +106,7 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     pub commit_index: u32,
     pub last_applied: u32,
 
-    // Role-specific state (new design)
-    role_state: RoleState,
-
-    // Deprecated: kept for backward compatibility during transition
-    // These fields are kept in sync with role_state
-    pub next_index: HashMap<SocketAddr, u32>,
-    pub match_index: HashMap<SocketAddr, u32>,
-    pub role: Role,
-    pub noop_index: Option<u32>,
+    pub role: RoleState,
 
     pub leader_id: Option<u32>,
     pub id: u32,
@@ -129,15 +129,11 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
                 voted_for: None,
                 log: Vec::new(),
             },
-            role_state: RoleState::Follower,
-            role: Role::Follower,
+            role: RoleState::Follower,
             commit_index: 0,
             last_applied: 0,
-            next_index: HashMap::new(),
-            match_index: HashMap::new(),
             leader_id: None,
             id,
-            noop_index: None,
             storage,
             state_machine: sm,
             apply_notifier: None,
@@ -206,54 +202,25 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         0u32
     }
 
-    fn sync_role_to_deprecated_fields(&mut self) {
-        self.role = self.role_state.role();
-        match &self.role_state {
-            RoleState::Follower | RoleState::Candidate => {
-                self.next_index.clear();
-                self.match_index.clear();
-                self.noop_index = None;
-            }
-            RoleState::Leader(leader_state) => {
-                self.next_index = leader_state.next_index.clone();
-                self.match_index = leader_state.match_index.clone();
-                self.noop_index = leader_state.noop_index;
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn sync_deprecated_fields_to_role(&mut self) {
-        if let RoleState::Leader(leader_state) = &mut self.role_state {
-            leader_state.next_index = self.next_index.clone();
-            leader_state.match_index = self.match_index.clone();
-            leader_state.noop_index = self.noop_index;
-        }
-        self.role = self.role_state.role();
-    }
-
     pub fn become_follower(&mut self, term: u32, leader_id: Option<u32>) {
         self.persistent.current_term = term;
         self.persistent.voted_for = None;
-        self.role_state = RoleState::Follower;
+        self.role = RoleState::Follower;
         self.leader_id = leader_id;
-        self.sync_role_to_deprecated_fields();
     }
 
     pub fn become_candidate(&mut self) {
         self.persistent.current_term += 1;
         self.persistent.voted_for = Some(self.id);
-        self.role_state = RoleState::Candidate;
+        self.role = RoleState::Candidate;
         self.leader_id = None;
-        self.sync_role_to_deprecated_fields();
     }
 
     pub fn become_leader(&mut self, peers: &[SocketAddr]) {
         let last_log_index = self.get_last_log_idx();
         let leader_state = LeaderState::new(peers, last_log_index);
-        self.role_state = RoleState::Leader(leader_state);
+        self.role = RoleState::Leader(leader_state);
         self.leader_id = Some(self.id);
-        self.sync_role_to_deprecated_fields();
     }
 }
 
@@ -353,7 +320,7 @@ mod tests {
         {
             let mut state = follower_state.lock().await;
             state.persistent.current_term = 1;
-            state.role = Role::Follower;
+            // Follower state set via become_follower
             state.leader_id = Some(10001);
         }
 
@@ -436,7 +403,10 @@ mod tests {
         {
             let mut state = old_leader_state.lock().await;
             state.persistent.current_term = 1;
-            state.role = Role::Leader;
+            state.role = RoleState::Leader(LeaderState::new(
+                &[],
+                state.get_last_log_idx(),
+            ));
             state.persistent.log.push(Entry {
                 term: 1,
                 command: KVCommand::Put {
@@ -491,9 +461,8 @@ mod tests {
 
         {
             let state = old_leader_state.lock().await;
-            assert_eq!(
-                state.role,
-                Role::Follower,
+            assert!(
+                state.role.is_follower(),
                 "Old leader should have stepped down to follower"
             );
             assert_eq!(
@@ -545,7 +514,10 @@ mod tests {
             KVStateMachine::default(),
         );
         leader_state.persistent.current_term = 1;
-        leader_state.role = Role::Leader;
+        leader_state.role = RoleState::Leader(LeaderState::new(
+            &[],
+            leader_state.get_last_log_idx(),
+        ));
 
         // Leader commits and applies value 1
         leader_state.persistent.log.push(Entry {
