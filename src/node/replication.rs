@@ -275,9 +275,6 @@ where
                 new_commit = new_commit_index,
                 "Leader advanced commit_index"
             );
-            state.send_event(crate::events::RaftEvent::CommitIndexAdvanced {
-                commit_index: new_commit_index,
-            });
         }
 
         Ok(())
@@ -349,13 +346,6 @@ where
                 if res.success {
                     leader_state.match_index.insert(addr, sent_up_to_index);
                     leader_state.next_index.insert(addr, sent_up_to_index + 1);
-
-                    state.send_event(
-                        crate::events::RaftEvent::ReplicationProgress {
-                            peer: addr,
-                            match_index: sent_up_to_index,
-                        },
-                    );
                 } else {
                     let current_next_idx = leader_state
                         .next_index

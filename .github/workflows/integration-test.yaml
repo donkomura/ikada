@@ -156,8 +156,10 @@ jobs:
             # Extract test status
             if grep -q ":valid? true" "$RESULTS_FILE"; then
               echo "TEST_STATUS=✅ Success" >> $GITHUB_ENV
-            else
+            elif grep -q ":valid? false" "$RESULTS_FILE"; then
               echo "TEST_STATUS=❌ Failed" >> $GITHUB_ENV
+            else
+              echo "TEST_STATUS=⚠️ Unknown" >> $GITHUB_ENV
             fi
 
             # Extract overall statistics

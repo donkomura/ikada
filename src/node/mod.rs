@@ -10,11 +10,10 @@ pub mod handlers;
 mod lifecycle;
 mod replication;
 
-use crate::client_manager::ClientResponseManager;
 use crate::config::Config;
-use crate::events::RaftEvent;
 use crate::network::NetworkFactory;
 use crate::raft::RaftState;
+use crate::request_tracker::RequestTracker;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::collections::HashMap;
@@ -89,7 +88,7 @@ pub struct Node<
     pub c: Chan,
     pub network_factory: NF,
     heartbeat_failure_count: usize,
-    pub client_manager: Arc<Mutex<ClientResponseManager<SM::Response>>>,
+    pub request_tracker: Arc<Mutex<RequestTracker<SM::Response>>>,
 }
 
 impl<T, SM, NF> Node<T, SM, NF>
@@ -111,25 +110,21 @@ where
         let storage = Box::new(MemStorage::default());
         let id = port as u32;
 
-        let (raft_event_tx, raft_event_rx) = mpsc::unbounded_channel();
-        let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
+        let (apply_tx, mut apply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_tracker = Arc::new(Mutex::new(RequestTracker::new()));
 
-        let manager_clone = Arc::clone(&client_manager);
+        let tracker_clone = Arc::clone(&request_tracker);
         tokio::spawn(async move {
-            let mut rx = raft_event_rx;
-            while let Some(event) = rx.recv().await {
-                if let RaftEvent::LogApplied {
-                    log_index,
-                    response,
-                } = event
-                {
-                    manager_clone.lock().await.resolve(log_index, response);
-                }
+            while let Some((log_index, response)) = apply_rx.recv().await {
+                tracker_clone
+                    .lock()
+                    .await
+                    .complete_write(log_index, response);
             }
         });
 
         let mut raft_state = RaftState::new(id, storage, sm);
-        raft_state.set_event_tx(raft_event_tx);
+        raft_state.apply_tx = Some(apply_tx);
 
         Node {
             config,
@@ -138,7 +133,7 @@ where
             c: Chan::new(),
             network_factory,
             heartbeat_failure_count: 0,
-            client_manager,
+            request_tracker,
         }
     }
 
@@ -149,20 +144,16 @@ where
         state: Arc<Mutex<RaftState<T, SM>>>,
         network_factory: NF,
     ) -> Self {
-        let (raft_event_tx, raft_event_rx) = mpsc::unbounded_channel();
-        let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
+        let (apply_tx, mut apply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_tracker = Arc::new(Mutex::new(RequestTracker::new()));
 
-        let manager_clone = Arc::clone(&client_manager);
+        let tracker_clone = Arc::clone(&request_tracker);
         tokio::spawn(async move {
-            let mut rx = raft_event_rx;
-            while let Some(event) = rx.recv().await {
-                if let RaftEvent::LogApplied {
-                    log_index,
-                    response,
-                } = event
-                {
-                    manager_clone.lock().await.resolve(log_index, response);
-                }
+            while let Some((log_index, response)) = apply_rx.recv().await {
+                tracker_clone
+                    .lock()
+                    .await
+                    .complete_write(log_index, response);
             }
         });
 
@@ -170,7 +161,7 @@ where
             let state_clone = Arc::clone(&state);
             async move {
                 let mut state = state_clone.lock().await;
-                state.set_event_tx(raft_event_tx);
+                state.apply_tx = Some(apply_tx);
             }
         });
 
@@ -181,7 +172,7 @@ where
             c: Chan::new(),
             network_factory,
             heartbeat_failure_count: 0,
-            client_manager,
+            request_tracker,
         }
     }
 
@@ -256,14 +247,14 @@ where
         let state = Arc::clone(&self.state);
         let heartbeat_tx = self.c.heartbeat_tx.clone();
         let client_request_tx = self.c.client_request_tx.clone();
-        let client_manager = Arc::clone(&self.client_manager);
+        let request_tracker = Arc::clone(&self.request_tracker);
 
         tokio::spawn(Self::rpc_handler(
             state,
             cmd_rx,
             heartbeat_tx,
             client_request_tx,
-            client_manager,
+            request_tracker,
         ));
 
         self.main(vec![]).await
@@ -279,18 +270,18 @@ where
             CommandRequest,
             oneshot::Sender<CommandResponse>,
         )>,
-        client_manager: Arc<Mutex<ClientResponseManager<SM::Response>>>,
+        request_tracker: Arc<Mutex<RequestTracker<SM::Response>>>,
     ) -> anyhow::Result<()> {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 Command::AppendEntries(req, resp_tx) => {
                     let state_clone = Arc::clone(&state);
                     let heartbeat_tx = heartbeat_tx.clone();
-                    let client_manager_clone = Arc::clone(&client_manager);
+                    let tracker_clone = Arc::clone(&request_tracker);
                     tokio::spawn(async move {
                         let current_term =
                             state_clone.lock().await.persistent.current_term;
-                        let resp = handlers::handle_append_entries(&req, state_clone.clone(), Some(client_manager_clone))
+                        let resp = handlers::handle_append_entries(&req, state_clone.clone(), Some(tracker_clone))
                             .await
                             .unwrap_or_else(|e| {
                                 tracing::error!(error=?e, "Failed to handle AppendEntries");
@@ -350,7 +341,6 @@ where
                 }
                 Command::ReadRequest(req, resp_tx) => {
                     let state_clone = Arc::clone(&state);
-                    let _client_manager_clone = Arc::clone(&client_manager);
                     tokio::spawn(async move {
                         // Check if this node is the leader
                         let is_leader = {

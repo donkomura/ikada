@@ -230,7 +230,7 @@ where
 
         for (req, resp_tx) in requests.drain(..) {
             let state = self.state.clone();
-            let client_manager = self.client_manager.clone();
+            let request_tracker = self.request_tracker.clone();
 
             tokio::spawn(async move {
                 let resp = handlers::handle_client_request_impl(
@@ -238,7 +238,7 @@ where
                     state,
                     rpc_timeout + std::time::Duration::from_millis(100),
                     peer_count,
-                    client_manager,
+                    request_tracker,
                 )
                 .await;
 

@@ -191,8 +191,8 @@ async fn synchronize_log<T, SM>(
     start_index: u32,
     sender_id: u32,
     state: &mut RaftState<T, SM>,
-    client_manager: Option<
-        Arc<Mutex<crate::client_manager::ClientResponseManager<SM::Response>>>,
+    request_tracker: Option<
+        Arc<Mutex<crate::request_tracker::RequestTracker<SM::Response>>>,
     >,
 ) -> Result<(), AppendEntriesError>
 where
@@ -204,9 +204,9 @@ where
         detect_and_truncate_conflicts(entries, start_index, state);
 
     if let Some(log_index) = conflict_at
-        && let Some(manager) = &client_manager
+        && let Some(tracker) = &request_tracker
     {
-        manager.lock().await.clear_from(log_index);
+        tracker.lock().await.clear_from(log_index);
     }
 
     let append_modified =
@@ -260,8 +260,8 @@ where
 pub async fn handle_append_entries<T, SM>(
     req: &AppendEntriesRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
-    client_manager: Option<
-        Arc<Mutex<crate::client_manager::ClientResponseManager<SM::Response>>>,
+    request_tracker: Option<
+        Arc<Mutex<crate::request_tracker::RequestTracker<SM::Response>>>,
     >,
 ) -> anyhow::Result<AppendEntriesResponse>
 where
@@ -280,7 +280,7 @@ where
             req.prev_log_index + 1,
             req.leader_id,
             &mut state,
-            client_manager,
+            request_tracker,
         )
         .await?;
         advance_commit_index(req.leader_commit, &mut state).await?;
@@ -594,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_entries_clears_pending_responses_on_conflict()
     -> anyhow::Result<()> {
-        use crate::client_manager::ClientResponseManager;
+        use crate::request_tracker::RequestTracker;
 
         let mut follower_state = RaftState::new(
             1,
@@ -615,14 +615,16 @@ mod tests {
             command: bytes::Bytes::from(&b"cmd3_old"[..]),
         });
 
-        let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
+        let request_tracker = Arc::new(Mutex::new(RequestTracker::new()));
 
         let (tx1, _rx1) = tokio::sync::oneshot::channel();
         let (tx2, mut rx2) = tokio::sync::oneshot::channel();
         let (tx3, mut rx3) = tokio::sync::oneshot::channel();
-        client_manager.lock().await.register(1, tx1);
-        client_manager.lock().await.register(2, tx2);
-        client_manager.lock().await.register(3, tx3);
+        let timeout =
+            std::time::Instant::now() + std::time::Duration::from_secs(30);
+        request_tracker.lock().await.track_write(1, tx1, timeout);
+        request_tracker.lock().await.track_write(2, tx2, timeout);
+        request_tracker.lock().await.track_write(3, tx3, timeout);
 
         let state = Arc::new(Mutex::new(follower_state));
 
@@ -644,7 +646,7 @@ mod tests {
         let response = handle_append_entries(
             &req,
             state.clone(),
-            Some(client_manager.clone()),
+            Some(request_tracker.clone()),
         )
         .await?;
         assert!(response.success);
@@ -655,7 +657,7 @@ mod tests {
         assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2_new");
         drop(final_state);
 
-        drop(client_manager);
+        drop(request_tracker);
 
         assert!(
             matches!(
