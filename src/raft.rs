@@ -22,6 +22,7 @@ pub struct PersistentState<T: Send + Sync> {
 pub struct LeaderState {
     pub next_index: HashMap<SocketAddr, u32>,
     pub match_index: HashMap<SocketAddr, u32>,
+    pub inflight_index: HashMap<SocketAddr, Option<u32>>,
     pub noop_index: Option<u32>,
 }
 
@@ -29,15 +30,18 @@ impl LeaderState {
     pub fn new(peers: &[SocketAddr], last_log_index: u32) -> Self {
         let mut next_index = HashMap::new();
         let mut match_index = HashMap::new();
+        let mut inflight_index = HashMap::new();
 
         for peer in peers {
             next_index.insert(*peer, last_log_index + 1);
             match_index.insert(*peer, 0);
+            inflight_index.insert(*peer, None);
         }
 
         Self {
             next_index,
             match_index,
+            inflight_index,
             noop_index: None,
         }
     }
