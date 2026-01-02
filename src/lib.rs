@@ -5,6 +5,7 @@ pub mod events;
 pub mod network;
 pub mod node;
 pub mod raft;
+pub mod request_tracker;
 pub mod rpc;
 pub mod server;
 pub mod statemachine;
