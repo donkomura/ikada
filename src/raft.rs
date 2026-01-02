@@ -61,6 +61,7 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     apply_notifier: Option<mpsc::UnboundedSender<AppliedEntry<SM::Response>>>,
 
     pub replication_notifier: Arc<Notify>,
+    pub last_applied_notifier: Arc<Notify>,
 }
 
 impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
@@ -83,6 +84,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             state_machine: sm,
             apply_notifier: None,
             replication_notifier: Arc::new(Notify::new()),
+            last_applied_notifier: Arc::new(Notify::new()),
         }
     }
 
@@ -126,6 +128,11 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
 
             responses.push(response);
         }
+
+        if !responses.is_empty() {
+            self.last_applied_notifier.notify_waiters();
+        }
+
         Ok(responses)
     }
     pub fn get_last_log_idx(&self) -> u32 {
