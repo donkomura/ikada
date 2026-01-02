@@ -24,12 +24,64 @@ pub struct PersistentState<T: Send + Sync> {
     pub log: Vec<Entry<T>>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone)]
+pub struct LeaderState {
+    pub next_index: HashMap<SocketAddr, u32>,
+    pub match_index: HashMap<SocketAddr, u32>,
+    pub noop_index: Option<u32>,
+}
+
+impl LeaderState {
+    pub fn new(peers: &[SocketAddr], last_log_index: u32) -> Self {
+        let mut next_index = HashMap::new();
+        let mut match_index = HashMap::new();
+
+        for peer in peers {
+            next_index.insert(*peer, last_log_index + 1);
+            match_index.insert(*peer, 0);
+        }
+
+        Self {
+            next_index,
+            match_index,
+            noop_index: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Role {
-    #[default]
     Follower,
     Candidate,
-    Leader,
+    Leader(LeaderState),
+}
+
+impl Role {
+    pub fn is_leader(&self) -> bool {
+        matches!(self, Role::Leader(_))
+    }
+
+    pub fn is_follower(&self) -> bool {
+        matches!(self, Role::Follower)
+    }
+
+    pub fn is_candidate(&self) -> bool {
+        matches!(self, Role::Candidate)
+    }
+
+    pub fn leader_state(&self) -> Option<&LeaderState> {
+        match self {
+            Role::Leader(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    pub fn leader_state_mut(&mut self) -> Option<&mut LeaderState> {
+        match self {
+            Role::Leader(state) => Some(state),
+            _ => None,
+        }
+    }
 }
 
 pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
@@ -40,19 +92,10 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     pub commit_index: u32,
     pub last_applied: u32,
 
-    // Volatile state on leader
-    pub next_index: HashMap<SocketAddr, u32>,
-    pub match_index: HashMap<SocketAddr, u32>,
-
     pub role: Role,
+
     pub leader_id: Option<u32>,
     pub id: u32,
-
-    // ReadIndex optimization: track the index of the no-op entry added when becoming leader
-    // Based on: https://github.com/drmingdrmer/consensus-essence/blob/main/src/list/raft-read-index/raft-read-index.md
-    // The noop entry ensures that all committed entries from previous terms are applied
-    // before serving read requests, preventing stale reads.
-    pub noop_index: Option<u32>,
 
     storage: Box<dyn Storage<T>>,
     pub state_machine: SM,
@@ -61,6 +104,7 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     apply_notifier: Option<mpsc::UnboundedSender<AppliedEntry<SM::Response>>>,
 
     pub replication_notifier: Arc<Notify>,
+    pub last_applied_notifier: Arc<Notify>,
 }
 
 impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
@@ -74,15 +118,13 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             role: Role::Follower,
             commit_index: 0,
             last_applied: 0,
-            next_index: HashMap::new(),
-            match_index: HashMap::new(),
             leader_id: None,
             id,
-            noop_index: None,
             storage,
             state_machine: sm,
             apply_notifier: None,
             replication_notifier: Arc::new(Notify::new()),
+            last_applied_notifier: Arc::new(Notify::new()),
         }
     }
 
@@ -126,6 +168,11 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
 
             responses.push(response);
         }
+
+        if !responses.is_empty() {
+            self.last_applied_notifier.notify_waiters();
+        }
+
         Ok(responses)
     }
     pub fn get_last_log_idx(&self) -> u32 {
@@ -139,6 +186,27 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     }
     pub fn get_last_voted_term(&self) -> u32 {
         0u32
+    }
+
+    pub fn become_follower(&mut self, term: u32, leader_id: Option<u32>) {
+        self.persistent.current_term = term;
+        self.persistent.voted_for = None;
+        self.role = Role::Follower;
+        self.leader_id = leader_id;
+    }
+
+    pub fn become_candidate(&mut self) {
+        self.persistent.current_term += 1;
+        self.persistent.voted_for = Some(self.id);
+        self.role = Role::Candidate;
+        self.leader_id = None;
+    }
+
+    pub fn become_leader(&mut self, peers: &[SocketAddr]) {
+        let last_log_index = self.get_last_log_idx();
+        let leader_state = LeaderState::new(peers, last_log_index);
+        self.role = Role::Leader(leader_state);
+        self.leader_id = Some(self.id);
     }
 }
 
@@ -238,7 +306,7 @@ mod tests {
         {
             let mut state = follower_state.lock().await;
             state.persistent.current_term = 1;
-            state.role = Role::Follower;
+            // Follower state set via become_follower
             state.leader_id = Some(10001);
         }
 
@@ -321,7 +389,8 @@ mod tests {
         {
             let mut state = old_leader_state.lock().await;
             state.persistent.current_term = 1;
-            state.role = Role::Leader;
+            state.role =
+                Role::Leader(LeaderState::new(&[], state.get_last_log_idx()));
             state.persistent.log.push(Entry {
                 term: 1,
                 command: KVCommand::Put {
@@ -376,9 +445,8 @@ mod tests {
 
         {
             let state = old_leader_state.lock().await;
-            assert_eq!(
-                state.role,
-                Role::Follower,
+            assert!(
+                state.role.is_follower(),
                 "Old leader should have stepped down to follower"
             );
             assert_eq!(
@@ -430,7 +498,10 @@ mod tests {
             KVStateMachine::default(),
         );
         leader_state.persistent.current_term = 1;
-        leader_state.role = Role::Leader;
+        leader_state.role = Role::Leader(LeaderState::new(
+            &[],
+            leader_state.get_last_log_idx(),
+        ));
 
         // Leader commits and applies value 1
         leader_state.persistent.log.push(Entry {

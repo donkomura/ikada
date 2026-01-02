@@ -7,7 +7,7 @@
 
 use super::Node;
 use crate::network::NetworkFactory;
-use crate::raft::{self, Role};
+use crate::raft::{self};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::collections::HashMap;
@@ -43,13 +43,24 @@ where
 
             // Copy log and peer state data
             let log_entries = state.persistent.log.clone();
-            let next_indices: Vec<_> = self
-                .peers
-                .keys()
-                .map(|addr| {
-                    (*addr, state.next_index.get(addr).copied().unwrap_or(1))
-                })
-                .collect();
+            let next_indices: Vec<_> =
+                if let Some(leader_state) = state.role.leader_state() {
+                    self.peers
+                        .keys()
+                        .map(|addr| {
+                            (
+                                *addr,
+                                leader_state
+                                    .next_index
+                                    .get(addr)
+                                    .copied()
+                                    .unwrap_or(1),
+                            )
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                };
 
             (
                 state.persistent.current_term,
@@ -121,7 +132,7 @@ where
 
                     let still_leader = {
                         let state = self.state.lock().await;
-                        matches!(state.role, Role::Leader)
+                        state.role.is_leader()
                     };
 
                     if !still_leader {
@@ -237,18 +248,23 @@ where
         let mut state = self.state.lock().await;
 
         // Only leaders can update commit_index this way
-        if !matches!(state.role, Role::Leader) {
+        if !state.role.is_leader() {
             return Ok(());
         }
 
         let current_commit_index = state.commit_index;
-        let new_commit_index = Self::new_commit_index(
-            state.commit_index,
-            state.persistent.current_term,
-            &state.persistent.log,
-            &state.match_index,
-            self.peers.len(),
-        );
+        let new_commit_index =
+            if let Some(leader_state) = state.role.leader_state() {
+                Self::new_commit_index(
+                    state.commit_index,
+                    state.persistent.current_term,
+                    &state.persistent.log,
+                    &leader_state.match_index,
+                    self.peers.len(),
+                )
+            } else {
+                state.commit_index
+            };
 
         // Update commit_index if we found a higher value
         if new_commit_index > current_commit_index {
@@ -274,7 +290,7 @@ where
         let mut state = self.state.lock().await;
 
         // Only leaders should call this
-        if !matches!(state.role, Role::Leader) {
+        if !state.role.is_leader() {
             return Ok(());
         }
 
@@ -304,34 +320,42 @@ where
         if check_term {
             {
                 let mut state = self.state.lock().await;
-                state.persistent.current_term = res.term;
-                state.role = Role::Follower;
-                state.persistent.voted_for = None;
+                state.become_follower(res.term, None);
                 let _ = state.persist().await;
             }
-            self.become_follower().await?;
+            self.heartbeat_failure_count = 0;
             return Ok(());
         }
 
-        let (_id, role, current_term) = {
+        let (_id, is_leader, current_term) = {
             let state = self.state.lock().await;
-            (state.id, state.role, state.persistent.current_term)
+            (
+                state.id,
+                state.role.is_leader(),
+                state.persistent.current_term,
+            )
         };
-        if matches!(role, Role::Leader) && current_term != res.term {
+        if is_leader && current_term != res.term {
             return Ok(());
         }
 
         // Step 6-7: Update replication state based on follower's response
         let notifier = {
             let mut state = self.state.lock().await;
-            if res.success {
-                state.match_index.insert(addr, sent_up_to_index);
-                state.next_index.insert(addr, sent_up_to_index + 1);
-            } else {
-                let current_next_idx =
-                    state.next_index.get(&addr).copied().unwrap_or(1);
-                let new_next_idx = current_next_idx.saturating_sub(1).max(1);
-                state.next_index.insert(addr, new_next_idx);
+            if let Some(leader_state) = state.role.leader_state_mut() {
+                if res.success {
+                    leader_state.match_index.insert(addr, sent_up_to_index);
+                    leader_state.next_index.insert(addr, sent_up_to_index + 1);
+                } else {
+                    let current_next_idx = leader_state
+                        .next_index
+                        .get(&addr)
+                        .copied()
+                        .unwrap_or(1);
+                    let new_next_idx =
+                        current_next_idx.saturating_sub(1).max(1);
+                    leader_state.next_index.insert(addr, new_next_idx);
+                }
             }
             state.replication_notifier.clone()
         };
@@ -380,8 +404,11 @@ mod tests {
         // ログエントリを追加: 古いterm と 現在のterm
         {
             let mut state = node.state.lock().await;
-            state.role = Role::Leader;
             state.persistent.current_term = 5;
+            state.role = raft::Role::Leader(raft::LeaderState::new(
+                &[peer1, peer2],
+                state.get_last_log_idx(),
+            ));
             state.commit_index = 0;
 
             // 古いterm=3のエントリ
@@ -405,24 +432,30 @@ mod tests {
             });
 
             // match_indexを設定: すべてのエントリが過半数に複製されている
-            state.match_index.insert(peer1, 4);
-            state.match_index.insert(peer2, 4);
+            if let Some(leader_state) = state.role.leader_state_mut() {
+                leader_state.match_index.insert(peer1, 4);
+                leader_state.match_index.insert(peer2, 4);
+            }
         }
 
         // new_commit_index()を直接テスト
         let new_commit_index = {
             let state = node.state.lock().await;
-            Node::<
-                bytes::Bytes,
-                crate::statemachine::NoOpStateMachine,
-                crate::network::mock::MockNetworkFactory,
-            >::new_commit_index(
-                state.commit_index,
-                state.persistent.current_term,
-                &state.persistent.log,
-                &state.match_index,
-                2, // peer_count = 2
-            )
+            if let Some(leader_state) = state.role.leader_state() {
+                Node::<
+                    bytes::Bytes,
+                    crate::statemachine::NoOpStateMachine,
+                    crate::network::mock::MockNetworkFactory,
+                >::new_commit_index(
+                    state.commit_index,
+                    state.persistent.current_term,
+                    &state.persistent.log,
+                    &leader_state.match_index,
+                    2, // peer_count = 2
+                )
+            } else {
+                state.commit_index
+            }
         };
 
         // 期待値: term=3のエントリ（index 1,2）はスキップされ、

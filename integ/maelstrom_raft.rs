@@ -433,7 +433,7 @@ impl MaelstromRaftNode {
             .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
         let state_inner = state.lock().await;
 
-        if state_inner.role == ikada::raft::Role::Leader {
+        if state_inner.role.is_leader() {
             return Ok(None);
         }
 
@@ -776,7 +776,7 @@ impl MaelstromRaftNode {
             .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
         let state_inner = state.lock().await;
 
-        Ok(state_inner.role == ikada::raft::Role::Leader)
+        Ok(state_inner.role.is_leader())
     }
 
     async fn forward_cas_if_possible(
