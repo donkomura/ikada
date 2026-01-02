@@ -180,6 +180,7 @@ where
     /// Step 4: Node transitions to leader role and initializes replication state for each follower
     pub(super) async fn become_leader(&mut self) -> anyhow::Result<()>
     where
+        // T::default() is used to create a noop command that has no side effects.
         T: Default,
     {
         let mut state = self.state.lock().await;

@@ -48,6 +48,9 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     pub id: u32,
 
     // ReadIndex optimization: track the index of the no-op entry added when becoming leader
+    // Based on: https://github.com/drmingdrmer/consensus-essence/blob/main/src/list/raft-read-index/raft-read-index.md
+    // The noop entry ensures that all committed entries from previous terms are applied
+    // before serving read requests, preventing stale reads.
     pub noop_index: Option<u32>,
 
     storage: Box<dyn Storage<T>>,

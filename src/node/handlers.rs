@@ -694,6 +694,8 @@ where
 
 /// Handles a read-only request using ReadIndex optimization.
 ///
+/// Based on: https://github.com/drmingdrmer/consensus-essence/blob/main/src/list/raft-read-index/raft-read-index.md
+///
 /// ReadIndex Algorithm (from consensus-essence):
 /// Step 1: Initial Commit Check - verify leader's latest term entry is committed
 /// Step 2: Set ReadIndex - set to max(CommitIndex, NoopIndex)
