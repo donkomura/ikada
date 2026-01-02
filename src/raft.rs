@@ -13,12 +13,6 @@ pub struct Entry<T: Send + Sync> {
 }
 
 #[derive(Debug, Clone)]
-pub struct AppliedEntry<R> {
-    pub log_index: u32,
-    pub response: R,
-}
-
-#[derive(Debug, Clone)]
 pub struct PersistentState<T: Send + Sync> {
     pub current_term: u32,
     pub voted_for: Option<u32>,
