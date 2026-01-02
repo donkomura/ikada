@@ -457,7 +457,13 @@ where
     SM: StateMachine<Command = T>,
 {
     let start = std::time::Instant::now();
-    let poll_interval = std::time::Duration::from_millis(10);
+    let timeout_deadline = tokio::time::sleep(timeout);
+    tokio::pin!(timeout_deadline);
+
+    let notifier = {
+        let state_guard = state.lock().await;
+        state_guard.replication_notifier.clone()
+    };
 
     loop {
         if start.elapsed() > timeout {
@@ -500,7 +506,20 @@ where
             return Ok(());
         }
 
-        tokio::time::sleep(poll_interval).await;
+        // Waiting Point 2: Wait for this log_index to reach majority replication.
+        tokio::select! {
+            _ = &mut timeout_deadline => {
+                return Err(CommandResponse {
+                    success: false,
+                    leader_hint: None,
+                    data: None,
+                    error: Some("Timeout waiting for majority replication".to_string()),
+                });
+            }
+            _ = notifier.notified() => {
+                continue;
+            }
+        }
     }
 }
 

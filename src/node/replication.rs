@@ -112,6 +112,7 @@ where
         let mut success_count = 0; // Leader already counts as 1 in match_index logic
         let mut failure_count = 0;
 
+        // Waiting Point 1: Collect responses for the current heartbeat round.
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok(Ok((server, res, sent_up_to_index))) => {
@@ -321,7 +322,7 @@ where
         }
 
         // Step 6-7: Update replication state based on follower's response
-        {
+        let notifier = {
             let mut state = self.state.lock().await;
             if res.success {
                 state.match_index.insert(addr, sent_up_to_index);
@@ -332,7 +333,10 @@ where
                 let new_next_idx = current_next_idx.saturating_sub(1).max(1);
                 state.next_index.insert(addr, new_next_idx);
             }
-        }
+            state.replication_notifier.clone()
+        };
+
+        notifier.notify_waiters();
 
         // Note: Step 8 (commit_index update and state machine application) is now
         // performed once after all Acks are collected in run_leader(), not here

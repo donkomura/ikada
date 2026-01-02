@@ -2,7 +2,8 @@ use crate::statemachine::StateMachine;
 use crate::storage::Storage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{Notify, mpsc};
 
 #[derive(Debug, Clone)]
 pub struct Entry<T: Send + Sync> {
@@ -58,6 +59,8 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
 
     // Event notifier for applied entries
     apply_notifier: Option<mpsc::UnboundedSender<AppliedEntry<SM::Response>>>,
+
+    pub replication_notifier: Arc<Notify>,
 }
 
 impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
@@ -79,6 +82,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             storage,
             state_machine: sm,
             apply_notifier: None,
+            replication_notifier: Arc::new(Notify::new()),
         }
     }
 
