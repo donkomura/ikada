@@ -32,6 +32,64 @@ pub enum Role {
     Leader,
 }
 
+pub struct LeaderState {
+    pub next_index: HashMap<SocketAddr, u32>,
+    pub match_index: HashMap<SocketAddr, u32>,
+    pub noop_index: Option<u32>,
+}
+
+impl LeaderState {
+    pub fn new(peers: &[SocketAddr], last_log_index: u32) -> Self {
+        let mut next_index = HashMap::new();
+        let mut match_index = HashMap::new();
+
+        for peer in peers {
+            next_index.insert(*peer, last_log_index + 1);
+            match_index.insert(*peer, 0);
+        }
+
+        Self {
+            next_index,
+            match_index,
+            noop_index: None,
+        }
+    }
+}
+
+pub enum RoleState {
+    Follower,
+    Candidate,
+    Leader(LeaderState),
+}
+
+impl RoleState {
+    pub fn role(&self) -> Role {
+        match self {
+            RoleState::Follower => Role::Follower,
+            RoleState::Candidate => Role::Candidate,
+            RoleState::Leader(_) => Role::Leader,
+        }
+    }
+
+    pub fn is_leader(&self) -> bool {
+        matches!(self, RoleState::Leader(_))
+    }
+
+    pub fn leader_state(&self) -> Option<&LeaderState> {
+        match self {
+            RoleState::Leader(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    pub fn leader_state_mut(&mut self) -> Option<&mut LeaderState> {
+        match self {
+            RoleState::Leader(state) => Some(state),
+            _ => None,
+        }
+    }
+}
+
 pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     // Persistent state on all services
     pub persistent: PersistentState<T>,
@@ -40,19 +98,18 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     pub commit_index: u32,
     pub last_applied: u32,
 
-    // Volatile state on leader
+    // Role-specific state (new design)
+    role_state: RoleState,
+
+    // Deprecated: kept for backward compatibility during transition
+    // These fields are kept in sync with role_state
     pub next_index: HashMap<SocketAddr, u32>,
     pub match_index: HashMap<SocketAddr, u32>,
-
     pub role: Role,
+    pub noop_index: Option<u32>,
+
     pub leader_id: Option<u32>,
     pub id: u32,
-
-    // ReadIndex optimization: track the index of the no-op entry added when becoming leader
-    // Based on: https://github.com/drmingdrmer/consensus-essence/blob/main/src/list/raft-read-index/raft-read-index.md
-    // The noop entry ensures that all committed entries from previous terms are applied
-    // before serving read requests, preventing stale reads.
-    pub noop_index: Option<u32>,
 
     storage: Box<dyn Storage<T>>,
     pub state_machine: SM,
@@ -72,6 +129,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
                 voted_for: None,
                 log: Vec::new(),
             },
+            role_state: RoleState::Follower,
             role: Role::Follower,
             commit_index: 0,
             last_applied: 0,
@@ -146,6 +204,56 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     }
     pub fn get_last_voted_term(&self) -> u32 {
         0u32
+    }
+
+    fn sync_role_to_deprecated_fields(&mut self) {
+        self.role = self.role_state.role();
+        match &self.role_state {
+            RoleState::Follower | RoleState::Candidate => {
+                self.next_index.clear();
+                self.match_index.clear();
+                self.noop_index = None;
+            }
+            RoleState::Leader(leader_state) => {
+                self.next_index = leader_state.next_index.clone();
+                self.match_index = leader_state.match_index.clone();
+                self.noop_index = leader_state.noop_index;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn sync_deprecated_fields_to_role(&mut self) {
+        if let RoleState::Leader(leader_state) = &mut self.role_state {
+            leader_state.next_index = self.next_index.clone();
+            leader_state.match_index = self.match_index.clone();
+            leader_state.noop_index = self.noop_index;
+        }
+        self.role = self.role_state.role();
+    }
+
+    pub fn become_follower(&mut self, term: u32, leader_id: Option<u32>) {
+        self.persistent.current_term = term;
+        self.persistent.voted_for = None;
+        self.role_state = RoleState::Follower;
+        self.leader_id = leader_id;
+        self.sync_role_to_deprecated_fields();
+    }
+
+    pub fn become_candidate(&mut self) {
+        self.persistent.current_term += 1;
+        self.persistent.voted_for = Some(self.id);
+        self.role_state = RoleState::Candidate;
+        self.leader_id = None;
+        self.sync_role_to_deprecated_fields();
+    }
+
+    pub fn become_leader(&mut self, peers: &[SocketAddr]) {
+        let last_log_index = self.get_last_log_idx();
+        let leader_state = LeaderState::new(peers, last_log_index);
+        self.role_state = RoleState::Leader(leader_state);
+        self.leader_id = Some(self.id);
+        self.sync_role_to_deprecated_fields();
     }
 }
 
