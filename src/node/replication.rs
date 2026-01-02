@@ -47,15 +47,28 @@ where
                 if let Some(leader_state) = state.role.leader_state() {
                     self.peers
                         .keys()
-                        .map(|addr| {
-                            (
-                                *addr,
-                                leader_state
+                        .filter_map(|addr| {
+                            let inflight = leader_state
+                                .inflight_index
+                                .get(addr)
+                                .copied()
+                                .flatten();
+
+                            if inflight.is_some() {
+                                tracing::debug!(
+                                    peer = ?addr,
+                                    inflight_index = inflight,
+                                    "Skipping peer with inflight AppendEntries"
+                                );
+                                None
+                            } else {
+                                let next_idx = leader_state
                                     .next_index
                                     .get(addr)
                                     .copied()
-                                    .unwrap_or(1),
-                            )
+                                    .unwrap_or(1);
+                                Some((*addr, next_idx))
+                            }
                         })
                         .collect()
                 } else {
@@ -100,6 +113,15 @@ where
                 })
                 .collect();
             let sent_up_to_index = prev_log_idx + entries.len() as u32;
+
+            {
+                let mut state = self.state.lock().await;
+                if let Some(leader_state) = state.role.leader_state_mut() {
+                    leader_state
+                        .inflight_index
+                        .insert(addr, Some(sent_up_to_index));
+                }
+            }
 
             let req = AppendEntriesRequest {
                 term: leader_term,
@@ -343,6 +365,8 @@ where
         let notifier = {
             let mut state = self.state.lock().await;
             if let Some(leader_state) = state.role.leader_state_mut() {
+                leader_state.inflight_index.insert(addr, None);
+
                 if res.success {
                     leader_state.match_index.insert(addr, sent_up_to_index);
                     leader_state.next_index.insert(addr, sent_up_to_index + 1);
