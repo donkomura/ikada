@@ -38,10 +38,7 @@ where
     }
 
     if request_term > state.persistent.current_term {
-        state.persistent.current_term = request_term;
-        state.role = Role::Follower;
-        state.persistent.voted_for = None;
-        state.leader_id = Some(sender_id);
+        state.become_follower(request_term, Some(sender_id));
         if let Err(e) = state.persist().await {
             tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update");
             return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
@@ -52,7 +49,7 @@ where
     } else if request_term == state.persistent.current_term {
         state.leader_id = Some(sender_id);
         if matches!(state.role, Role::Candidate | Role::Leader) {
-            state.role = Role::Follower;
+            state.become_follower(request_term, Some(sender_id));
         }
     }
 

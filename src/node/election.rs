@@ -7,7 +7,6 @@
 
 use super::Node;
 use crate::network::NetworkFactory;
-use crate::raft::Role;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::net::SocketAddr;
@@ -185,14 +184,9 @@ where
     {
         let mut state = self.state.lock().await;
         tracing::info!(id=?state.id, term=state.persistent.current_term, "BECOMING LEADER");
-        state.role = Role::Leader;
-        state.leader_id = Some(state.id);
 
-        let last_log_idx = state.get_last_log_idx();
-        for peer_addr in self.peers.keys() {
-            state.next_index.insert(*peer_addr, last_log_idx + 1);
-            state.match_index.insert(*peer_addr, 0);
-        }
+        let peers: Vec<_> = self.peers.keys().copied().collect();
+        state.become_leader(&peers);
 
         // Append no-op entry for ReadIndex optimization
         let current_term = state.persistent.current_term;
@@ -218,9 +212,8 @@ where
     /// Transitions to follower and clears vote.
     pub(super) async fn become_follower(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
-        state.role = Role::Follower;
-        state.persistent.voted_for = None;
-        state.leader_id = None;
+        let current_term = state.persistent.current_term;
+        state.become_follower(current_term, None);
 
         self.heartbeat_failure_count = 0;
         Ok(())
@@ -232,9 +225,7 @@ where
     /// Step 1: Follower becomes candidate, increments term, and votes for itself
     pub(super) async fn become_candidate(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
-        state.role = Role::Candidate;
-        state.persistent.current_term += 1;
-        state.persistent.voted_for = Some(state.id);
+        state.become_candidate();
         state.persist().await?;
         Ok(())
     }
@@ -272,6 +263,7 @@ where
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::raft::Role;
 
     fn create_test_state_machine() -> crate::statemachine::NoOpStateMachine {
         crate::statemachine::NoOpStateMachine::default()

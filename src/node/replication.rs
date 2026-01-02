@@ -304,9 +304,7 @@ where
         if check_term {
             {
                 let mut state = self.state.lock().await;
-                state.persistent.current_term = res.term;
-                state.role = Role::Follower;
-                state.persistent.voted_for = None;
+                state.become_follower(res.term, None);
                 let _ = state.persist().await;
             }
             self.become_follower().await?;

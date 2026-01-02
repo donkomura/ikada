@@ -1,4 +1,4 @@
-use crate::raft::{RaftState, Role};
+use crate::raft::RaftState;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::sync::Arc;
@@ -16,9 +16,7 @@ where
         let mut state = state.lock().await;
 
         if req.term > state.persistent.current_term {
-            state.persistent.current_term = req.term;
-            state.role = Role::Follower;
-            state.persistent.voted_for = None;
+            state.become_follower(req.term, None);
             if let Err(e) = state.persist().await {
                 tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update in RequestVote");
                 return RequestVoteResponse {
@@ -95,7 +93,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft;
+    use crate::raft::{self, Role};
 
     fn create_test_storage<T: Send + Sync + Clone + 'static>()
     -> Box<dyn crate::storage::Storage<T>> {
