@@ -1,7 +1,6 @@
 pub mod client;
 pub mod client_manager;
 pub mod config;
-pub mod events;
 pub mod network;
 pub mod node;
 pub mod raft;

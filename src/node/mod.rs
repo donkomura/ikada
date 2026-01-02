@@ -12,7 +12,6 @@ mod replication;
 
 use crate::client_manager::ClientResponseManager;
 use crate::config::Config;
-use crate::events::RaftEvent;
 use crate::network::NetworkFactory;
 use crate::raft::RaftState;
 use crate::rpc::*;
@@ -111,24 +110,18 @@ where
         let storage = Box::new(MemStorage::default());
         let id = port as u32;
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (apply_tx, mut apply_rx) = tokio::sync::mpsc::unbounded_channel();
         let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
 
         let manager_clone = Arc::clone(&client_manager);
         tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                if let RaftEvent::LogApplied {
-                    log_index,
-                    response,
-                } = event
-                {
-                    manager_clone.lock().await.resolve(log_index, response);
-                }
+            while let Some((log_index, response)) = apply_rx.recv().await {
+                manager_clone.lock().await.resolve(log_index, response);
             }
         });
 
         let mut raft_state = RaftState::new(id, storage, sm);
-        raft_state.set_event_tx(event_tx);
+        raft_state.apply_tx = Some(apply_tx);
 
         Node {
             config,
@@ -148,19 +141,13 @@ where
         state: Arc<Mutex<RaftState<T, SM>>>,
         network_factory: NF,
     ) -> Self {
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (apply_tx, mut apply_rx) = tokio::sync::mpsc::unbounded_channel();
         let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
 
         let manager_clone = Arc::clone(&client_manager);
         tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                if let RaftEvent::LogApplied {
-                    log_index,
-                    response,
-                } = event
-                {
-                    manager_clone.lock().await.resolve(log_index, response);
-                }
+            while let Some((log_index, response)) = apply_rx.recv().await {
+                manager_clone.lock().await.resolve(log_index, response);
             }
         });
 
@@ -168,7 +155,7 @@ where
             let state_clone = Arc::clone(&state);
             async move {
                 let mut state = state_clone.lock().await;
-                state.set_event_tx(event_tx);
+                state.apply_tx = Some(apply_tx);
             }
         });
 

@@ -1,10 +1,9 @@
-use crate::events::RaftEvent;
 use crate::statemachine::StateMachine;
 use crate::storage::Storage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone)]
 pub struct Entry<T: Send + Sync> {
@@ -95,7 +94,8 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     storage: Box<dyn Storage<T>>,
     pub state_machine: SM,
 
-    event_tx: Option<mpsc::UnboundedSender<RaftEvent<SM::Response>>>,
+    pub apply_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<(u32, SM::Response)>>,
 
     pub replication_notifier: Arc<Notify>,
     pub last_applied_notifier: Arc<Notify>,
@@ -116,22 +116,9 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             id,
             storage,
             state_machine: sm,
-            event_tx: None,
+            apply_tx: None,
             replication_notifier: Arc::new(Notify::new()),
             last_applied_notifier: Arc::new(Notify::new()),
-        }
-    }
-
-    pub fn set_event_tx(
-        &mut self,
-        tx: mpsc::UnboundedSender<RaftEvent<SM::Response>>,
-    ) {
-        self.event_tx = Some(tx);
-    }
-
-    pub fn send_event(&self, event: RaftEvent<SM::Response>) {
-        if let Some(event_tx) = &self.event_tx {
-            let _ = event_tx.send(event);
         }
     }
 
@@ -158,10 +145,9 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             let entry = &self.persistent.log[(self.last_applied - 1) as usize];
             let response = self.state_machine.apply(&entry.command).await?;
 
-            self.send_event(RaftEvent::LogApplied {
-                log_index: self.last_applied,
-                response: response.clone(),
-            });
+            if let Some(apply_tx) = &self.apply_tx {
+                let _ = apply_tx.send((self.last_applied, response.clone()));
+            }
 
             responses.push(response);
         }
