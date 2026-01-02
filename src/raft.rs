@@ -4,7 +4,7 @@ use crate::storage::Storage;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, broadcast};
 
 #[derive(Debug, Clone)]
 pub struct Entry<T: Send + Sync> {
@@ -95,7 +95,7 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     storage: Box<dyn Storage<T>>,
     pub state_machine: SM,
 
-    event_tx: Option<mpsc::UnboundedSender<RaftEvent<SM::Response>>>,
+    event_tx: Option<broadcast::Sender<RaftEvent<SM::Response>>>,
 
     pub replication_notifier: Arc<Notify>,
     pub last_applied_notifier: Arc<Notify>,
@@ -124,7 +124,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
 
     pub fn set_event_tx(
         &mut self,
-        tx: mpsc::UnboundedSender<RaftEvent<SM::Response>>,
+        tx: broadcast::Sender<RaftEvent<SM::Response>>,
     ) {
         self.event_tx = Some(tx);
     }
