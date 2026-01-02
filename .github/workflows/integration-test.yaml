@@ -70,6 +70,22 @@ jobs:
             concurrency: "2n"
             nemesis: "partition"
             nemesis-interval: "3"
+          - test-name: "5nodes-high-rate-50"
+            workload: "lin-kv"
+            time-limit: 30
+            rate: 50
+            node-count: 5
+            concurrency: "2n"
+            nemesis: "partition"
+            nemesis-interval: "3"
+          - test-name: "5nodes-high-rate-100"
+            workload: "lin-kv"
+            time-limit: 30
+            rate: 100
+            node-count: 5
+            concurrency: "2n"
+            nemesis: "partition"
+            nemesis-interval: "3"
     steps:
       - uses: actions/checkout@v4
       - name: Install Java
