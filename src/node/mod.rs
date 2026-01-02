@@ -90,7 +90,6 @@ pub struct Node<
     pub network_factory: NF,
     heartbeat_failure_count: usize,
     pub client_manager: Arc<Mutex<ClientResponseManager<SM::Response>>>,
-    event_tx: tokio::sync::broadcast::Sender<RaftEvent<SM::Response>>,
 }
 
 impl<T, SM, NF> Node<T, SM, NF>
@@ -112,13 +111,12 @@ where
         let storage = Box::new(MemStorage::default());
         let id = port as u32;
 
-        let (event_tx, _) = tokio::sync::broadcast::channel(1000);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
 
         let manager_clone = Arc::clone(&client_manager);
-        let mut event_rx = event_tx.subscribe();
         tokio::spawn(async move {
-            while let Ok(event) = event_rx.recv().await {
+            while let Some(event) = event_rx.recv().await {
                 if let RaftEvent::LogApplied {
                     log_index,
                     response,
@@ -130,7 +128,7 @@ where
         });
 
         let mut raft_state = RaftState::new(id, storage, sm);
-        raft_state.set_event_tx(event_tx.clone());
+        raft_state.set_event_tx(event_tx);
 
         Node {
             config,
@@ -140,7 +138,6 @@ where
             network_factory,
             heartbeat_failure_count: 0,
             client_manager,
-            event_tx,
         }
     }
 
@@ -151,13 +148,12 @@ where
         state: Arc<Mutex<RaftState<T, SM>>>,
         network_factory: NF,
     ) -> Self {
-        let (event_tx, _) = tokio::sync::broadcast::channel(1000);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
 
         let manager_clone = Arc::clone(&client_manager);
-        let mut event_rx = event_tx.subscribe();
         tokio::spawn(async move {
-            while let Ok(event) = event_rx.recv().await {
+            while let Some(event) = event_rx.recv().await {
                 if let RaftEvent::LogApplied {
                     log_index,
                     response,
@@ -170,10 +166,9 @@ where
 
         tokio::spawn({
             let state_clone = Arc::clone(&state);
-            let event_tx_clone = event_tx.clone();
             async move {
                 let mut state = state_clone.lock().await;
-                state.set_event_tx(event_tx_clone);
+                state.set_event_tx(event_tx);
             }
         });
 
@@ -185,7 +180,6 @@ where
             network_factory,
             heartbeat_failure_count: 0,
             client_manager,
-            event_tx,
         }
     }
 
@@ -432,14 +426,5 @@ where
             }
         }
         Ok(())
-    }
-
-    /// Subscribes to RaftEvents emitted by this node.
-    ///
-    /// Multiple subscribers can receive events simultaneously.
-    pub fn subscribe_events(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<RaftEvent<SM::Response>> {
-        self.event_tx.subscribe()
     }
 }
