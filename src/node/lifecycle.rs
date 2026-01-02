@@ -120,9 +120,20 @@ where
     {
         let _id = self.state.lock().await.id;
 
-        let timeout = self.config.heartbeat_interval;
-        let watchdog = WatchDog::default();
-        watchdog.reset(timeout).await;
+        let heartbeat_timeout = self.config.heartbeat_interval;
+        let batch_window = self.config.batch_window;
+        let max_batch_size = self.config.max_batch_size;
+
+        let heartbeat_watchdog = WatchDog::default();
+        heartbeat_watchdog.reset(heartbeat_timeout).await;
+
+        let mut pending_requests: Vec<(
+            crate::rpc::CommandRequest,
+            tokio::sync::oneshot::Sender<crate::rpc::CommandResponse>,
+        )> = Vec::new();
+        let mut batch_timer = tokio::time::interval(batch_window);
+        batch_timer
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             if !matches!(self.state.lock().await.role, Role::Leader) {
@@ -130,31 +141,20 @@ where
             }
             tokio::select! {
                 Some((req, resp_tx)) = self.c.client_request_rx.recv() => {
-                    // Step 1: Client sends a write entry (data or command) to the leader
-                    // Step 2-9 are handled asynchronously in handle_client_request_impl
-                    let rpc_timeout = self.config.rpc_timeout;
-                    let state = self.state.clone();
-                    let peer_count = self.peers.len();
-                    let client_manager = self.client_manager.clone();
+                    pending_requests.push((req, resp_tx));
 
-                    tokio::spawn(async move {
-                        let resp = handlers::handle_client_request_impl(
-                            &req,
-                            state,
-                            rpc_timeout + std::time::Duration::from_millis(100),
-                            peer_count,
-                            client_manager,
-                        )
-                        .await;
-
-                        let _ = resp_tx.send(resp);
-                    });
+                    if pending_requests.len() >= max_batch_size {
+                        self.flush_request_batch(&mut pending_requests).await?;
+                    }
                 },
-                _ = watchdog.wait() => {
-                    // Step 3: Leader sends AppendEntries RPC to all followers in parallel
-                    // (includes current commit_index for Step 10)
-                    // Step 6-7: Receive Acks from followers
-                    // (handled in broadcast_heartbeat -> handle_heartbeat)
+                _ = batch_timer.tick(), if !pending_requests.is_empty() => {
+                    self.flush_request_batch(&mut pending_requests).await?;
+                },
+                _ = heartbeat_watchdog.wait() => {
+                    if !pending_requests.is_empty() {
+                        self.flush_request_batch(&mut pending_requests).await?;
+                    }
+
                     let has_majority = self.broadcast_heartbeat().await?;
 
                     if !has_majority {
@@ -176,21 +176,57 @@ where
                         self.heartbeat_failure_count = 0;
                     }
 
-                    // Step 8 (Part 1): Leader calculates new commit_index based on majority Acks
                     self.update_commit_index().await?;
-
-                    // Step 8 (Part 2): Leader applies committed entries to its own state machine
                     self.apply_committed_entries_on_leader().await?;
-
-                    // Step 9: Success responses to clients are sent by handle_client_request_impl
-                    // when entries are applied to state machine
-
-                    // Step 10: Next heartbeat will propagate the updated commit_index to followers
-                    // Step 11: Followers will apply committed entries when they receive Step 10
-                    watchdog.reset(timeout).await;
+                    heartbeat_watchdog.reset(heartbeat_timeout).await;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Flushes accumulated requests by spawning independent handlers.
+    ///
+    /// Batching allows multiple log entries to be replicated together,
+    /// reducing network overhead and improving throughput under load.
+    async fn flush_request_batch(
+        &mut self,
+        requests: &mut Vec<(
+            crate::rpc::CommandRequest,
+            tokio::sync::oneshot::Sender<crate::rpc::CommandResponse>,
+        )>,
+    ) -> anyhow::Result<()>
+    where
+        SM::Response: Clone + serde::Serialize,
+    {
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        let batch_size = requests.len();
+        tracing::debug!("Flushing batch of {} requests", batch_size);
+
+        let rpc_timeout = self.config.rpc_timeout;
+        let peer_count = self.peers.len();
+
+        for (req, resp_tx) in requests.drain(..) {
+            let state = self.state.clone();
+            let client_manager = self.client_manager.clone();
+
+            tokio::spawn(async move {
+                let resp = handlers::handle_client_request_impl(
+                    &req,
+                    state,
+                    rpc_timeout + std::time::Duration::from_millis(100),
+                    peer_count,
+                    client_manager,
+                )
+                .await;
+
+                let _ = resp_tx.send(resp);
+            });
+        }
+
         Ok(())
     }
 }

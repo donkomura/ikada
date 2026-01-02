@@ -7,6 +7,8 @@ pub struct Config {
     pub election_timeout: tokio::time::Duration,
     pub rpc_timeout: Duration,
     pub heartbeat_failure_retry_limit: u32,
+    pub batch_window: tokio::time::Duration,
+    pub max_batch_size: usize,
 }
 
 impl Default for Config {
@@ -21,6 +23,8 @@ impl Default for Config {
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
             rpc_timeout: tokio::time::Duration::from_millis(2000),
             heartbeat_failure_retry_limit: 1,
+            batch_window: tokio::time::Duration::from_millis(30),
+            max_batch_size: 100,
         }
     }
 }

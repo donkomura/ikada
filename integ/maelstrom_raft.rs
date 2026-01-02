@@ -271,6 +271,8 @@ impl MaelstromRaftNode {
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
             rpc_timeout: std::time::Duration::from_millis(100),
             heartbeat_failure_retry_limit: 5,
+            batch_window: tokio::time::Duration::from_millis(10),
+            max_batch_size: 100,
         };
 
         let node = Node::new_with_state(config, state, network_factory.clone());
