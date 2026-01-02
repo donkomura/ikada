@@ -12,6 +12,7 @@ mod replication;
 
 use crate::client_manager::ClientResponseManager;
 use crate::config::Config;
+use crate::events::RaftEvent;
 use crate::network::NetworkFactory;
 use crate::raft::{AppliedEntry, RaftState};
 use crate::rpc::*;
@@ -89,8 +90,7 @@ pub struct Node<
     pub network_factory: NF,
     heartbeat_failure_count: usize,
     pub client_manager: Arc<Mutex<ClientResponseManager<SM::Response>>>,
-    #[allow(dead_code)]
-    apply_event_tx: mpsc::UnboundedSender<AppliedEntry<SM::Response>>,
+    pub raft_event_rx: mpsc::UnboundedReceiver<RaftEvent>,
 }
 
 impl<T, SM, NF> Node<T, SM, NF>
@@ -113,6 +113,7 @@ where
         let id = port as u32;
 
         let (apply_event_tx, apply_event_rx) = mpsc::unbounded_channel();
+        let (raft_event_tx, raft_event_rx) = mpsc::unbounded_channel();
         let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
 
         let manager_clone = Arc::clone(&client_manager);
@@ -129,6 +130,7 @@ where
 
         let mut raft_state = RaftState::new(id, storage, sm);
         raft_state.set_apply_notifier(apply_event_tx.clone());
+        raft_state.set_event_tx(raft_event_tx);
 
         Node {
             config,
@@ -138,7 +140,7 @@ where
             network_factory,
             heartbeat_failure_count: 0,
             client_manager,
-            apply_event_tx,
+            raft_event_rx,
         }
     }
 
@@ -150,6 +152,7 @@ where
         network_factory: NF,
     ) -> Self {
         let (apply_event_tx, apply_event_rx) = mpsc::unbounded_channel();
+        let (raft_event_tx, raft_event_rx) = mpsc::unbounded_channel();
         let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
 
         let manager_clone = Arc::clone(&client_manager);
@@ -170,6 +173,7 @@ where
             async move {
                 let mut state = state_clone.lock().await;
                 state.set_apply_notifier(apply_event_tx_clone);
+                state.set_event_tx(raft_event_tx);
             }
         });
 
@@ -181,7 +185,7 @@ where
             network_factory,
             heartbeat_failure_count: 0,
             client_manager,
-            apply_event_tx,
+            raft_event_rx,
         }
     }
 

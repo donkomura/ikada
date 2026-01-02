@@ -1,3 +1,4 @@
+use crate::events::RaftEvent;
 use crate::statemachine::StateMachine;
 use crate::storage::Storage;
 use std::collections::HashMap;
@@ -103,6 +104,8 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     // Event notifier for applied entries
     apply_notifier: Option<mpsc::UnboundedSender<AppliedEntry<SM::Response>>>,
 
+    event_tx: Option<mpsc::UnboundedSender<RaftEvent>>,
+
     pub replication_notifier: Arc<Notify>,
     pub last_applied_notifier: Arc<Notify>,
 }
@@ -123,6 +126,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             storage,
             state_machine: sm,
             apply_notifier: None,
+            event_tx: None,
             replication_notifier: Arc::new(Notify::new()),
             last_applied_notifier: Arc::new(Notify::new()),
         }
@@ -133,6 +137,16 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         notifier: mpsc::UnboundedSender<AppliedEntry<SM::Response>>,
     ) {
         self.apply_notifier = Some(notifier);
+    }
+
+    pub fn set_event_tx(&mut self, tx: mpsc::UnboundedSender<RaftEvent>) {
+        self.event_tx = Some(tx);
+    }
+
+    pub fn send_event(&self, event: RaftEvent) {
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx.send(event);
+        }
     }
 
     pub async fn persist(&mut self) -> anyhow::Result<()> {
@@ -165,6 +179,10 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
                     response: response.clone(),
                 });
             }
+
+            self.send_event(RaftEvent::LogApplied {
+                index: self.last_applied,
+            });
 
             responses.push(response);
         }
