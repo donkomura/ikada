@@ -29,7 +29,10 @@ where
     pub(super) async fn main(
         mut self,
         servers: Vec<SocketAddr>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        T: Default,
+    {
         self.setup(servers).await?;
 
         loop {
@@ -79,7 +82,10 @@ where
 
     /// Runs as candidate, starting elections periodically.
     /// Transitions to follower if a valid leader's heartbeat is received.
-    pub async fn run_candidate(&mut self) -> anyhow::Result<()> {
+    pub async fn run_candidate(&mut self) -> anyhow::Result<()>
+    where
+        T: Default,
+    {
         let timeout = self.config.election_timeout;
         let watchdog = WatchDog::default();
 

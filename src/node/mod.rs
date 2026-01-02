@@ -29,6 +29,7 @@ pub enum Command {
     AppendEntries(AppendEntriesRequest, oneshot::Sender<AppendEntriesResponse>),
     RequestVote(RequestVoteRequest, oneshot::Sender<RequestVoteResponse>),
     ClientRequest(CommandRequest, oneshot::Sender<CommandResponse>),
+    ReadRequest(CommandRequest, oneshot::Sender<CommandResponse>),
 }
 
 /// Chan holds all channels needed for node-internal communication.
@@ -217,7 +218,10 @@ where
         self,
         port: u16,
         servers: Vec<SocketAddr>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        T: Default,
+    {
         let (tx, rx) = mpsc::channel::<Command>(32);
         let mut workers = JoinSet::new();
         workers.spawn(self.run_with_handler(servers, rx));
@@ -239,7 +243,10 @@ where
         mut self,
         servers: Vec<SocketAddr>,
         cmd_rx: mpsc::Receiver<Command>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        T: Default,
+    {
         self.setup(servers).await?;
 
         let state = Arc::clone(&self.state);
@@ -322,6 +329,45 @@ where
                             // Send to leader loop for processing
                             let _ =
                                 client_request_tx_clone.send((req, resp_tx));
+                        } else {
+                            // Not a leader, return error with leader hint
+                            let leader_hint = {
+                                let state = state_clone.lock().await;
+                                state.leader_id
+                            };
+                            let _ = resp_tx.send(CommandResponse {
+                                success: false,
+                                leader_hint,
+                                data: None,
+                                error: Some("Not the leader".to_string()),
+                            });
+                        }
+                    });
+                }
+                Command::ReadRequest(req, resp_tx) => {
+                    let state_clone = Arc::clone(&state);
+                    let _client_manager_clone = Arc::clone(&client_manager);
+                    tokio::spawn(async move {
+                        // Check if this node is the leader
+                        let role = {
+                            let state = state_clone.lock().await;
+                            state.role
+                        };
+
+                        if matches!(role, crate::raft::Role::Leader) {
+                            // Use ReadIndex optimization for reads
+                            let peer_count = {
+                                let state = state_clone.lock().await;
+                                state.match_index.len()
+                            };
+                            let resp = handlers::handle_read_index_request(
+                                &req,
+                                state_clone,
+                                std::time::Duration::from_millis(2000),
+                                peer_count,
+                            )
+                            .await;
+                            let _ = resp_tx.send(resp);
                         } else {
                             // Not a leader, return error with leader hint
                             let leader_hint = {
