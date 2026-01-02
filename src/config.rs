@@ -23,7 +23,7 @@ impl Default for Config {
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
             rpc_timeout: tokio::time::Duration::from_millis(2000),
             heartbeat_failure_retry_limit: 1,
-            batch_window: tokio::time::Duration::from_millis(10),
+            batch_window: tokio::time::Duration::from_millis(30),
             max_batch_size: 100,
         }
     }
