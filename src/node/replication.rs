@@ -112,6 +112,7 @@ where
         let mut success_count = 0; // Leader already counts as 1 in match_index logic
         let mut failure_count = 0;
 
+        // Waiting Point 1: Collect responses for the current heartbeat round.
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok(Ok((server, res, sent_up_to_index))) => {

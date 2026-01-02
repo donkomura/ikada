@@ -506,6 +506,7 @@ where
             return Ok(());
         }
 
+        // Waiting Point 2: Wait for this log_index to reach majority replication.
         tokio::select! {
             _ = &mut timeout_deadline => {
                 return Err(CommandResponse {
