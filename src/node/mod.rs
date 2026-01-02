@@ -34,11 +34,18 @@ pub enum Command {
 
 /// Chan holds all channels needed for node-internal communication.
 /// Separated from Node to keep initialization logic cleaner.
-pub struct Chan<T> {
+///
+/// Channel usage by role:
+/// - heartbeat: Used by all roles (Follower/Candidate receive, Leader sends)
+/// - client_request: Used only by Leader to process client write requests
+pub struct Chan {
+    /// Heartbeat notification channel (leader_id, term)
+    /// Used by all roles to detect leader presence
     pub heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
     pub heartbeat_rx: mpsc::UnboundedReceiver<(u32, u32)>,
-    pub client_tx: mpsc::Sender<T>,
-    pub client_rx: mpsc::Receiver<T>,
+
+    /// Client write request channel
+    /// Used only by Leader role to batch and process client commands
     pub client_request_tx: mpsc::UnboundedSender<(
         CommandRequest,
         oneshot::Sender<CommandResponse>,
@@ -49,22 +56,19 @@ pub struct Chan<T> {
     )>,
 }
 
-impl<T> Default for Chan<T> {
+impl Default for Chan {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> Chan<T> {
+impl Chan {
     pub fn new() -> Self {
         let (heartbeat_tx, heartbeat_rx) = mpsc::unbounded_channel();
-        let (client_tx, client_rx) = mpsc::channel::<T>(32);
         let (client_request_tx, client_request_rx) = mpsc::unbounded_channel();
         Self {
             heartbeat_tx,
             heartbeat_rx,
-            client_tx,
-            client_rx,
             client_request_tx,
             client_request_rx,
         }
@@ -81,7 +85,7 @@ pub struct Node<
     pub config: Config,
     pub peers: HashMap<SocketAddr, Arc<dyn RaftRpcTrait>>,
     pub state: Arc<Mutex<RaftState<T, SM>>>,
-    pub c: Chan<T>,
+    pub c: Chan,
     pub network_factory: NF,
     heartbeat_failure_count: usize,
     pub client_manager: Arc<Mutex<ClientResponseManager<SM::Response>>>,
