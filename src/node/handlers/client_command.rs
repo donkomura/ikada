@@ -104,8 +104,8 @@ where
 async fn append_command_to_log<T, SM>(
     state: &mut RaftState<T, SM>,
     command: T,
-    client_manager: Arc<
-        Mutex<crate::client_manager::ClientResponseManager<SM::Response>>,
+    request_tracker: Arc<
+        Mutex<crate::request_tracker::RequestTracker<SM::Response>>,
     >,
 ) -> Result<(u32, tokio::sync::oneshot::Receiver<SM::Response>), CommandResponse>
 where
@@ -130,7 +130,11 @@ where
     }
 
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    client_manager.lock().await.register(log_index, result_tx);
+    request_tracker.lock().await.track_write(
+        log_index,
+        result_tx,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    );
 
     tracing::debug!(
         id = state.id,
@@ -185,8 +189,8 @@ pub async fn handle_client_request_impl<T, SM>(
     state: Arc<Mutex<RaftState<T, SM>>>,
     timeout: std::time::Duration,
     peer_count: usize,
-    client_manager: Arc<
-        Mutex<crate::client_manager::ClientResponseManager<SM::Response>>,
+    request_tracker: Arc<
+        Mutex<crate::request_tracker::RequestTracker<SM::Response>>,
     >,
 ) -> CommandResponse
 where
@@ -233,7 +237,7 @@ where
         match append_command_to_log(
             &mut state_guard,
             command.clone(),
-            client_manager.clone(),
+            request_tracker.clone(),
         )
         .await
         {

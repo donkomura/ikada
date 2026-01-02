@@ -15,6 +15,7 @@ pub enum PendingRequest<R> {
     },
 }
 
+/// Bridges cluster-wide log indices with node-local client response channels.
 pub struct RequestTracker<R> {
     pending_writes: HashMap<u32, PendingRequest<R>>,
     pending_reads: Vec<PendingRequest<R>>,
@@ -67,25 +68,37 @@ impl<R> RequestTracker<R> {
         }
     }
 
-    pub fn complete_reads(&mut self, last_applied: u32) -> Vec<u32>
-    where
+    pub fn complete_reads(
+        &mut self,
+        last_applied: u32,
+        get_response: impl Fn() -> R,
+    ) where
         R: Clone,
     {
-        let mut completed_indices = Vec::new();
-        self.pending_reads.retain(|req| {
+        let mut remaining = Vec::new();
+        for req in self.pending_reads.drain(..) {
             if let PendingRequest::Read {
                 read_index,
-                response_tx: _,
-                timeout: _,
+                response_tx,
+                timeout,
             } = req
-                && *read_index <= last_applied
             {
-                completed_indices.push(*read_index);
-                return false;
+                if read_index <= last_applied {
+                    let _ = response_tx.send(get_response());
+                } else {
+                    remaining.push(PendingRequest::Read {
+                        read_index,
+                        response_tx,
+                        timeout,
+                    });
+                }
             }
-            true
-        });
-        completed_indices
+        }
+        self.pending_reads = remaining;
+    }
+
+    pub fn clear_from(&mut self, log_index: u32) {
+        self.pending_writes.retain(|idx, _| *idx < log_index);
     }
 
     pub fn cleanup_timed_out(&mut self) -> Vec<u32> {
@@ -147,33 +160,34 @@ mod tests {
     #[test]
     fn test_track_and_complete_read() {
         let mut tracker = RequestTracker::<i32>::new();
-        let (tx, _rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let timeout = Instant::now() + Duration::from_secs(10);
 
         tracker.track_read(tx, 5, timeout);
-        let completed = tracker.complete_reads(5);
+        tracker.complete_reads(5, || 42);
 
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0], 5);
+        assert_eq!(rx.blocking_recv().unwrap(), 42);
     }
 
     #[test]
     fn test_complete_reads_only_when_applied() {
         let mut tracker = RequestTracker::<i32>::new();
-        let (tx1, _rx1) = oneshot::channel();
-        let (tx2, _rx2) = oneshot::channel();
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, mut rx2) = oneshot::channel();
         let timeout = Instant::now() + Duration::from_secs(10);
 
         tracker.track_read(tx1, 3, timeout);
         tracker.track_read(tx2, 7, timeout);
 
-        let completed = tracker.complete_reads(5);
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0], 3);
+        tracker.complete_reads(5, || 100);
+        assert_eq!(rx1.blocking_recv().unwrap(), 100);
+        assert!(matches!(
+            rx2.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
 
-        let completed = tracker.complete_reads(10);
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0], 7);
+        tracker.complete_reads(10, || 200);
+        assert_eq!(rx2.blocking_recv().unwrap(), 200);
     }
 
     #[test]
@@ -199,8 +213,8 @@ mod tests {
     #[test]
     fn test_cleanup_timed_out_reads() {
         let mut tracker = RequestTracker::<i32>::new();
-        let (tx1, _rx1) = oneshot::channel();
-        let (tx2, _rx2) = oneshot::channel();
+        let (tx1, mut rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
 
         let past = Instant::now() - Duration::from_secs(1);
         let future = Instant::now() + Duration::from_secs(10);
@@ -210,8 +224,11 @@ mod tests {
 
         tracker.cleanup_timed_out();
 
-        let completed = tracker.complete_reads(10);
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0], 7);
+        tracker.complete_reads(10, || 42);
+        assert!(matches!(
+            rx1.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert_eq!(rx2.blocking_recv().unwrap(), 42);
     }
 }
