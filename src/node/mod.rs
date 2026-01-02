@@ -14,7 +14,7 @@ use crate::client_manager::ClientResponseManager;
 use crate::config::Config;
 use crate::events::RaftEvent;
 use crate::network::NetworkFactory;
-use crate::raft::{AppliedEntry, RaftState};
+use crate::raft::RaftState;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use std::collections::HashMap;
@@ -90,7 +90,6 @@ pub struct Node<
     pub network_factory: NF,
     heartbeat_failure_count: usize,
     pub client_manager: Arc<Mutex<ClientResponseManager<SM::Response>>>,
-    pub raft_event_rx: mpsc::UnboundedReceiver<RaftEvent>,
 }
 
 impl<T, SM, NF> Node<T, SM, NF>
@@ -112,24 +111,24 @@ where
         let storage = Box::new(MemStorage::default());
         let id = port as u32;
 
-        let (apply_event_tx, apply_event_rx) = mpsc::unbounded_channel();
         let (raft_event_tx, raft_event_rx) = mpsc::unbounded_channel();
         let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
 
         let manager_clone = Arc::clone(&client_manager);
         tokio::spawn(async move {
-            let mut rx: mpsc::UnboundedReceiver<AppliedEntry<SM::Response>> =
-                apply_event_rx;
+            let mut rx = raft_event_rx;
             while let Some(event) = rx.recv().await {
-                manager_clone
-                    .lock()
-                    .await
-                    .resolve(event.log_index, event.response);
+                if let RaftEvent::LogApplied {
+                    log_index,
+                    response,
+                } = event
+                {
+                    manager_clone.lock().await.resolve(log_index, response);
+                }
             }
         });
 
         let mut raft_state = RaftState::new(id, storage, sm);
-        raft_state.set_apply_notifier(apply_event_tx.clone());
         raft_state.set_event_tx(raft_event_tx);
 
         Node {
@@ -140,7 +139,6 @@ where
             network_factory,
             heartbeat_failure_count: 0,
             client_manager,
-            raft_event_rx,
         }
     }
 
@@ -151,28 +149,27 @@ where
         state: Arc<Mutex<RaftState<T, SM>>>,
         network_factory: NF,
     ) -> Self {
-        let (apply_event_tx, apply_event_rx) = mpsc::unbounded_channel();
         let (raft_event_tx, raft_event_rx) = mpsc::unbounded_channel();
         let client_manager = Arc::new(Mutex::new(ClientResponseManager::new()));
 
         let manager_clone = Arc::clone(&client_manager);
         tokio::spawn(async move {
-            let mut rx: mpsc::UnboundedReceiver<AppliedEntry<SM::Response>> =
-                apply_event_rx;
+            let mut rx = raft_event_rx;
             while let Some(event) = rx.recv().await {
-                manager_clone
-                    .lock()
-                    .await
-                    .resolve(event.log_index, event.response);
+                if let RaftEvent::LogApplied {
+                    log_index,
+                    response,
+                } = event
+                {
+                    manager_clone.lock().await.resolve(log_index, response);
+                }
             }
         });
 
         tokio::spawn({
             let state_clone = Arc::clone(&state);
-            let apply_event_tx_clone = apply_event_tx.clone();
             async move {
                 let mut state = state_clone.lock().await;
-                state.set_apply_notifier(apply_event_tx_clone);
                 state.set_event_tx(raft_event_tx);
             }
         });
@@ -185,7 +182,6 @@ where
             network_factory,
             heartbeat_failure_count: 0,
             client_manager,
-            raft_event_rx,
         }
     }
 

@@ -13,12 +13,6 @@ pub struct Entry<T: Send + Sync> {
 }
 
 #[derive(Debug, Clone)]
-pub struct AppliedEntry<R> {
-    pub log_index: u32,
-    pub response: R,
-}
-
-#[derive(Debug, Clone)]
 pub struct PersistentState<T: Send + Sync> {
     pub current_term: u32,
     pub voted_for: Option<u32>,
@@ -101,10 +95,7 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     storage: Box<dyn Storage<T>>,
     pub state_machine: SM,
 
-    // Event notifier for applied entries
-    apply_notifier: Option<mpsc::UnboundedSender<AppliedEntry<SM::Response>>>,
-
-    event_tx: Option<mpsc::UnboundedSender<RaftEvent>>,
+    event_tx: Option<mpsc::UnboundedSender<RaftEvent<SM::Response>>>,
 
     pub replication_notifier: Arc<Notify>,
     pub last_applied_notifier: Arc<Notify>,
@@ -125,25 +116,20 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             id,
             storage,
             state_machine: sm,
-            apply_notifier: None,
             event_tx: None,
             replication_notifier: Arc::new(Notify::new()),
             last_applied_notifier: Arc::new(Notify::new()),
         }
     }
 
-    pub fn set_apply_notifier(
+    pub fn set_event_tx(
         &mut self,
-        notifier: mpsc::UnboundedSender<AppliedEntry<SM::Response>>,
+        tx: mpsc::UnboundedSender<RaftEvent<SM::Response>>,
     ) {
-        self.apply_notifier = Some(notifier);
-    }
-
-    pub fn set_event_tx(&mut self, tx: mpsc::UnboundedSender<RaftEvent>) {
         self.event_tx = Some(tx);
     }
 
-    pub fn send_event(&self, event: RaftEvent) {
+    pub fn send_event(&self, event: RaftEvent<SM::Response>) {
         if let Some(event_tx) = &self.event_tx {
             let _ = event_tx.send(event);
         }
@@ -172,16 +158,9 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             let entry = &self.persistent.log[(self.last_applied - 1) as usize];
             let response = self.state_machine.apply(&entry.command).await?;
 
-            // Notify via event channel if notifier is set
-            if let Some(notifier) = &self.apply_notifier {
-                let _ = notifier.send(AppliedEntry {
-                    log_index: self.last_applied,
-                    response: response.clone(),
-                });
-            }
-
             self.send_event(RaftEvent::LogApplied {
-                index: self.last_applied,
+                log_index: self.last_applied,
+                response: response.clone(),
             });
 
             responses.push(response);

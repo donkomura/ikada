@@ -275,6 +275,9 @@ where
                 new_commit = new_commit_index,
                 "Leader advanced commit_index"
             );
+            state.send_event(crate::events::RaftEvent::CommitIndexAdvanced {
+                commit_index: new_commit_index,
+            });
         }
 
         Ok(())

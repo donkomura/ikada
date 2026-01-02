@@ -1,6 +1,5 @@
-use crate::raft::AppliedEntry;
 use std::collections::HashMap;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 pub struct ClientResponseManager<R> {
     pending: HashMap<u32, oneshot::Sender<R>>,
@@ -25,15 +24,6 @@ impl<R> ClientResponseManager<R> {
 
     pub fn clear_from(&mut self, log_index: u32) {
         self.pending.retain(|&idx, _| idx < log_index);
-    }
-
-    pub async fn run(
-        mut self,
-        mut apply_events: mpsc::UnboundedReceiver<AppliedEntry<R>>,
-    ) {
-        while let Some(event) = apply_events.recv().await {
-            self.resolve(event.log_index, event.response);
-        }
     }
 }
 
