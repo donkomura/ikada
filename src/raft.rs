@@ -143,6 +143,12 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         self.event_tx = Some(tx);
     }
 
+    pub fn send_event(&self, event: RaftEvent) {
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx.send(event);
+        }
+    }
+
     pub async fn persist(&mut self) -> anyhow::Result<()> {
         self.storage.save(&self.persistent).await?;
         Ok(())
@@ -174,11 +180,9 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
                 });
             }
 
-            if let Some(event_tx) = &self.event_tx {
-                let _ = event_tx.send(RaftEvent::LogApplied {
-                    index: self.last_applied,
-                });
-            }
+            self.send_event(RaftEvent::LogApplied {
+                index: self.last_applied,
+            });
 
             responses.push(response);
         }
