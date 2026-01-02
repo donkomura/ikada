@@ -32,7 +32,10 @@ where
     ///
     /// Raft Algorithm - Leader Election Step 2:
     /// Step 2: Candidate sends RequestVote RPC to all other nodes in parallel
-    pub(super) async fn start_election(&mut self) -> anyhow::Result<()> {
+    pub(super) async fn start_election(&mut self) -> anyhow::Result<()>
+    where
+        T: Default,
+    {
         let mut responses: Vec<RequestVoteResponse> = Vec::new();
         let (
             current_term,
@@ -128,7 +131,10 @@ where
     async fn handle_election(
         &mut self,
         responses: Vec<RequestVoteResponse>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        T: Default,
+    {
         let (id, current_term) = {
             let state = self.state.lock().await;
             (state.id, state.persistent.current_term)
@@ -172,7 +178,10 @@ where
     ///
     /// Raft Algorithm - Leader Election Step 4 (continued):
     /// Step 4: Node transitions to leader role and initializes replication state for each follower
-    pub(super) async fn become_leader(&mut self) -> anyhow::Result<()> {
+    pub(super) async fn become_leader(&mut self) -> anyhow::Result<()>
+    where
+        T: Default,
+    {
         let mut state = self.state.lock().await;
         tracing::info!(id=?state.id, term=state.persistent.current_term, "BECOMING LEADER");
         state.role = Role::Leader;
@@ -183,6 +192,23 @@ where
             state.next_index.insert(*peer_addr, last_log_idx + 1);
             state.match_index.insert(*peer_addr, 0);
         }
+
+        // Append no-op entry for ReadIndex optimization
+        let current_term = state.persistent.current_term;
+        let noop_entry = crate::raft::Entry {
+            term: current_term,
+            command: T::default(),
+        };
+        state.persistent.log.push(noop_entry);
+        let noop_idx = state.get_last_log_idx();
+        state.noop_index = Some(noop_idx);
+        state.persist().await?;
+
+        tracing::info!(
+            id = ?state.id,
+            noop_index = noop_idx,
+            "Appended no-op entry for ReadIndex"
+        );
 
         self.heartbeat_failure_count = 0;
         Ok(())

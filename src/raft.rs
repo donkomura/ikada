@@ -47,8 +47,11 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     pub leader_id: Option<u32>,
     pub id: u32,
 
+    // ReadIndex optimization: track the index of the no-op entry added when becoming leader
+    pub noop_index: Option<u32>,
+
     storage: Box<dyn Storage<T>>,
-    sm: SM,
+    pub state_machine: SM,
 
     // Event notifier for applied entries
     apply_notifier: Option<mpsc::UnboundedSender<AppliedEntry<SM::Response>>>,
@@ -69,8 +72,9 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             match_index: HashMap::new(),
             leader_id: None,
             id,
+            noop_index: None,
             storage,
-            sm,
+            state_machine: sm,
             apply_notifier: None,
         }
     }
@@ -103,7 +107,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let entry = &self.persistent.log[(self.last_applied - 1) as usize];
-            let response = self.sm.apply(&entry.command).await?;
+            let response = self.state_machine.apply(&entry.command).await?;
 
             // Notify via event channel if notifier is set
             if let Some(notifier) = &self.apply_notifier {
@@ -143,6 +147,12 @@ mod tests {
         Get { key: String },
         Put { key: String, value: i32 },
         Cas { key: String, from: i32, to: i32 },
+    }
+
+    impl Default for KVCommand {
+        fn default() -> Self {
+            KVCommand::Get { key: String::new() }
+        }
     }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -431,7 +441,7 @@ mod tests {
 
         // Now read from leader's state machine
         let read_result = leader_state
-            .sm
+            .state_machine
             .apply(&KVCommand::Get {
                 key: "test_key".to_string(),
             })

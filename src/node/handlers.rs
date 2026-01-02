@@ -692,6 +692,183 @@ where
     wait_for_command_result::<SM>(result_rx, timeout).await
 }
 
+/// Handles a read-only request using ReadIndex optimization.
+///
+/// ReadIndex Algorithm (from consensus-essence):
+/// Step 1: Initial Commit Check - verify leader's latest term entry is committed
+/// Step 2: Set ReadIndex - set to max(CommitIndex, NoopIndex)
+/// Step 3: Leader Confirmation - send heartbeat to quorum
+/// Step 4: Index Synchronization - wait for StateMachine to apply entries up to ReadIndex
+pub async fn handle_read_index_request<T, SM>(
+    req: &CommandRequest,
+    state: Arc<Mutex<RaftState<T, SM>>>,
+    timeout: std::time::Duration,
+    peer_count: usize,
+) -> CommandResponse
+where
+    T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned,
+    SM: StateMachine<Command = T>,
+    SM::Response: Clone + serde::Serialize,
+{
+    // Step 1: Initial Commit Check
+    let (read_index, current_term, _noop_committed) = {
+        let state_guard = state.lock().await;
+
+        if let Err(response) = validate_leadership(&state_guard) {
+            return response;
+        }
+
+        let current_term = state_guard.persistent.current_term;
+        let noop_index = state_guard.noop_index;
+        let commit_index = state_guard.commit_index;
+
+        // Check if no-op entry is committed
+        let noop_committed = if let Some(noop_idx) = noop_index {
+            commit_index >= noop_idx
+        } else {
+            false
+        };
+
+        if !noop_committed {
+            return CommandResponse {
+                success: false,
+                leader_hint: None,
+                data: None,
+                error: Some("No-op entry not yet committed".to_string()),
+            };
+        }
+
+        // Step 2: Set ReadIndex = max(CommitIndex, NoopIndex)
+        let read_index = noop_index
+            .map(|n| n.max(commit_index))
+            .unwrap_or(commit_index);
+
+        (read_index, current_term, noop_committed)
+    };
+
+    // Step 3: Leader Confirmation - verify leadership with heartbeat
+    if !verify_leadership_with_quorum(
+        state.clone(),
+        peer_count,
+        timeout,
+        current_term,
+    )
+    .await
+    {
+        return CommandResponse {
+            success: false,
+            leader_hint: None,
+            data: None,
+            error: Some("Lost leadership during read".to_string()),
+        };
+    }
+
+    // Step 4: Index Synchronization - wait for last_applied >= read_index
+    let start = std::time::Instant::now();
+    loop {
+        let should_wait = {
+            let state_guard = state.lock().await;
+            state_guard.last_applied < read_index
+        };
+
+        if !should_wait {
+            break;
+        }
+
+        if start.elapsed() > timeout {
+            return CommandResponse {
+                success: false,
+                leader_hint: None,
+                data: None,
+                error: Some(
+                    "Read timeout waiting for state machine".to_string(),
+                ),
+            };
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+    }
+
+    // Read from state machine
+    let mut state_guard = state.lock().await;
+    let command: T = match bincode::deserialize(&req.command) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            return CommandResponse {
+                success: false,
+                leader_hint: None,
+                data: None,
+                error: Some(format!("Deserialize error: {}", e)),
+            };
+        }
+    };
+
+    match state_guard.state_machine.apply(&command).await {
+        Ok(result) => {
+            let response_data = bincode::serialize(&result).ok();
+            CommandResponse {
+                success: true,
+                leader_hint: None,
+                data: response_data,
+                error: None,
+            }
+        }
+        Err(e) => CommandResponse {
+            success: false,
+            leader_hint: None,
+            data: None,
+            error: Some(format!("State machine error: {}", e)),
+        },
+    }
+}
+
+/// Verifies leadership by sending heartbeat to quorum and checking for higher terms.
+async fn verify_leadership_with_quorum<T, SM>(
+    state: Arc<Mutex<RaftState<T, SM>>>,
+    peer_count: usize,
+    timeout: std::time::Duration,
+    expected_term: u32,
+) -> bool
+where
+    T: Send + Sync + Clone,
+    SM: StateMachine<Command = T>,
+{
+    // Poll match_index to see if majority has responded
+    let start = std::time::Instant::now();
+    let majority = peer_count.div_ceil(2) + 1;
+
+    loop {
+        if start.elapsed() > timeout {
+            return false;
+        }
+
+        let (_current_term, confirmed_count) = {
+            let state_guard = state.lock().await;
+
+            // Check if term changed
+            if state_guard.persistent.current_term != expected_term {
+                return false;
+            }
+
+            // Count peers with recent contact (match_index > 0)
+            let confirmed = state_guard
+                .match_index
+                .values()
+                .filter(|&&idx| idx > 0)
+                .count()
+                + 1; // +1 for self
+
+            (state_guard.persistent.current_term, confirmed)
+        };
+
+        if confirmed_count >= majority {
+            return true;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

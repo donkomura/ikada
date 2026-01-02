@@ -334,6 +334,24 @@ impl MaelstromRaftNode {
         self.handle_command_failure(cmd, response).await
     }
 
+    async fn execute_read_command(
+        &self,
+        cmd: KVCommand,
+    ) -> anyhow::Result<KVResponse> {
+        let response = self.send_read_to_raft(cmd.clone()).await?;
+
+        if response.success {
+            return self.parse_success_response(response);
+        }
+
+        // For reads, if no-op not committed yet, fall back to normal path
+        if response.error.as_deref() == Some("No-op entry not yet committed") {
+            return self.execute_command(cmd).await;
+        }
+
+        self.handle_command_failure(cmd, response).await
+    }
+
     async fn send_to_raft(
         &self,
         cmd: KVCommand,
@@ -344,6 +362,24 @@ impl MaelstromRaftNode {
 
         cmd_tx
             .send(Command::ClientRequest(
+                CommandRequest { command: cmd_bytes },
+                resp_tx,
+            ))
+            .await?;
+
+        Ok(resp_rx.await?)
+    }
+
+    async fn send_read_to_raft(
+        &self,
+        cmd: KVCommand,
+    ) -> anyhow::Result<CommandResponse> {
+        let cmd_tx = self.get_command_channel().await?;
+        let cmd_bytes = bincode::serialize(&cmd)?;
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        cmd_tx
+            .send(Command::ReadRequest(
                 CommandRequest { command: cmd_bytes },
                 resp_tx,
             ))
@@ -644,7 +680,8 @@ impl MaelstromRaftNode {
             key: key_str.clone(),
         };
 
-        match self.execute_command(command).await {
+        // Use ReadIndex optimization for reads
+        match self.execute_read_command(command).await {
             Ok(KVResponse::Value(Some(value))) => {
                 let json_value: serde_json::Value =
                     serde_json::from_str(&value)

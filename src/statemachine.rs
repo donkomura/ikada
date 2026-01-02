@@ -56,6 +56,12 @@ pub enum KVCommand {
     },
 }
 
+impl Default for KVCommand {
+    fn default() -> Self {
+        KVCommand::Get { key: String::new() }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum KVResponse {
     Success,
