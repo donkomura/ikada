@@ -1,4 +1,5 @@
 use rand::Rng;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -18,6 +19,7 @@ pub struct Config {
     pub snapshot_threshold: usize,
     /// Timeout for read index confirmation (linearizable reads)
     pub read_index_timeout: Duration,
+    pub storage_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -38,6 +40,7 @@ impl Default for Config {
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
             read_index_timeout: Duration::from_millis(2000),
+            storage_dir: PathBuf::from("."),
         }
     }
 }
