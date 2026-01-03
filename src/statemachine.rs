@@ -12,6 +12,7 @@ pub trait StateMachine: Send + Sync {
     ) -> anyhow::Result<Self::Response>;
 
     async fn snapshot(&self) -> anyhow::Result<Vec<u8>>;
+    async fn restore(&mut self, data: &[u8]) -> anyhow::Result<()>;
 }
 
 // Simple test state machine that just counts applied commands
@@ -34,6 +35,9 @@ impl StateMachine for NoOpStateMachine {
     }
     async fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
         unimplemented!()
+    }
+    async fn restore(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -111,5 +115,10 @@ impl StateMachine for KVStateMachine {
     async fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
         let serialized = bincode::serialize(&self.data).unwrap();
         Ok(serialized)
+    }
+
+    async fn restore(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        self.data = bincode::deserialize(data)?;
+        Ok(())
     }
 }

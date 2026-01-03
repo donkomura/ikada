@@ -335,6 +335,10 @@ mod tests {
         async fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
             Ok(Vec::new())
         }
+
+        async fn restore(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     impl RecordingStateMachine {

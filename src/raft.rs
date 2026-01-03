@@ -224,6 +224,36 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
 
         Ok(())
     }
+
+    pub async fn restore_from_snapshot(&mut self) -> anyhow::Result<bool> {
+        let snapshot = self.storage.load_snapshot().await?;
+
+        if let Some((metadata, data)) = snapshot {
+            self.state_machine.restore(&data).await?;
+
+            self.last_applied = metadata.last_included_index;
+            self.commit_index = metadata.last_included_index;
+
+            if self.persistent.log.len() > metadata.last_included_index as usize
+            {
+                self.persistent
+                    .log
+                    .drain(0..(metadata.last_included_index as usize));
+            } else {
+                self.persistent.log.clear();
+            }
+
+            tracing::info!(
+                last_included_index = metadata.last_included_index,
+                last_included_term = metadata.last_included_term,
+                "Snapshot restored successfully"
+            );
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -596,6 +626,129 @@ mod tests {
             state.persistent.log[1].command,
             KVCommand::Set { ref key, ref value } if key == "key5" && value == "value5"
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_restore_from_snapshot() -> anyhow::Result<()> {
+        let mut state = RaftState::new(
+            1,
+            Box::new(MemStorage::default()),
+            KVStateMachine::default(),
+        );
+
+        for i in 1..=5 {
+            state.persistent.log.push(Entry {
+                term: 1,
+                command: KVCommand::Set {
+                    key: format!("key{}", i),
+                    value: format!("value{}", i),
+                },
+            });
+        }
+
+        state.commit_index = 5;
+        state.apply_committed().await?;
+
+        state.create_snapshot().await?;
+
+        assert_eq!(state.last_applied, 5);
+        assert_eq!(state.persistent.log.len(), 0);
+
+        let mut new_state =
+            RaftState::new(1, state.storage, KVStateMachine::default());
+
+        let restored = new_state.restore_from_snapshot().await?;
+        assert!(restored, "Snapshot should be restored");
+
+        assert_eq!(new_state.last_applied, 5);
+        assert_eq!(new_state.commit_index, 5);
+        assert_eq!(new_state.persistent.log.len(), 0);
+
+        let result = new_state
+            .state_machine
+            .apply(&KVCommand::Get {
+                key: "key3".to_string(),
+            })
+            .await?;
+        assert!(
+            matches!(result, KVResponse::Value(Some(ref v)) if v == "value3"),
+            "Restored state machine should contain key3=value3"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_restore_from_snapshot_with_remaining_log()
+    -> anyhow::Result<()> {
+        let mut state = RaftState::new(
+            1,
+            Box::new(MemStorage::default()),
+            KVStateMachine::default(),
+        );
+
+        for i in 1..=5 {
+            state.persistent.log.push(Entry {
+                term: 1,
+                command: KVCommand::Set {
+                    key: format!("key{}", i),
+                    value: format!("value{}", i),
+                },
+            });
+        }
+
+        state.commit_index = 3;
+        state.apply_committed().await?;
+
+        state.create_snapshot().await?;
+
+        assert_eq!(state.last_applied, 3);
+        assert_eq!(state.persistent.log.len(), 2);
+
+        let mut new_state =
+            RaftState::new(1, state.storage, KVStateMachine::default());
+
+        for i in 1..=5 {
+            new_state.persistent.log.push(Entry {
+                term: 1,
+                command: KVCommand::Set {
+                    key: format!("key{}", i),
+                    value: format!("value{}", i),
+                },
+            });
+        }
+
+        let restored = new_state.restore_from_snapshot().await?;
+        assert!(restored, "Snapshot should be restored");
+
+        assert_eq!(new_state.last_applied, 3);
+        assert_eq!(new_state.commit_index, 3);
+        assert_eq!(new_state.persistent.log.len(), 2);
+
+        assert_eq!(new_state.persistent.log[0].term, 1);
+        assert!(matches!(
+            new_state.persistent.log[0].command,
+            KVCommand::Set { ref key, ref value } if key == "key4" && value == "value4"
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_restore_from_snapshot_no_snapshot() -> anyhow::Result<()> {
+        let mut state = RaftState::new(
+            1,
+            Box::new(MemStorage::default()),
+            KVStateMachine::default(),
+        );
+
+        let restored = state.restore_from_snapshot().await?;
+        assert!(!restored, "No snapshot should be found");
+
+        assert_eq!(state.last_applied, 0);
+        assert_eq!(state.commit_index, 0);
 
         Ok(())
     }
