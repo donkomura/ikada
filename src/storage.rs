@@ -117,7 +117,9 @@ where
     T: Send + Sync + Clone + serde::Serialize + serde::de::DeserializeOwned,
 {
     async fn save(&mut self, state: &PersistentState<T>) -> Result<()> {
-        fs::create_dir_all(&self.base_dir).await?;
+        if !self.base_dir.exists() {
+            fs::create_dir_all(&self.base_dir).await?;
+        }
         let serialized = bincode::serialize(state)?;
         fs::write(self.state_path(), serialized).await?;
         Ok(())
@@ -138,7 +140,9 @@ where
         metadata: &SnapshotMetadata,
         data: &[u8],
     ) -> Result<()> {
-        fs::create_dir_all(&self.base_dir).await?;
+        if !self.base_dir.exists() {
+            fs::create_dir_all(&self.base_dir).await?;
+        }
         let metadata_serialized = bincode::serialize(metadata)?;
         fs::write(self.snapshot_metadata_path(), metadata_serialized).await?;
         fs::write(self.snapshot_data_path(), data).await?;
