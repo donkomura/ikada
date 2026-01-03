@@ -389,6 +389,8 @@ where
                     let state_clone = Arc::clone(&state);
                     let heartbeat_tx = heartbeat_tx.clone();
                     tokio::spawn(async move {
+                        let current_term =
+                            state_clone.lock().await.persistent.current_term;
                         let resp = handlers::handle_install_snapshot(&req, state_clone.clone())
                             .await
                             .unwrap_or_else(|e| {
@@ -400,9 +402,8 @@ where
 
                         let _ = resp_tx.send(resp.clone());
 
-                        if req.term
-                            >= state_clone.lock().await.persistent.current_term
-                        {
+                        // Reset election timeout if we received InstallSnapshot from current or higher term leader
+                        if req.term >= current_term {
                             let _ =
                                 heartbeat_tx.send((req.term, req.leader_id));
                         }
