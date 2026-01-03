@@ -50,74 +50,70 @@ where
         let (leader_term, leader_id, leader_commit, log_data, peer_plan) = {
             let state = self.state.lock().await;
 
+            if !state.role.is_leader() {
+                return Ok(false);
+            }
+
             // Copy log and peer state data
             let log_entries = state.persistent.log.clone();
-            let plan: Vec<(SocketAddr, u32, usize)> = if let Some(
-                leader_state,
-            ) =
-                state.role.leader_state()
-            {
-                self.peers
-                        .keys()
-                        .filter_map(|addr| {
-                            let snapshot_inflight = leader_state
-                                .inflight_snapshot
-                                .get(addr)
-                                .copied()
-                                .unwrap_or(false);
-                            if snapshot_inflight {
-                                tracing::debug!(
-                                    peer = ?addr,
-                                    "Skipping peer with inflight InstallSnapshot"
-                                );
-                                return None;
-                            }
+            let leader_state = state.role.leader_state().unwrap();
+            let plan: Vec<(SocketAddr, u32, usize)> = self.peers
+                .keys()
+                .filter_map(|addr| {
+                    let snapshot_inflight = leader_state
+                        .inflight_snapshot
+                        .get(addr)
+                        .copied()
+                        .unwrap_or(false);
+                    if snapshot_inflight {
+                        tracing::debug!(
+                            peer = ?addr,
+                            "Skipping peer with inflight InstallSnapshot"
+                        );
+                        return None;
+                    }
 
-                            let inflight_len = leader_state
-                                .inflight_append
-                                .get(addr)
-                                .map(|q| q.len())
-                                .unwrap_or(0);
-                            let max_inflight =
-                                self.config.replication_max_inflight;
-                            if inflight_len >= max_inflight {
-                                tracing::debug!(
-                                    peer = ?addr,
-                                    inflight_len = inflight_len,
-                                    limit = max_inflight,
-                                    "Skipping peer: AppendEntries inflight window is full"
-                                );
-                                return None;
-                            }
+                    let inflight_len = leader_state
+                        .inflight_append
+                        .get(addr)
+                        .map(|q| q.len())
+                        .unwrap_or(0);
+                    let max_inflight = self.config.replication_max_inflight;
+                    if inflight_len >= max_inflight {
+                        tracing::debug!(
+                            peer = ?addr,
+                            inflight_len = inflight_len,
+                            limit = max_inflight,
+                            "Skipping peer: AppendEntries inflight window is full"
+                        );
+                        return None;
+                    }
 
-                            let base_next_idx = if inflight_len > 0 {
-                                leader_state
-                                    .inflight_append
-                                    .get(addr)
-                                    .and_then(|q| q.back().copied())
-                                    .unwrap_or_else(|| {
-                                        leader_state
-                                            .next_index
-                                            .get(addr)
-                                            .copied()
-                                            .unwrap_or(1)
-                                    })
-                                    .saturating_add(1)
-                            } else {
+                    let base_next_idx = if inflight_len > 0 {
+                        leader_state
+                            .inflight_append
+                            .get(addr)
+                            .and_then(|q| q.back().copied())
+                            .unwrap_or_else(|| {
                                 leader_state
                                     .next_index
                                     .get(addr)
                                     .copied()
                                     .unwrap_or(1)
-                            };
+                            })
+                            .saturating_add(1)
+                    } else {
+                        leader_state
+                            .next_index
+                            .get(addr)
+                            .copied()
+                            .unwrap_or(1)
+                    };
 
-                            let slots = max_inflight.saturating_sub(inflight_len);
-                            Some((*addr, base_next_idx, slots))
-                        })
-                        .collect()
-            } else {
-                vec![]
-            };
+                    let slots = max_inflight.saturating_sub(inflight_len);
+                    Some((*addr, base_next_idx, slots))
+                })
+                .collect();
 
             (
                 state.persistent.current_term,
