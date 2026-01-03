@@ -254,6 +254,61 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             Ok(false)
         }
     }
+
+    /// Applies snapshot data received via InstallSnapshot RPC
+    ///
+    /// Implements Raft Figure 13:
+    /// - If existing log entry has same index and term as snapshot's last included entry,
+    ///   retain log entries following it
+    /// - Otherwise discard the entire log
+    /// - Reset state machine using snapshot contents
+    pub async fn restore_from_snapshot_data(
+        &mut self,
+        last_included_index: u32,
+        last_included_term: u32,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        // Check if existing log entry has same index and term as snapshot's last included entry
+        let should_retain_log = if last_included_index > 0
+            && (last_included_index as usize) <= self.persistent.log.len()
+        {
+            let log_index = (last_included_index - 1) as usize;
+            self.persistent.log[log_index].term == last_included_term
+        } else {
+            false
+        };
+
+        if should_retain_log {
+            // Retain log entries following the snapshot's last included entry
+            self.persistent.log.drain(0..(last_included_index as usize));
+        } else {
+            // Discard the entire log
+            self.persistent.log.clear();
+        }
+
+        // Reset state machine using snapshot contents
+        self.state_machine.restore(data).await?;
+
+        // Update commit_index and last_applied to snapshot's last included index
+        self.commit_index = last_included_index;
+        self.last_applied = last_included_index;
+
+        tracing::info!(
+            last_included_index = last_included_index,
+            last_included_term = last_included_term,
+            log_retained = should_retain_log,
+            "Snapshot installed from leader"
+        );
+
+        Ok(())
+    }
+
+    pub async fn get_snapshot(
+        &self,
+    ) -> anyhow::Result<Option<(crate::snapshot::SnapshotMetadata, Vec<u8>)>>
+    {
+        self.storage.load_snapshot().await
+    }
 }
 
 #[cfg(test)]

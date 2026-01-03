@@ -90,4 +90,14 @@ impl RaftRpc for RaftServer {
             error: Some("Failed to process client request".to_string()),
         })
     }
+
+    async fn install_snapshot(
+        self,
+        _: tarpc::context::Context,
+        req: InstallSnapshotRequest,
+    ) -> InstallSnapshotResponse {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let _ = self.tx.send(Command::InstallSnapshot(req, resp_tx)).await;
+        resp_rx.await.unwrap_or(InstallSnapshotResponse { term: 0 })
+    }
 }

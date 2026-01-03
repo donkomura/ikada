@@ -16,6 +16,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
+enum ReplicationResponse {
+    AppendEntries(AppendEntriesResponse, u32),
+    InstallSnapshot(InstallSnapshotResponse, u32),
+}
+
 impl<T, SM, NF> Node<T, SM, NF>
 where
     T: Send
@@ -91,9 +96,57 @@ where
         let rpc_timeout = self.config.rpc_timeout;
         let mut tasks = JoinSet::new();
 
-        // Step 3: Spawn AppendEntries RPC tasks for all followers
+        // Step 3: Spawn AppendEntries or InstallSnapshot RPC tasks for all followers
         for (addr, next_idx) in peer_data {
             let client = self.peers.get(&addr).unwrap().clone();
+
+            if next_idx > 1 && (next_idx - 2) as usize >= log_data.len() {
+                tracing::debug!(
+                    peer = ?addr,
+                    next_idx = next_idx,
+                    log_len = log_data.len(),
+                    "next_idx points to compacted log, sending snapshot"
+                );
+
+                let state = self.state.lock().await;
+                let snapshot_result = state.get_snapshot().await;
+                drop(state);
+
+                match snapshot_result {
+                    Ok(Some((metadata, data))) => {
+                        let req = crate::rpc::InstallSnapshotRequest {
+                            term: leader_term,
+                            leader_id,
+                            last_included_index: metadata.last_included_index,
+                            last_included_term: metadata.last_included_term,
+                            data,
+                        };
+
+                        tasks.spawn(Self::send_install_snapshot(
+                            addr,
+                            client,
+                            req,
+                            rpc_timeout,
+                        ));
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            peer = ?addr,
+                            "No snapshot available to send"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            peer = ?addr,
+                            error = ?e,
+                            "Failed to load snapshot"
+                        );
+                        continue;
+                    }
+                }
+                continue;
+            }
 
             let (prev_log_idx, prev_log_term) = if next_idx > 1 {
                 (next_idx - 1, log_data[(next_idx - 2) as usize].term)
@@ -148,9 +201,31 @@ where
         // Waiting Point 1: Collect responses for the current heartbeat round.
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok(Ok((server, res, sent_up_to_index))) => {
-                    self.handle_heartbeat(server, res, sent_up_to_index)
-                        .await?;
+                Ok(Ok((server, response))) => {
+                    match response {
+                        ReplicationResponse::AppendEntries(
+                            res,
+                            sent_up_to_index,
+                        ) => {
+                            self.handle_heartbeat(
+                                server,
+                                res,
+                                sent_up_to_index,
+                            )
+                            .await?;
+                        }
+                        ReplicationResponse::InstallSnapshot(
+                            res,
+                            last_included_index,
+                        ) => {
+                            self.handle_install_snapshot_response(
+                                server,
+                                res,
+                                last_included_index,
+                            )
+                            .await?;
+                        }
+                    }
 
                     let still_leader = {
                         let state = self.state.lock().await;
@@ -176,7 +251,7 @@ where
                     }
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!("Failed to send heartbeat: {:?}", e);
+                    tracing::warn!("Failed to send replication RPC: {:?}", e);
                     failure_count += 1;
                 }
                 Err(e) => {
@@ -222,11 +297,31 @@ where
         req: AppendEntriesRequest,
         sent_up_to_index: u32,
         rpc_timeout: Duration,
-    ) -> anyhow::Result<(SocketAddr, AppendEntriesResponse, u32)> {
+    ) -> anyhow::Result<(SocketAddr, ReplicationResponse)> {
         let mut ctx = tarpc::context::current();
         ctx.deadline = Instant::now() + rpc_timeout;
         let res = client.append_entries(ctx, req.clone()).await?;
-        Ok((server, res, sent_up_to_index))
+        Ok((
+            server,
+            ReplicationResponse::AppendEntries(res, sent_up_to_index),
+        ))
+    }
+
+    /// Sends InstallSnapshot RPC to a single follower.
+    async fn send_install_snapshot(
+        server: SocketAddr,
+        client: Arc<dyn RaftRpcTrait>,
+        req: crate::rpc::InstallSnapshotRequest,
+        rpc_timeout: Duration,
+    ) -> anyhow::Result<(SocketAddr, ReplicationResponse)> {
+        let mut ctx = tarpc::context::current();
+        ctx.deadline = Instant::now() + rpc_timeout;
+        let last_included_index = req.last_included_index;
+        let res = client.install_snapshot(ctx, req).await?;
+        Ok((
+            server,
+            ReplicationResponse::InstallSnapshot(res, last_included_index),
+        ))
     }
 
     /// Calculates the new commit index based on match_index from peers.
@@ -319,6 +414,61 @@ where
         if state.commit_index > state.last_applied {
             state.apply_committed().await?;
         }
+
+        Ok(())
+    }
+
+    /// Handles InstallSnapshot response from a follower.
+    /// Updates next_index and match_index after successful snapshot installation.
+    ///
+    /// Following Raft semantics (not explicitly in Figure 13):
+    /// - If response term is higher, step down to follower
+    /// - Update match_index to last_included_index (follower is now caught up to this point)
+    /// - Update next_index to last_included_index + 1 (next AppendEntries will send entries after snapshot)
+    pub(super) async fn handle_install_snapshot_response(
+        &mut self,
+        addr: SocketAddr,
+        res: InstallSnapshotResponse,
+        last_included_index: u32,
+    ) -> anyhow::Result<()> {
+        // Check if we need to step down due to higher term
+        let check_term = {
+            let state = self.state.lock().await;
+            res.term > state.persistent.current_term
+        };
+
+        if check_term {
+            {
+                let mut state = self.state.lock().await;
+                state.become_follower(res.term, None);
+                let _ = state.persist().await;
+            }
+            self.heartbeat_failure_count = 0;
+            return Ok(());
+        }
+
+        // Update replication indices to reflect successful snapshot installation
+        let notifier = {
+            let mut state = self.state.lock().await;
+            if let Some(leader_state) = state.role.leader_state_mut() {
+                leader_state.match_index.insert(addr, last_included_index);
+                leader_state
+                    .next_index
+                    .insert(addr, last_included_index + 1);
+                leader_state.inflight_index.insert(addr, None);
+            }
+            state.replication_notifier.clone()
+        };
+
+        // Notify any tasks waiting on replication progress
+        // (e.g., commit index calculation, read index requests)
+        notifier.notify_waiters();
+
+        tracing::info!(
+            peer = ?addr,
+            last_included_index = last_included_index,
+            "InstallSnapshot succeeded"
+        );
 
         Ok(())
     }
@@ -541,6 +691,14 @@ mod tests {
                     data: None,
                     error: None,
                 })
+            }
+
+            async fn install_snapshot(
+                &self,
+                _ctx: tarpc::context::Context,
+                _req: InstallSnapshotRequest,
+            ) -> anyhow::Result<InstallSnapshotResponse> {
+                Ok(InstallSnapshotResponse { term: 1 })
             }
         }
 

@@ -30,6 +30,10 @@ pub enum Command {
     RequestVote(RequestVoteRequest, oneshot::Sender<RequestVoteResponse>),
     ClientRequest(CommandRequest, oneshot::Sender<CommandResponse>),
     ReadRequest(CommandRequest, oneshot::Sender<CommandResponse>),
+    InstallSnapshot(
+        InstallSnapshotRequest,
+        oneshot::Sender<InstallSnapshotResponse>,
+    ),
 }
 
 /// Chan holds all channels needed for node-internal communication.
@@ -381,6 +385,30 @@ where
                         }
                     });
                 }
+                Command::InstallSnapshot(req, resp_tx) => {
+                    let state_clone = Arc::clone(&state);
+                    let heartbeat_tx = heartbeat_tx.clone();
+                    tokio::spawn(async move {
+                        let current_term =
+                            state_clone.lock().await.persistent.current_term;
+                        let resp = handlers::handle_install_snapshot(&req, state_clone.clone())
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::error!(error=?e, "Failed to handle InstallSnapshot");
+                                InstallSnapshotResponse {
+                                    term: 0,
+                                }
+                            });
+
+                        let _ = resp_tx.send(resp.clone());
+
+                        // Reset election timeout if we received InstallSnapshot from current or higher term leader
+                        if req.term >= current_term {
+                            let _ =
+                                heartbeat_tx.send((req.term, req.leader_id));
+                        }
+                    });
+                }
             }
         }
         Ok(())
@@ -403,13 +431,6 @@ where
         servers: Vec<SocketAddr>,
     ) -> anyhow::Result<()> {
         let id = self.state.lock().await.id;
-
-        {
-            let mut state = self.state.lock().await;
-            if let Err(e) = state.restore_from_snapshot().await {
-                tracing::warn!(id = id, error = ?e, "Failed to restore from snapshot");
-            }
-        }
 
         for &addr in &servers {
             // Skip self to avoid connecting to own address
