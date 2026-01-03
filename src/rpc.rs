@@ -47,13 +47,35 @@ pub struct CommandRequest {
     pub command: Vec<u8>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(crate = "tarpc::serde")]
+pub enum CommandError {
+    NotLeader,
+    NoopNotCommitted,
+    ReplicationFailed,
+    Other(String),
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandError::NotLeader => write!(f, "Not the leader"),
+            CommandError::NoopNotCommitted => {
+                write!(f, "No-op entry not yet committed")
+            }
+            CommandError::ReplicationFailed => write!(f, "Replication failed"),
+            CommandError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "tarpc::serde")]
 pub struct CommandResponse {
     pub success: bool,
     pub leader_hint: Option<u32>,
     pub data: Option<Vec<u8>>,
-    pub error: Option<String>,
+    pub error: Option<CommandError>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -387,8 +387,8 @@ mod tests {
         let follower_response = resp_rx.await?;
         assert!(!follower_response.success, "Follower should reject reads");
         assert_eq!(
-            follower_response.error.as_deref(),
-            Some("Not the leader"),
+            follower_response.error,
+            Some(crate::rpc::CommandError::NotLeader),
             "Follower should return 'Not the leader' error"
         );
         assert_eq!(
@@ -520,8 +520,8 @@ mod tests {
             "Old leader (now follower) should reject client requests"
         );
         assert_eq!(
-            response.error.as_deref(),
-            Some("Not the leader"),
+            response.error,
+            Some(crate::rpc::CommandError::NotLeader),
             "Should return 'Not the leader' error"
         );
 

@@ -250,8 +250,7 @@ where
         // 3) kick commit/apply to unblock client responses quickly
         // 4) wait for each index to reach majority + applied result (in background)
         let peer_count = self.peers.len();
-        let timeout =
-            self.config.rpc_timeout + std::time::Duration::from_millis(100);
+        let timeout = self.config.rpc_timeout;
 
         // Append to log in one lock/persist, and register RequestTracker entries.
         let mut appended: Vec<(
@@ -277,7 +276,7 @@ where
                             success: false,
                             leader_hint,
                             data: None,
-                            error: Some("Not the leader".to_string()),
+                            error: Some(crate::rpc::CommandError::NotLeader),
                         },
                     ));
                 }
@@ -311,9 +310,11 @@ where
                                 success: false,
                                 leader_hint: None,
                                 data: None,
-                                error: Some(format!(
-                                    "Failed to deserialize command: {}",
-                                    e
+                                error: Some(crate::rpc::CommandError::Other(
+                                    format!(
+                                        "Failed to deserialize command: {}",
+                                        e
+                                    ),
                                 )),
                             },
                         ));
@@ -343,8 +344,7 @@ where
                 self.request_tracker.lock().await.track_write(
                     log_index,
                     result_tx,
-                    std::time::Instant::now()
-                        + std::time::Duration::from_secs(30),
+                    std::time::Instant::now() + self.config.rpc_timeout,
                 );
                 appended.push((log_index, result_rx, resp_tx));
             }

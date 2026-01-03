@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
             replication_max_inflight: 4,
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
+            read_index_timeout: std::time::Duration::from_millis(100),
         }
     };
     let mut node1 = Node::new(
@@ -58,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
             replication_max_inflight: 4,
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
+            read_index_timeout: std::time::Duration::from_millis(100),
         }
     };
     let mut node2 = Node::new(
@@ -82,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
             replication_max_inflight: 4,
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
+            read_index_timeout: std::time::Duration::from_millis(100),
         }
     };
     let mut node3 = Node::new(
