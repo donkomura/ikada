@@ -254,6 +254,48 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             Ok(false)
         }
     }
+
+    pub async fn restore_from_snapshot_data(
+        &mut self,
+        last_included_index: u32,
+        last_included_term: u32,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        self.state_machine.restore(data).await?;
+
+        self.last_applied = last_included_index;
+        self.commit_index = last_included_index;
+
+        if let Some(pos) = self
+            .persistent
+            .log
+            .iter()
+            .position(|e| e.term == last_included_term)
+        {
+            if pos < self.persistent.log.len()
+                && (pos as u32) < last_included_index
+            {
+                self.persistent.log.drain(0..=pos);
+            }
+        } else {
+            self.persistent.log.clear();
+        }
+
+        tracing::info!(
+            last_included_index = last_included_index,
+            last_included_term = last_included_term,
+            "Snapshot installed from leader"
+        );
+
+        Ok(())
+    }
+
+    pub async fn get_snapshot(
+        &self,
+    ) -> anyhow::Result<Option<(crate::snapshot::SnapshotMetadata, Vec<u8>)>>
+    {
+        self.storage.load_snapshot().await
+    }
 }
 
 #[cfg(test)]

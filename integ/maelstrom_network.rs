@@ -287,4 +287,12 @@ impl RaftRpcTrait for MaelstromRpcClient {
             ),
         })
     }
+
+    async fn install_snapshot(
+        &self,
+        _ctx: context::Context,
+        _req: InstallSnapshotRequest,
+    ) -> anyhow::Result<InstallSnapshotResponse> {
+        Ok(InstallSnapshotResponse { term: 0 })
+    }
 }

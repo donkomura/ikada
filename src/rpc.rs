@@ -56,12 +56,31 @@ pub struct CommandResponse {
     pub error: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(crate = "tarpc::serde")]
+pub struct InstallSnapshotRequest {
+    pub term: u32,
+    pub leader_id: u32,
+    pub last_included_index: u32,
+    pub last_included_term: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(crate = "tarpc::serde")]
+pub struct InstallSnapshotResponse {
+    pub term: u32,
+}
+
 #[tarpc::service]
 pub trait RaftRpc {
     async fn append_entries(req: AppendEntriesRequest)
     -> AppendEntriesResponse;
     async fn request_vote(req: RequestVoteRequest) -> RequestVoteResponse;
     async fn client_request(req: CommandRequest) -> CommandResponse;
+    async fn install_snapshot(
+        req: InstallSnapshotRequest,
+    ) -> InstallSnapshotResponse;
 }
 
 /// Trait for Raft RPC client abstraction.
@@ -85,6 +104,12 @@ pub trait RaftRpcTrait: Send + Sync {
         ctx: tarpc::context::Context,
         req: CommandRequest,
     ) -> anyhow::Result<CommandResponse>;
+
+    async fn install_snapshot(
+        &self,
+        ctx: tarpc::context::Context,
+        req: InstallSnapshotRequest,
+    ) -> anyhow::Result<InstallSnapshotResponse>;
 }
 
 /// Implement RaftRpcTrait for RaftRpcClient (tarpc-generated client)
@@ -119,6 +144,17 @@ impl RaftRpcTrait for RaftRpcClient {
     ) -> anyhow::Result<CommandResponse> {
         self.clone()
             .client_request(ctx, req)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn install_snapshot(
+        &self,
+        ctx: tarpc::context::Context,
+        req: InstallSnapshotRequest,
+    ) -> anyhow::Result<InstallSnapshotResponse> {
+        self.clone()
+            .install_snapshot(ctx, req)
             .await
             .map_err(Into::into)
     }

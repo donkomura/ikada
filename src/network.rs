@@ -142,6 +142,23 @@ pub mod mock {
             drop(partitions);
             self.inner.client_request(ctx, req).await
         }
+
+        async fn install_snapshot(
+            &self,
+            ctx: tarpc::context::Context,
+            req: InstallSnapshotRequest,
+        ) -> anyhow::Result<InstallSnapshotResponse> {
+            let partitions = self.partitions.lock().await;
+            if partitions.contains(&(self.local_addr, self.remote_addr)) {
+                return Err(anyhow::anyhow!(
+                    "Network partition between {} and {}",
+                    self.local_addr,
+                    self.remote_addr
+                ));
+            }
+            drop(partitions);
+            self.inner.install_snapshot(ctx, req).await
+        }
     }
 
     #[derive(Clone)]
