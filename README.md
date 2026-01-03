@@ -2,7 +2,7 @@
 
 A Raft consensus algorithm implementation written in Rust for distributed systems.
 
-**Ikada** (いかだ) is the Japanese word for "raft" - a simple floating platform that carries its load reliably across water, just as this library carries your data reliably across distributed nodes.
+**Ikada** (いかだ / 筏) is the Japanese word for "raft" - a simple floating platform that carries its load reliably across water, just as this library carries your data reliably across distributed nodes.
 
 ## Description
 
@@ -32,6 +32,7 @@ For correctness verification, we employ [Maelstrom](https://github.com/jepsen-io
 - ✅ **Snapshot**: Log compaction with snapshot creation, installation, and automatic transmission via InstallSnapshot RPC (Raft §7)
 - ✅ **ReadIndex**: Linearizable reads without committing log entries, ensuring read operations reflect the latest committed state
 - ✅ **Leader Stepping Down**: Leaders can voluntarily step down when they detect they are no longer the legitimate leader
+- ✅ **Distributed Tracing**: OpenTelemetry instrumentation for visualizing Raft operations (leader election, log replication, state transitions) in tools like Jaeger
 - ✅ **Linearizability Testing**: Verified with [Maelstrom](https://github.com/jepsen-io/maelstrom) under network partitions and various failure scenarios
 - ⏳ **Dynamic Membership**: Runtime cluster configuration changes (Raft §6) - Planned
 
@@ -87,6 +88,34 @@ OK
 (nil)
 ```
 
+### Distributed Tracing
+
+Ikada supports distributed tracing with OpenTelemetry, allowing you to visualize Raft operations in tools like Jaeger.
+
+#### Start Jaeger
+
+```bash
+$ docker run -d --name jaeger \
+  -e COLLECTOR_OTLP_ENABLED=true \
+  -p 16686:16686 \
+  -p 4317:4317 \
+  jaegertracing/all-in-one:latest
+```
+
+#### Run with Tracing Enabled
+
+```bash
+$ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  RUST_LOG=info \
+  ikada-server
+```
+
+Then open http://localhost:16686 to view traces in Jaeger UI.
+
+**Environment Variables**:
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: OpenTelemetry collector endpoint (default: disabled)
+- `OTEL_TRACES_SAMPLING`: Sampling ratio from 0.0 to 1.0 (default: 1.0 = 100%)
+
 ## Project Status
 
 Ikada is currently under active development. Core Raft functionality is implemented and tested, but production readiness requires additional features.
@@ -99,7 +128,6 @@ Ikada is currently under active development. Core Raft functionality is implemen
   - [ ] Further ReadIndex optimizations
 - [ ] Benchmarking Suite
 - [ ] Automatic Snapshot Triggers (configurable thresholds)
-- [ ] Monitoring and Metrics Dashboard
 
 ## License
 
