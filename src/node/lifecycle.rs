@@ -11,6 +11,7 @@ use crate::raft::Role;
 use crate::statemachine::StateMachine;
 use crate::watchdog::WatchDog;
 use std::net::SocketAddr;
+use tracing::Instrument;
 
 impl<T, SM, NF> Node<T, SM, NF>
 where
@@ -26,6 +27,7 @@ where
 {
     /// Main event loop that dispatches to role-specific handlers.
     /// Runs indefinitely until an error occurs.
+    #[tracing::instrument(skip(self, servers), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn main(
         mut self,
         servers: Vec<SocketAddr>,
@@ -54,6 +56,7 @@ where
     /// Raft Algorithm Step 1: Election Timeout Detection
     /// - Followers wait for heartbeats (AppendEntries) from the leader
     /// - If no heartbeat is received within election_timeout, transition to candidate
+    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
     pub async fn run_follower(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.election_timeout;
         let watchdog = WatchDog::default();
@@ -86,6 +89,7 @@ where
 
     /// Runs as candidate, starting elections periodically.
     /// Transitions to follower if a valid leader's heartbeat is received.
+    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
     pub async fn run_candidate(&mut self) -> anyhow::Result<()>
     where
         T: Default,
@@ -128,6 +132,7 @@ where
     ///
     /// Raft Algorithm - Log Replication Flow:
     /// This function coordinates steps 1-11 of the log replication process
+    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
     pub async fn run_leader(&mut self) -> anyhow::Result<()>
     where
         SM::Response: Clone + serde::Serialize,
@@ -227,6 +232,7 @@ where
     ///
     /// Batching allows multiple log entries to be replicated together,
     /// reducing network overhead and improving throughput under load.
+    #[tracing::instrument(skip(self, requests), fields(node_id = self.state.try_lock().ok().map(|s| s.id), batch_size = requests.len()))]
     async fn flush_request_batch(
         &mut self,
         requests: &mut Vec<(
@@ -364,13 +370,16 @@ where
         // Respond to each client independently without blocking the leader loop.
         for (log_index, result_rx, resp_tx) in appended {
             let state = self.state.clone();
-            tokio::spawn(async move {
-                let resp = handlers::wait_for_write_result::<T, SM>(
-                    state, log_index, peer_count, timeout, result_rx,
-                )
-                .await;
-                let _ = resp_tx.send(resp);
-            });
+            tokio::spawn(
+                async move {
+                    let resp = handlers::wait_for_write_result::<T, SM>(
+                        state, log_index, peer_count, timeout, result_rx,
+                    )
+                    .await;
+                    let _ = resp_tx.send(resp);
+                }
+                .instrument(tracing::Span::current()),
+            );
         }
 
         Ok(())

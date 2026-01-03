@@ -217,6 +217,7 @@ where
 
     /// Starts the Raft node and runs until error or shutdown.
     /// Spawns three tasks: main loop, RPC handler, and RPC server.
+    #[tracing::instrument(skip(self, servers), fields(port = port))]
     pub async fn run(
         self,
         port: u16,
@@ -225,10 +226,18 @@ where
     where
         T: Default,
     {
+        use tracing::Instrument;
+
         let (tx, rx) = mpsc::channel::<Command>(32);
         let mut workers = JoinSet::new();
-        workers.spawn(self.run_with_handler(servers, rx));
-        workers.spawn(crate::server::rpc_server(tx, port));
+        workers.spawn(
+            self.run_with_handler(servers, rx)
+                .instrument(tracing::Span::current()),
+        );
+        workers.spawn(
+            crate::server::rpc_server(tx, port)
+                .instrument(tracing::Span::current()),
+        );
 
         if let Some(res) = workers.join_next().await {
             res??;

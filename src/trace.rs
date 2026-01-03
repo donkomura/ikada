@@ -1,17 +1,52 @@
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::trace::Sampler;
 use tracing_subscriber::{fmt::format::FmtSpan, prelude::*};
 
 pub fn init_tracing(
     service_name: &'static str,
 ) -> anyhow::Result<opentelemetry_sdk::trace::SdkTracerProvider> {
-    let tracer_provider =
+    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    let sampling_ratio = std::env::var("OTEL_TRACES_SAMPLING")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.0);
+
+    // ParentBasedサンプラー: 親スパンがサンプリングされていればそれに従い、
+    // そうでなければ確率ベースでサンプリング
+    let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+        sampling_ratio,
+    )));
+
+    let tracer_provider = if let Some(endpoint) = otlp_endpoint {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(&endpoint)
+            .build()?;
+
         opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_sampler(sampler)
             .with_resource(
                 opentelemetry_sdk::Resource::builder()
                     .with_service_name(service_name)
                     .build(),
             )
-            .build();
+            .build()
+    } else {
+        opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(sampler)
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name(service_name)
+                    .build(),
+            )
+            .build()
+    };
+
     opentelemetry::global::set_tracer_provider(tracer_provider.clone());
     let tracer = tracer_provider.tracer(service_name);
 
@@ -30,14 +65,48 @@ pub fn init_tracing(
 pub fn init_tracing_stderr(
     service_name: &'static str,
 ) -> anyhow::Result<opentelemetry_sdk::trace::SdkTracerProvider> {
-    let tracer_provider =
+    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    // サンプリング率を環境変数から取得（デフォルトは0.1 = 10%）
+    let sampling_ratio = std::env::var("OTEL_TRACES_SAMPLER_ARG")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.1);
+
+    // ParentBasedサンプラー: 親スパンがサンプリングされていればそれに従い、
+    // そうでなければ確率ベースでサンプリング
+    let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+        sampling_ratio,
+    )));
+
+    let tracer_provider = if let Some(endpoint) = otlp_endpoint {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(&endpoint)
+            .build()?;
+
         opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_sampler(sampler)
             .with_resource(
                 opentelemetry_sdk::Resource::builder()
                     .with_service_name(service_name)
                     .build(),
             )
-            .build();
+            .build()
+    } else {
+        opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(sampler)
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name(service_name)
+                    .build(),
+            )
+            .build()
+    };
+
     opentelemetry::global::set_tracer_provider(tracer_provider.clone());
     let tracer = tracer_provider.tracer(service_name);
 
