@@ -257,18 +257,18 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
 
     /// Applies snapshot data received via InstallSnapshot RPC
     ///
-    /// Implements Raft Figure 13 steps 3-5:
-    /// - Step 3: If existing log entry has same index and term as snapshot's last included entry,
+    /// Implements Raft Figure 13:
+    /// - If existing log entry has same index and term as snapshot's last included entry,
     ///   retain log entries following it
-    /// - Step 4: Discard the entire log (if step 3 doesn't apply)
-    /// - Step 5: Reset state machine using snapshot contents
+    /// - Otherwise discard the entire log
+    /// - Reset state machine using snapshot contents
     pub async fn restore_from_snapshot_data(
         &mut self,
         last_included_index: u32,
         last_included_term: u32,
         data: &[u8],
     ) -> anyhow::Result<()> {
-        // Step 3: Check if existing log entry has same index and term as snapshot's last included entry
+        // Check if existing log entry has same index and term as snapshot's last included entry
         let should_retain_log = if last_included_index > 0
             && (last_included_index as usize) <= self.persistent.log.len()
         {
@@ -279,14 +279,14 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         };
 
         if should_retain_log {
-            // Step 3: Retain log entries following the snapshot's last included entry
+            // Retain log entries following the snapshot's last included entry
             self.persistent.log.drain(0..(last_included_index as usize));
         } else {
-            // Step 4: Discard the entire log
+            // Discard the entire log
             self.persistent.log.clear();
         }
 
-        // Step 5: Reset state machine using snapshot contents
+        // Reset state machine using snapshot contents
         self.state_machine.restore(data).await?;
 
         // Update commit_index and last_applied to snapshot's last included index

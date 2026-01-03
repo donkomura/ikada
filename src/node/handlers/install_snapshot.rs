@@ -24,7 +24,7 @@ where
 {
     let mut state = state.lock().await;
 
-    // Step 1: Reply immediately if term < currentTerm
+    // Reply immediately if term < currentTerm
     if req.term < state.persistent.current_term {
         return Ok(InstallSnapshotResponse {
             term: state.persistent.current_term,
@@ -37,7 +37,7 @@ where
         let _ = state.persist().await;
     }
 
-    // Steps 2-5: Apply snapshot to state machine and handle log
+    // Apply snapshot to state machine and handle log
     state
         .restore_from_snapshot_data(
             req.last_included_index,

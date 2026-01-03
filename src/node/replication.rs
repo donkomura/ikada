@@ -451,16 +451,12 @@ where
         let notifier = {
             let mut state = self.state.lock().await;
             if let Some(leader_state) = state.role.leader_state_mut() {
-                // Update match_index: follower now has all entries up to last_included_index
                 leader_state.match_index.insert(addr, last_included_index);
-                // Update next_index: next AppendEntries should send entries after the snapshot
                 leader_state
                     .next_index
                     .insert(addr, last_included_index + 1);
-                // Clear inflight tracking as this RPC completed
                 leader_state.inflight_index.insert(addr, None);
             }
-            // Clone notifier to signal waiting tasks (used for commit advancement and read requests)
             state.replication_notifier.clone()
         };
 
