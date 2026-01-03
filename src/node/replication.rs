@@ -420,12 +420,18 @@ where
 
     /// Handles InstallSnapshot response from a follower.
     /// Updates next_index and match_index after successful snapshot installation.
+    ///
+    /// Following Raft semantics (not explicitly in Figure 13):
+    /// - If response term is higher, step down to follower
+    /// - Update match_index to last_included_index (follower is now caught up to this point)
+    /// - Update next_index to last_included_index + 1 (next AppendEntries will send entries after snapshot)
     pub(super) async fn handle_install_snapshot_response(
         &mut self,
         addr: SocketAddr,
         res: InstallSnapshotResponse,
         last_included_index: u32,
     ) -> anyhow::Result<()> {
+        // Check if we need to step down due to higher term
         let check_term = {
             let state = self.state.lock().await;
             res.term > state.persistent.current_term
@@ -441,18 +447,25 @@ where
             return Ok(());
         }
 
+        // Update replication indices to reflect successful snapshot installation
         let notifier = {
             let mut state = self.state.lock().await;
             if let Some(leader_state) = state.role.leader_state_mut() {
+                // Update match_index: follower now has all entries up to last_included_index
                 leader_state.match_index.insert(addr, last_included_index);
+                // Update next_index: next AppendEntries should send entries after the snapshot
                 leader_state
                     .next_index
                     .insert(addr, last_included_index + 1);
+                // Clear inflight tracking as this RPC completed
                 leader_state.inflight_index.insert(addr, None);
             }
+            // Clone notifier to signal waiting tasks (used for commit advancement and read requests)
             state.replication_notifier.clone()
         };
 
+        // Notify any tasks waiting on replication progress
+        // (e.g., commit index calculation, read index requests)
         notifier.notify_waiters();
 
         tracing::info!(
