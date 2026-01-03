@@ -34,9 +34,14 @@ impl StateMachine for NoOpStateMachine {
         Ok(self.applied_count)
     }
     async fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
-        unimplemented!()
+        Ok(self.applied_count.to_le_bytes().to_vec())
     }
-    async fn restore(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+    async fn restore(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        if data.len() >= std::mem::size_of::<usize>() {
+            let bytes: [u8; std::mem::size_of::<usize>()] =
+                data[0..std::mem::size_of::<usize>()].try_into()?;
+            self.applied_count = usize::from_le_bytes(bytes);
+        }
         Ok(())
     }
 }
