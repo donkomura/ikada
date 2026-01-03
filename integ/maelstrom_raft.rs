@@ -276,6 +276,7 @@ impl MaelstromRaftNode {
             replication_max_inflight: 4,
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
+            read_index_timeout: std::time::Duration::from_millis(100),
         };
 
         let node = Node::new_with_state(config, state, network_factory.clone());

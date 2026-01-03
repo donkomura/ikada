@@ -16,6 +16,8 @@ pub struct Config {
     /// Smaller values improve fairness and latency under load, larger values improve throughput.
     pub replication_max_entries_per_rpc: usize,
     pub snapshot_threshold: usize,
+    /// Timeout for read index confirmation (linearizable reads)
+    pub read_index_timeout: Duration,
 }
 
 impl Default for Config {
@@ -35,6 +37,7 @@ impl Default for Config {
             replication_max_inflight: 4,
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
+            read_index_timeout: Duration::from_millis(2000),
         }
     }
 }

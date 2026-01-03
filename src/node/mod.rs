@@ -252,6 +252,7 @@ where
         let heartbeat_tx = self.c.heartbeat_tx.clone();
         let client_request_tx = self.c.client_request_tx.clone();
         let request_tracker = Arc::clone(&self.request_tracker);
+        let config = self.config.clone();
 
         tokio::spawn(Self::rpc_handler(
             state,
@@ -259,6 +260,7 @@ where
             heartbeat_tx,
             client_request_tx,
             request_tracker,
+            config,
         ));
 
         self.main(vec![]).await
@@ -275,6 +277,7 @@ where
             oneshot::Sender<CommandResponse>,
         )>,
         request_tracker: Arc<Mutex<RequestTracker<SM::Response>>>,
+        config: Config,
     ) -> anyhow::Result<()> {
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -367,7 +370,7 @@ where
                             let resp = handlers::handle_read_index_request(
                                 &req,
                                 state_clone,
-                                std::time::Duration::from_millis(2000),
+                                config.read_index_timeout,
                                 peer_count,
                             )
                             .await;

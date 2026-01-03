@@ -105,6 +105,7 @@ async fn append_command_to_log<T, SM>(
     request_tracker: Arc<
         Mutex<crate::request_tracker::RequestTracker<SM::Response>>,
     >,
+    tracker_timeout: std::time::Duration,
 ) -> Result<(u32, tokio::sync::oneshot::Receiver<SM::Response>), CommandResponse>
 where
     T: Send + Sync + Clone,
@@ -134,7 +135,7 @@ where
     request_tracker.lock().await.track_write(
         log_index,
         result_tx,
-        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        std::time::Instant::now() + tracker_timeout,
     );
 
     tracing::debug!(
@@ -277,6 +278,7 @@ where
             &mut state_guard,
             command.clone(),
             request_tracker.clone(),
+            timeout,
         )
         .await
         {
