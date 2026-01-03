@@ -15,8 +15,8 @@ pub fn init_tracing(
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(1.0);
 
-    // ParentBasedサンプラー: 親スパンがサンプリングされていればそれに従い、
-    // そうでなければ確率ベースでサンプリング
+    // ParentBased sampler: follows parent span's sampling decision if present,
+    // otherwise uses TraceIdRatioBased sampling
     let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
         sampling_ratio,
     )));
@@ -69,14 +69,13 @@ pub fn init_tracing_stderr(
         .ok()
         .filter(|s| !s.is_empty());
 
-    // サンプリング率を環境変数から取得（デフォルトは0.1 = 10%）
-    let sampling_ratio = std::env::var("OTEL_TRACES_SAMPLER_ARG")
+    let sampling_ratio = std::env::var("OTEL_TRACES_SAMPLER_RATE")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.1);
 
-    // ParentBasedサンプラー: 親スパンがサンプリングされていればそれに従い、
-    // そうでなければ確率ベースでサンプリング
+    // ParentBased sampler: follows parent span's sampling decision if present,
+    // otherwise uses TraceIdRatioBased sampling
     let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
         sampling_ratio,
     )));

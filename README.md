@@ -114,7 +114,7 @@ Then open http://localhost:16686 to view traces in Jaeger UI.
 
 **Environment Variables**:
 - `OTEL_EXPORTER_OTLP_ENDPOINT`: OpenTelemetry collector endpoint (default: disabled)
-- `OTEL_TRACES_SAMPLING`: Sampling ratio from 0.0 to 1.0 (default: 1.0 = 100%)
+- `OTEL_TRACES_SAMPLER_RATE`: Sampling ratio from 0.0 to 1.0 (default: 1.0 = 100%)
 
 ## Project Status
 
