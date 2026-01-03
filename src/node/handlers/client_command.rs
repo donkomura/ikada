@@ -184,6 +184,37 @@ where
     }
 }
 
+/// Waits for a given log index to reach majority replication, then waits for the
+/// state machine application result corresponding to that log index.
+///
+/// This is intended for leader-side batching where the caller already appended
+/// to the log and registered the `RequestTracker` entry.
+pub async fn wait_for_write_result<T, SM>(
+    state: Arc<Mutex<RaftState<T, SM>>>,
+    log_index: u32,
+    peer_count: usize,
+    timeout: std::time::Duration,
+    result_rx: tokio::sync::oneshot::Receiver<SM::Response>,
+) -> CommandResponse
+where
+    T: Send + Sync + Clone,
+    SM: StateMachine<Command = T>,
+    SM::Response: Clone + serde::Serialize,
+{
+    if let Err(response) = wait_for_majority_replication(
+        state.clone(),
+        log_index,
+        peer_count,
+        timeout,
+    )
+    .await
+    {
+        return response;
+    }
+
+    wait_for_command_result::<SM>(result_rx, timeout).await
+}
+
 pub async fn handle_client_request_impl<T, SM>(
     req: &CommandRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,

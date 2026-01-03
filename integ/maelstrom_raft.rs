@@ -273,6 +273,8 @@ impl MaelstromRaftNode {
             heartbeat_failure_retry_limit: 5,
             batch_window: tokio::time::Duration::from_millis(10),
             max_batch_size: 100,
+            replication_max_inflight: 4,
+            replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
         };
 

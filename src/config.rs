@@ -9,6 +9,12 @@ pub struct Config {
     pub heartbeat_failure_retry_limit: u32,
     pub batch_window: tokio::time::Duration,
     pub max_batch_size: usize,
+    /// Max number of concurrent AppendEntries in-flight per follower.
+    /// Higher values increase throughput (pipelining) but can amplify wasted work on conflicts.
+    pub replication_max_inflight: usize,
+    /// Max number of log entries to include in a single AppendEntries RPC.
+    /// Smaller values improve fairness and latency under load, larger values improve throughput.
+    pub replication_max_entries_per_rpc: usize,
     pub snapshot_threshold: usize,
 }
 
@@ -26,6 +32,8 @@ impl Default for Config {
             heartbeat_failure_retry_limit: 1,
             batch_window: tokio::time::Duration::from_millis(30),
             max_batch_size: 100,
+            replication_max_inflight: 4,
+            replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
         }
     }
