@@ -16,7 +16,7 @@ where
             success: false,
             leader_hint: state.leader_id,
             data: None,
-            error: Some("Not the leader".to_string()),
+            error: Some(crate::rpc::CommandError::NotLeader),
         });
     }
 
@@ -48,9 +48,7 @@ where
                 success: false,
                 leader_hint: None,
                 data: None,
-                error: Some(
-                    "Timeout waiting for majority replication".to_string(),
-                ),
+                error: Some(crate::rpc::CommandError::ReplicationFailed),
             });
         }
 
@@ -62,7 +60,7 @@ where
                     success: false,
                     leader_hint: state_guard.leader_id,
                     data: None,
-                    error: Some("No longer the leader".to_string()),
+                    error: Some(crate::rpc::CommandError::NotLeader),
                 });
             }
 
@@ -91,7 +89,7 @@ where
                     success: false,
                     leader_hint: None,
                     data: None,
-                    error: Some("Timeout waiting for majority replication".to_string()),
+                    error: Some(crate::rpc::CommandError::ReplicationFailed),
                 });
             }
             _ = notifier.notified() => {
@@ -125,7 +123,10 @@ where
             success: false,
             leader_hint: None,
             data: None,
-            error: Some(format!("Failed to persist log: {}", e)),
+            error: Some(crate::rpc::CommandError::Other(format!(
+                "Failed to persist log: {}",
+                e
+            ))),
         });
     }
 
@@ -166,20 +167,27 @@ where
                 success: false,
                 leader_hint: None,
                 data: None,
-                error: Some(format!("Failed to serialize response: {}", e)),
+                error: Some(crate::rpc::CommandError::Other(format!(
+                    "Failed to serialize response: {}",
+                    e
+                ))),
             },
         },
         Ok(Err(_)) => CommandResponse {
             success: false,
             leader_hint: None,
             data: None,
-            error: Some("Response channel closed".to_string()),
+            error: Some(crate::rpc::CommandError::Other(
+                "Response channel closed".to_string(),
+            )),
         },
         Err(_) => CommandResponse {
             success: false,
             leader_hint: None,
             data: None,
-            error: Some("Request timeout".to_string()),
+            error: Some(crate::rpc::CommandError::Other(
+                "Request timeout".to_string(),
+            )),
         },
     }
 }
@@ -243,10 +251,10 @@ where
                 success: false,
                 leader_hint: None,
                 data: None,
-                error: Some(format!(
+                error: Some(crate::rpc::CommandError::Other(format!(
                     "Failed to apply committed entries: {}",
                     e
-                )),
+                ))),
             };
         }
 
@@ -257,10 +265,10 @@ where
                     success: false,
                     leader_hint: None,
                     data: None,
-                    error: Some(format!(
+                    error: Some(crate::rpc::CommandError::Other(format!(
                         "Failed to deserialize command: {}",
                         e
-                    )),
+                    ))),
                 };
             }
         };
@@ -325,7 +333,7 @@ where
                 success: false,
                 leader_hint: None,
                 data: None,
-                error: Some("No-op entry not yet committed".to_string()),
+                error: Some(crate::rpc::CommandError::NoopNotCommitted),
             };
         }
 
@@ -348,7 +356,7 @@ where
             success: false,
             leader_hint: None,
             data: None,
-            error: Some("Lost leadership during read".to_string()),
+            error: Some(crate::rpc::CommandError::NotLeader),
         };
     }
 
@@ -367,9 +375,9 @@ where
                 success: false,
                 leader_hint: None,
                 data: None,
-                error: Some(
+                error: Some(crate::rpc::CommandError::Other(
                     "Read timeout waiting for state machine".to_string(),
-                ),
+                )),
             };
         }
 
@@ -388,7 +396,7 @@ where
                     success: false,
                     leader_hint: None,
                     data: None,
-                    error: Some("Read timeout waiting for state machine".to_string()),
+                    error: Some(crate::rpc::CommandError::Other("Read timeout waiting for state machine".to_string())),
                 };
             }
             _ = apply_notifier.notified() => {
@@ -405,7 +413,10 @@ where
                 success: false,
                 leader_hint: None,
                 data: None,
-                error: Some(format!("Deserialize error: {}", e)),
+                error: Some(crate::rpc::CommandError::Other(format!(
+                    "Deserialize error: {}",
+                    e
+                ))),
             };
         }
     };
@@ -424,7 +435,10 @@ where
             success: false,
             leader_hint: None,
             data: None,
-            error: Some(format!("State machine error: {}", e)),
+            error: Some(crate::rpc::CommandError::Other(format!(
+                "State machine error: {}",
+                e
+            ))),
         },
     }
 }

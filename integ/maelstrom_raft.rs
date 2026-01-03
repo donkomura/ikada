@@ -328,7 +328,7 @@ impl MaelstromRaftNode {
         &self,
         cmd: KVCommand,
     ) -> anyhow::Result<KVResponse> {
-        let response = self.send_to_raft(cmd.clone()).await?;
+        let response = self.send_to_raft(cmd.clone(), false).await?;
 
         if response.success {
             return self.parse_success_response(response);
@@ -341,14 +341,14 @@ impl MaelstromRaftNode {
         &self,
         cmd: KVCommand,
     ) -> anyhow::Result<KVResponse> {
-        let response = self.send_read_to_raft(cmd.clone()).await?;
+        let response = self.send_to_raft(cmd.clone(), true).await?;
 
         if response.success {
             return self.parse_success_response(response);
         }
 
         // For reads, if no-op not committed yet, fall back to normal path
-        if response.error.as_deref() == Some("No-op entry not yet committed") {
+        if response.error == Some(ikada::rpc::CommandError::NoopNotCommitted) {
             return self.execute_command(cmd).await;
         }
 
@@ -358,35 +358,22 @@ impl MaelstromRaftNode {
     async fn send_to_raft(
         &self,
         cmd: KVCommand,
+        use_read_index: bool,
     ) -> anyhow::Result<CommandResponse> {
         let cmd_tx = self.get_command_channel().await?;
         let cmd_bytes = bincode::serialize(&cmd)?;
         let (resp_tx, resp_rx) = oneshot::channel();
 
-        cmd_tx
-            .send(Command::ClientRequest(
+        let command = if use_read_index {
+            Command::ReadRequest(CommandRequest { command: cmd_bytes }, resp_tx)
+        } else {
+            Command::ClientRequest(
                 CommandRequest { command: cmd_bytes },
                 resp_tx,
-            ))
-            .await?;
+            )
+        };
 
-        Ok(resp_rx.await?)
-    }
-
-    async fn send_read_to_raft(
-        &self,
-        cmd: KVCommand,
-    ) -> anyhow::Result<CommandResponse> {
-        let cmd_tx = self.get_command_channel().await?;
-        let cmd_bytes = bincode::serialize(&cmd)?;
-        let (resp_tx, resp_rx) = oneshot::channel();
-
-        cmd_tx
-            .send(Command::ReadRequest(
-                CommandRequest { command: cmd_bytes },
-                resp_tx,
-            ))
-            .await?;
+        cmd_tx.send(command).await?;
 
         Ok(resp_rx.await?)
     }
@@ -420,7 +407,13 @@ impl MaelstromRaftNode {
             return self.forward_to_leader(leader_node_id, cmd).await;
         }
 
-        Err(anyhow::anyhow!("Command failed: {:?}", response.error))
+        Err(anyhow::anyhow!(
+            "Command failed: {}",
+            response
+                .error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "Unknown error".to_string())
+        ))
     }
 
     /// Check if we should forward to leader and return leader's node ID.
@@ -559,15 +552,14 @@ impl MaelstromRaftNode {
         }
     }
 
-    /// Forward CAS operation to the leader
+    /// Generic message forwarding to leader
     ///
-    /// Custom implementation for forwarding compare-and-swap operations.
-    async fn forward_cas_to_leader(
+    /// Forwards any message body to the leader and returns the response message.
+    /// This avoids unnecessary serialization/deserialization.
+    async fn forward_message_to_leader(
         &self,
         leader_node_id: String,
-        key: String,
-        from: serde_json::Value,
-        to: serde_json::Value,
+        body: Body,
     ) -> anyhow::Result<Message> {
         let my_node_id = self
             .get_node_id()
@@ -575,7 +567,7 @@ impl MaelstromRaftNode {
             .ok_or_else(|| anyhow::anyhow!("Node ID not set"))?;
 
         if leader_node_id == my_node_id {
-            return Err(anyhow::anyhow!("Cannot forward CAS to self"));
+            return Err(anyhow::anyhow!("Cannot forward to self"));
         }
 
         let msg_id = self.get_next_forward_msg_id().await;
@@ -586,30 +578,41 @@ impl MaelstromRaftNode {
             forward_mgr.response_handlers.insert(msg_id, tx);
         }
 
-        let key_value: serde_json::Value = serde_json::from_str(&key)
-            .unwrap_or_else(|_| serde_json::Value::String(key.clone()));
+        // Update msg_id in the body
+        let body_with_msg_id = match body {
+            Body::Read(mut read_body) => {
+                read_body.msg_id = msg_id;
+                Body::Read(read_body)
+            }
+            Body::Write(mut write_body) => {
+                write_body.msg_id = msg_id;
+                Body::Write(write_body)
+            }
+            Body::Cas(mut cas_body) => {
+                cas_body.msg_id = msg_id;
+                Body::Cas(cas_body)
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Unsupported body type for forwarding"
+                ));
+            }
+        };
 
         let msg = Message {
             src: my_node_id.clone(),
             dest: Some(leader_node_id.clone()),
-            body: Body::Cas(CasBody {
-                msg_id,
-                key: key_value,
-                from,
-                to,
-            }),
+            body: body_with_msg_id,
         };
 
         self.outgoing_tx
             .send(msg)
-            .map_err(|e| anyhow::anyhow!("Failed to forward CAS: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to forward: {}", e))?;
 
         let response =
             tokio::time::timeout(std::time::Duration::from_secs(5), rx)
                 .await
-                .map_err(|_| {
-                    anyhow::anyhow!("Forward CAS request timed out")
-                })??;
+                .map_err(|_| anyhow::anyhow!("Forward request timed out"))??;
 
         Ok(response)
     }
@@ -620,34 +623,24 @@ impl MaelstromRaftNode {
         body: ReadBody,
     ) -> anyhow::Result<Option<Message>> {
         if let Some(leader_node_id) = self.should_forward_to_leader().await? {
-            let key_str = body.key.to_string().trim_matches('"').to_string();
-            let command = KVCommand::Get { key: key_str };
-
-            match self.forward_to_leader(leader_node_id, command).await {
-                Ok(KVResponse::Value(Some(value))) => {
-                    let json_value: serde_json::Value =
-                        serde_json::from_str(&value)
-                            .unwrap_or(serde_json::Value::String(value));
-
-                    return Ok(Some(Message {
-                        src: self.get_node_id().await.unwrap(),
-                        dest: Some(src),
-                        body: Body::ReadOk(ReadOkBody {
-                            in_reply_to: body.msg_id,
-                            value: json_value,
-                        }),
-                    }));
-                }
-                Ok(KVResponse::Value(None)) => {
-                    return Ok(Some(Message {
-                        src: self.get_node_id().await.unwrap(),
-                        dest: Some(src),
-                        body: Body::Error(ErrorBody {
-                            in_reply_to: body.msg_id,
-                            code: ERROR_KEY_NOT_EXIST,
-                            text: Some("Key does not exist".to_string()),
-                        }),
-                    }));
+            // Use generic message forwarding - no serialize/deserialize overhead
+            match self
+                .forward_message_to_leader(
+                    leader_node_id,
+                    Body::Read(body.clone()),
+                )
+                .await
+            {
+                Ok(mut response) => {
+                    // Fix response destination and msg_id
+                    response.dest = Some(src);
+                    if let Body::ReadOk(ref mut ok_body) = response.body {
+                        ok_body.in_reply_to = body.msg_id;
+                    } else if let Body::Error(ref mut err_body) = response.body
+                    {
+                        err_body.in_reply_to = body.msg_id;
+                    }
+                    return Ok(Some(response));
                 }
                 Err(e) => {
                     return Ok(Some(Message {
@@ -660,7 +653,6 @@ impl MaelstromRaftNode {
                         }),
                     }));
                 }
-                _ => unreachable!(),
             }
         }
 
@@ -759,14 +751,48 @@ impl MaelstromRaftNode {
         src: String,
         body: CasBody,
     ) -> anyhow::Result<Option<Message>> {
-        let key_str = body.key.to_string().trim_matches('"').to_string();
+        // First, check if we should forward to leader (same pattern as handle_read)
+        if let Some(leader_node_id) = self.should_forward_to_leader().await? {
+            // Use generic message forwarding
+            return match self
+                .forward_message_to_leader(
+                    leader_node_id,
+                    Body::Cas(body.clone()),
+                )
+                .await
+            {
+                Ok(mut response_msg) => {
+                    response_msg.dest = Some(src);
+                    self.fix_cas_reply_to(&mut response_msg.body, body.msg_id);
+                    Ok(Some(response_msg))
+                }
+                Err(e) => {
+                    self.error_response(
+                        src,
+                        body.msg_id,
+                        ERROR_GENERAL,
+                        format!("Forward error: {}", e),
+                    )
+                    .await
+                }
+            };
+        }
 
+        // We are the leader or no leader is known yet
         let leadership_confirmed = self.check_leadership_confirmed().await?;
 
         if !leadership_confirmed {
-            return self.forward_cas_if_possible(src, body, key_str).await;
+            return self
+                .error_response(
+                    src,
+                    body.msg_id,
+                    ERROR_GENERAL,
+                    "Not leader and no leader known".to_string(),
+                )
+                .await;
         }
 
+        let key_str = body.key.to_string().trim_matches('"').to_string();
         self.execute_cas_as_leader(src, body, key_str).await
     }
 
@@ -780,43 +806,6 @@ impl MaelstromRaftNode {
         let state_inner = state.lock().await;
 
         Ok(state_inner.role.is_leader())
-    }
-
-    async fn forward_cas_if_possible(
-        &self,
-        src: String,
-        body: CasBody,
-        key_str: String,
-    ) -> anyhow::Result<Option<Message>> {
-        if let Some(leader_node_id) = self.should_forward_to_leader().await? {
-            return match self
-                .forward_cas_to_leader(
-                    leader_node_id,
-                    key_str,
-                    body.from.clone(),
-                    body.to.clone(),
-                )
-                .await
-            {
-                Ok(mut response_msg) => {
-                    response_msg.dest = Some(src);
-                    self.fix_cas_reply_to(&mut response_msg.body, body.msg_id);
-                    Ok(Some(response_msg))
-                }
-                Err(e) => {
-                    self.error_response(
-                        src,
-                        body.msg_id,
-                        13,
-                        format!("Forward error: {}", e),
-                    )
-                    .await
-                }
-            };
-        }
-
-        self.error_response(src, body.msg_id, 13, "Not the leader".to_string())
-            .await
     }
 
     fn fix_cas_reply_to(&self, body: &mut Body, msg_id: u64) {

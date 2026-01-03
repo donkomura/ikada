@@ -64,9 +64,9 @@ impl<NF: NetworkFactory> RaftClient<NF> {
         } else {
             Err(anyhow::anyhow!(
                 "Command failed: {}",
-                response
-                    .error
-                    .unwrap_or_else(|| "Unknown error".to_string())
+                response.error.unwrap_or_else(|| {
+                    crate::rpc::CommandError::Other("Unknown error".to_string())
+                })
             ))
         }
     }

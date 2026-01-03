@@ -277,7 +277,7 @@ where
                             success: false,
                             leader_hint,
                             data: None,
-                            error: Some("Not the leader".to_string()),
+                            error: Some(crate::rpc::CommandError::NotLeader),
                         },
                     ));
                 }
@@ -311,9 +311,11 @@ where
                                 success: false,
                                 leader_hint: None,
                                 data: None,
-                                error: Some(format!(
-                                    "Failed to deserialize command: {}",
-                                    e
+                                error: Some(crate::rpc::CommandError::Other(
+                                    format!(
+                                        "Failed to deserialize command: {}",
+                                        e
+                                    ),
                                 )),
                             },
                         ));

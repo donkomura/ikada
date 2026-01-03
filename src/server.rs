@@ -87,7 +87,9 @@ impl RaftRpc for RaftServer {
             success: false,
             leader_hint: None,
             data: None,
-            error: Some("Failed to process client request".to_string()),
+            error: Some(crate::rpc::CommandError::Other(
+                "Failed to process client request".to_string(),
+            )),
         })
     }
 

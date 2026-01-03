@@ -282,9 +282,9 @@ impl RaftRpcTrait for MaelstromRpcClient {
             success: false,
             leader_hint: None,
             data: None,
-            error: Some(
+            error: Some(ikada::rpc::CommandError::Other(
                 "Not implemented for inter-node communication".to_string(),
-            ),
+            )),
         })
     }
 

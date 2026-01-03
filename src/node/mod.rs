@@ -338,7 +338,9 @@ where
                                 success: false,
                                 leader_hint,
                                 data: None,
-                                error: Some("Not the leader".to_string()),
+                                error: Some(
+                                    crate::rpc::CommandError::NotLeader,
+                                ),
                             });
                         }
                     });
@@ -380,7 +382,9 @@ where
                                 success: false,
                                 leader_hint,
                                 data: None,
-                                error: Some("Not the leader".to_string()),
+                                error: Some(
+                                    crate::rpc::CommandError::NotLeader,
+                                ),
                             });
                         }
                     });
