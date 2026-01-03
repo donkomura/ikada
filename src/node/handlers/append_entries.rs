@@ -331,6 +331,10 @@ mod tests {
             self.applied_commands.lock().await.push(command.clone());
             Ok(())
         }
+
+        async fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
     }
 
     impl RecordingStateMachine {

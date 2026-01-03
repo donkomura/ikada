@@ -273,6 +273,7 @@ impl MaelstromRaftNode {
             heartbeat_failure_retry_limit: 5,
             batch_window: tokio::time::Duration::from_millis(10),
             max_batch_size: 100,
+            snapshot_threshold: 10000,
         };
 
         let node = Node::new_with_state(config, state, network_factory.clone());

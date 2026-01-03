@@ -195,75 +195,44 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         self.role = Role::Leader(leader_state);
         self.leader_id = Some(self.id);
     }
+
+    pub async fn create_snapshot(&mut self) -> anyhow::Result<()> {
+        use crate::snapshot::SnapshotMetadata;
+
+        if self.last_applied == 0 {
+            return Ok(());
+        }
+
+        let last_included_index = self.last_applied;
+        let last_included_term = self
+            .persistent
+            .log
+            .get((last_included_index - 1) as usize)
+            .map(|e| e.term)
+            .unwrap_or(0);
+
+        let data = self.state_machine.snapshot().await?;
+
+        let metadata = SnapshotMetadata {
+            last_included_index,
+            last_included_term,
+        };
+
+        self.storage.save_snapshot(&metadata, &data).await?;
+
+        self.persistent.log.drain(0..(last_included_index as usize));
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::statemachine::StateMachine;
+    use crate::statemachine::{
+        KVCommand, KVResponse, KVStateMachine, NoOpStateMachine,
+    };
     use crate::storage::MemStorage;
-    use std::collections::HashMap;
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    enum KVCommand {
-        Get { key: String },
-        Put { key: String, value: i32 },
-        Cas { key: String, from: i32, to: i32 },
-    }
-
-    impl Default for KVCommand {
-        fn default() -> Self {
-            KVCommand::Get { key: String::new() }
-        }
-    }
-
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    enum KVResponse {
-        Value(Option<i32>),
-        Ok,
-        Error(String),
-    }
-
-    #[derive(Debug, Clone, Default)]
-    struct KVStateMachine {
-        store: HashMap<String, i32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StateMachine for KVStateMachine {
-        type Command = KVCommand;
-        type Response = KVResponse;
-
-        async fn apply(
-            &mut self,
-            command: &Self::Command,
-        ) -> anyhow::Result<Self::Response> {
-            match command {
-                KVCommand::Get { key } => {
-                    Ok(KVResponse::Value(self.store.get(key).copied()))
-                }
-                KVCommand::Put { key, value } => {
-                    self.store.insert(key.clone(), *value);
-                    Ok(KVResponse::Ok)
-                }
-                KVCommand::Cas { key, from, to } => {
-                    if let Some(current) = self.store.get(key) {
-                        if current == from {
-                            self.store.insert(key.clone(), *to);
-                            Ok(KVResponse::Ok)
-                        } else {
-                            Ok(KVResponse::Error(format!(
-                                "Expected {} but found {}",
-                                from, current
-                            )))
-                        }
-                    } else {
-                        Ok(KVResponse::Error("Key does not exist".to_string()))
-                    }
-                }
-            }
-        }
-    }
 
     /// Test that followers reject read requests (linearizability protection)
     ///
@@ -288,7 +257,7 @@ mod tests {
         let follower_state = Arc::new(Mutex::new(RaftState::new(
             10002,
             Box::new(MemStorage::default()),
-            KVStateMachine::default(),
+            NoOpStateMachine::default(),
         )));
         {
             let mut state = follower_state.lock().await;
@@ -313,9 +282,7 @@ mod tests {
         });
 
         let get_command = CommandRequest {
-            command: bincode::serialize(&KVCommand::Get {
-                key: "test_key".to_string(),
-            })?,
+            command: vec![1, 2, 3],
         };
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -380,9 +347,9 @@ mod tests {
                 Role::Leader(LeaderState::new(&[], state.get_last_log_idx()));
             state.persistent.log.push(Entry {
                 term: 1,
-                command: KVCommand::Put {
+                command: KVCommand::Set {
                     key: "test_key".to_string(),
-                    value: 2,
+                    value: "value2".to_string(),
                 },
             });
             state.commit_index = 1;
@@ -493,9 +460,9 @@ mod tests {
         // Leader commits and applies value 1
         leader_state.persistent.log.push(Entry {
             term: 1,
-            command: KVCommand::Put {
+            command: KVCommand::Set {
                 key: "test_key".to_string(),
-                value: 1,
+                value: "value1".to_string(),
             },
         });
         leader_state.commit_index = 1;
@@ -514,10 +481,121 @@ mod tests {
 
         // Should return the latest committed value
         assert!(
-            matches!(read_result, KVResponse::Value(Some(1))),
-            "Leader should return latest committed value 1, got {:?}",
+            matches!(read_result, KVResponse::Value(Some(ref v)) if v == "value1"),
+            "Leader should return latest committed value 'value1', got {:?}",
             read_result
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_snapshot() -> anyhow::Result<()> {
+        let mut state = RaftState::new(
+            1,
+            Box::new(MemStorage::default()),
+            KVStateMachine::default(),
+        );
+
+        state.persistent.log.push(Entry {
+            term: 1,
+            command: KVCommand::Set {
+                key: "key1".to_string(),
+                value: "value1".to_string(),
+            },
+        });
+        state.persistent.log.push(Entry {
+            term: 1,
+            command: KVCommand::Set {
+                key: "key2".to_string(),
+                value: "value2".to_string(),
+            },
+        });
+        state.persistent.log.push(Entry {
+            term: 2,
+            command: KVCommand::Set {
+                key: "key3".to_string(),
+                value: "value3".to_string(),
+            },
+        });
+
+        state.commit_index = 3;
+        state.apply_committed().await?;
+
+        assert_eq!(state.last_applied, 3);
+        assert_eq!(state.persistent.log.len(), 3);
+
+        state.create_snapshot().await?;
+
+        assert_eq!(state.persistent.log.len(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_snapshot_with_no_applied_entries() -> anyhow::Result<()>
+    {
+        let mut state = RaftState::new(
+            1,
+            Box::new(MemStorage::default()),
+            KVStateMachine::default(),
+        );
+
+        state.persistent.log.push(Entry {
+            term: 1,
+            command: KVCommand::Set {
+                key: "key1".to_string(),
+                value: "value1".to_string(),
+            },
+        });
+
+        state.create_snapshot().await?;
+
+        assert_eq!(state.persistent.log.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_snapshot_preserves_unapplied_entries()
+    -> anyhow::Result<()> {
+        let mut state = RaftState::new(
+            1,
+            Box::new(MemStorage::default()),
+            KVStateMachine::default(),
+        );
+
+        for i in 1..=5 {
+            state.persistent.log.push(Entry {
+                term: 1,
+                command: KVCommand::Set {
+                    key: format!("key{}", i),
+                    value: format!("value{}", i),
+                },
+            });
+        }
+
+        state.commit_index = 3;
+        state.apply_committed().await?;
+
+        assert_eq!(state.last_applied, 3);
+        assert_eq!(state.persistent.log.len(), 5);
+
+        state.create_snapshot().await?;
+
+        assert_eq!(state.persistent.log.len(), 2);
+
+        assert_eq!(state.persistent.log[0].term, 1);
+        assert!(matches!(
+            state.persistent.log[0].command,
+            KVCommand::Set { ref key, ref value } if key == "key4" && value == "value4"
+        ));
+
+        assert_eq!(state.persistent.log[1].term, 1);
+        assert!(matches!(
+            state.persistent.log[1].command,
+            KVCommand::Set { ref key, ref value } if key == "key5" && value == "value5"
+        ));
 
         Ok(())
     }
