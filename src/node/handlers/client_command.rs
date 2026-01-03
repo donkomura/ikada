@@ -224,6 +224,7 @@ where
     wait_for_command_result::<SM>(result_rx, timeout).await
 }
 
+#[tracing::instrument(skip(state, request_tracker, req), fields(timeout_ms = timeout.as_millis()))]
 pub async fn handle_client_request_impl<T, SM>(
     req: &CommandRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,

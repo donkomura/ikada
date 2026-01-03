@@ -31,6 +31,7 @@ where
     ///
     /// Raft Algorithm - Leader Election Step 2:
     /// Step 2: Candidate sends RequestVote RPC to all other nodes in parallel
+    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn start_election(&mut self) -> anyhow::Result<()>
     where
         T: Default,
@@ -98,12 +99,10 @@ where
                 last_log_index,
                 last_log_term,
             };
-            tasks.spawn(Self::send_request_vote(
-                addr,
-                client,
-                req,
-                rpc_timeout,
-            ));
+            tasks.spawn(
+                Self::send_request_vote(addr, client, req, rpc_timeout)
+                    .instrument(tracing::Span::current()),
+            );
         }
 
         while let Some(result) = tasks.join_next().await {
@@ -132,6 +131,7 @@ where
     /// Raft Algorithm - Leader Election Steps 3-4:
     /// Step 3: Each node evaluates the RequestVote and grants vote based on log up-to-dateness
     /// Step 4: Candidate becomes leader if it receives votes from a majority of nodes
+    #[tracing::instrument(skip(self, responses), fields(node_id = self.state.try_lock().ok().map(|s| s.id), response_count = responses.len()))]
     async fn handle_election(
         &mut self,
         responses: Vec<RequestVoteResponse>,
@@ -211,6 +211,7 @@ where
     }
 
     /// Sends RequestVote RPC to a single peer.
+    #[tracing::instrument(skip(client, req), fields(peer = ?peer_addr, candidate_id = req.candidate_id, term = req.term))]
     async fn send_request_vote(
         peer_addr: SocketAddr,
         client: Arc<dyn RaftRpcTrait>,

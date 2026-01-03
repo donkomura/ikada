@@ -149,6 +149,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     pub fn restore_from(&mut self, persisted: PersistentState<T>) {
         self.persistent = persisted;
     }
+
     pub async fn apply_committed(
         &mut self,
     ) -> anyhow::Result<Vec<SM::Response>> {
@@ -184,6 +185,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         0u32
     }
 
+    #[tracing::instrument(skip(self), fields(node_id = self.id, term = term, leader_id = ?leader_id))]
     pub fn become_follower(&mut self, term: u32, leader_id: Option<u32>) {
         self.persistent.current_term = term;
         self.persistent.voted_for = None;
@@ -191,6 +193,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         self.leader_id = leader_id;
     }
 
+    #[tracing::instrument(skip(self), fields(node_id = self.id, new_term = self.persistent.current_term + 1))]
     pub fn become_candidate(&mut self) {
         self.persistent.current_term += 1;
         self.persistent.voted_for = Some(self.id);
@@ -198,6 +201,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         self.leader_id = None;
     }
 
+    #[tracing::instrument(skip(self, peers), fields(node_id = self.id, peer_count = peers.len()))]
     pub fn become_leader(&mut self, peers: &[SocketAddr]) {
         let last_log_index = self.get_last_log_idx();
         let leader_state = LeaderState::new(peers, last_log_index);

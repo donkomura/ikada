@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use tracing::Instrument;
 
 use ikada::config::Config;
 use ikada::network::TarpcNetworkFactory;
@@ -51,6 +52,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    run().await
+}
+
+#[tracing::instrument(name = "ikada-server")]
+async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     let tracer_provider = init_tracing("ikada-server")?;
 
@@ -125,9 +131,13 @@ async fn main() -> anyhow::Result<()> {
             .into_iter()
             .filter(|&x| x.port() != node_port)
             .collect();
-        tokio::spawn(async move {
-            node.run(node_port, peers).await.unwrap();
-        })
+        let span = tracing::info_span!("node", port = node_port);
+        tokio::spawn(
+            async move {
+                node.run(node_port, peers).await.unwrap();
+            }
+            .instrument(span),
+        )
     };
 
     let mut handles = Vec::new();

@@ -257,6 +257,7 @@ where
     Ok(())
 }
 
+#[tracing::instrument(skip(state, request_tracker), fields(term = req.term, leader_id = req.leader_id, prev_log_index = req.prev_log_index, entries_count = req.entries.len()))]
 pub async fn handle_append_entries<T, SM>(
     req: &AppendEntriesRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,

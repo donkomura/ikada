@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
+use tracing::Instrument;
 
 enum ReplicationResponse {
     AppendEntries(AppendEntriesResponse, u32),
@@ -45,6 +46,7 @@ where
     /// Raft Algorithm - Log Replication Step 3, 6-7:
     /// Step 3: Leader sends AppendEntries RPC to all followers in parallel
     /// Step 6-7: Receives Acks from followers
+    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn broadcast_heartbeat(&mut self) -> anyhow::Result<bool> {
         // Lock once and copy all needed data
         let (leader_term, leader_id, leader_commit, log_data, peer_plan) = {
@@ -254,13 +256,16 @@ where
                     leader_commit,
                 };
 
-                tasks.spawn(Self::send_heartbeat(
-                    addr,
-                    client.clone(),
-                    req,
-                    sent_up_to_index,
-                    rpc_timeout,
-                ));
+                tasks.spawn(
+                    Self::send_heartbeat(
+                        addr,
+                        client.clone(),
+                        req,
+                        sent_up_to_index,
+                        rpc_timeout,
+                    )
+                    .instrument(tracing::Span::current()),
+                );
 
                 // Nothing more to send for this follower in this call.
                 if sent_up_to_index < next_idx {
@@ -403,6 +408,7 @@ where
     ///
     /// Raft Algorithm - Log Replication Step 8 (Part 1):
     /// Step 8 (Part 1): Calculate new commit_index based on majority replication
+    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn update_commit_index(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
 
@@ -443,6 +449,7 @@ where
     ///
     /// Raft Algorithm - Log Replication Step 8 (Part 2):
     /// Step 8 (Part 2): Leader applies committed entries to its own state machine
+    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn apply_committed_entries_on_leader(
         &mut self,
     ) -> anyhow::Result<()> {
