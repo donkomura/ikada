@@ -403,6 +403,14 @@ where
         servers: Vec<SocketAddr>,
     ) -> anyhow::Result<()> {
         let id = self.state.lock().await.id;
+
+        {
+            let mut state = self.state.lock().await;
+            if let Err(e) = state.restore_from_snapshot().await {
+                tracing::warn!(id = id, error = ?e, "Failed to restore from snapshot");
+            }
+        }
+
         for &addr in &servers {
             // Skip self to avoid connecting to own address
             if addr.port() as u32 == id {

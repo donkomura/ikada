@@ -197,6 +197,25 @@ where
 
                     self.update_commit_index().await?;
                     self.apply_committed_entries_on_leader().await?;
+
+                    let should_snapshot = {
+                        let state = self.state.lock().await;
+                        state.persistent.log.len() > self.config.snapshot_threshold
+                    };
+
+                    if should_snapshot {
+                        let mut state = self.state.lock().await;
+                        if let Err(e) = state.create_snapshot().await {
+                            tracing::error!(error = ?e, "Failed to create snapshot");
+                        } else {
+                            tracing::info!(
+                                last_applied = state.last_applied,
+                                remaining_log_entries = state.persistent.log.len(),
+                                "Snapshot created successfully"
+                            );
+                        }
+                    }
+
                     heartbeat_watchdog.reset(heartbeat_timeout).await;
                 }
             }

@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
             heartbeat_failure_retry_limit: 5,
             batch_window: tokio::time::Duration::from_millis(30),
             max_batch_size: 100,
+            snapshot_threshold: 10000,
         }
     };
     let mut node1 = Node::new(
@@ -52,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
             heartbeat_failure_retry_limit: 5,
             batch_window: tokio::time::Duration::from_millis(30),
             max_batch_size: 100,
+            snapshot_threshold: 10000,
         }
     };
     let mut node2 = Node::new(
@@ -73,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
             heartbeat_failure_retry_limit: 5,
             batch_window: tokio::time::Duration::from_millis(30),
             max_batch_size: 100,
+            snapshot_threshold: 10000,
         }
     };
     let mut node3 = Node::new(

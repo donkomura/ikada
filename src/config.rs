@@ -9,6 +9,7 @@ pub struct Config {
     pub heartbeat_failure_retry_limit: u32,
     pub batch_window: tokio::time::Duration,
     pub max_batch_size: usize,
+    pub snapshot_threshold: usize,
 }
 
 impl Default for Config {
@@ -25,6 +26,7 @@ impl Default for Config {
             heartbeat_failure_retry_limit: 1,
             batch_window: tokio::time::Duration::from_millis(30),
             max_batch_size: 100,
+            snapshot_threshold: 10000,
         }
     }
 }

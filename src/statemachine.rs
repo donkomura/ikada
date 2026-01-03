@@ -10,6 +10,9 @@ pub trait StateMachine: Send + Sync {
         &mut self,
         command: &Self::Command,
     ) -> anyhow::Result<Self::Response>;
+
+    async fn snapshot(&self) -> anyhow::Result<Vec<u8>>;
+    async fn restore(&mut self, data: &[u8]) -> anyhow::Result<()>;
 }
 
 // Simple test state machine that just counts applied commands
@@ -29,6 +32,17 @@ impl StateMachine for NoOpStateMachine {
     ) -> anyhow::Result<Self::Response> {
         self.applied_count += 1;
         Ok(self.applied_count)
+    }
+    async fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(self.applied_count.to_le_bytes().to_vec())
+    }
+    async fn restore(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        if data.len() >= std::mem::size_of::<usize>() {
+            let bytes: [u8; std::mem::size_of::<usize>()] =
+                data[0..std::mem::size_of::<usize>()].try_into()?;
+            self.applied_count = usize::from_le_bytes(bytes);
+        }
+        Ok(())
     }
 }
 
@@ -101,5 +115,15 @@ impl StateMachine for KVStateMachine {
                 }
             }
         }
+    }
+
+    async fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
+        let serialized = bincode::serialize(&self.data).unwrap();
+        Ok(serialized)
+    }
+
+    async fn restore(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        self.data = bincode::deserialize(data)?;
+        Ok(())
     }
 }
