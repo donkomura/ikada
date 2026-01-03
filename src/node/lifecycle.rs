@@ -394,11 +394,13 @@ mod tests {
         crate::statemachine::NoOpStateMachine,
         crate::network::mock::MockNetworkFactory,
     > {
+        use crate::storage::MemStorage;
         Node::new(
             10101,
             config,
             create_test_state_machine(),
             crate::network::mock::MockNetworkFactory::new(),
+            Box::new(MemStorage::default()),
         )
     }
 

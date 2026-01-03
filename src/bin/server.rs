@@ -35,13 +35,20 @@ async fn main() -> anyhow::Result<()> {
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
             read_index_timeout: std::time::Duration::from_millis(100),
+            storage_dir: std::path::PathBuf::from("."),
         }
+    };
+    let storage1 = {
+        use ikada::storage::FileStorage;
+        let storage_dir = config1.storage_dir.join(format!("node_{}", port));
+        Box::new(FileStorage::new(storage_dir))
     };
     let mut node1 = Node::new(
         port,
         config1,
         KVStateMachine::default(),
         network_factory.clone(),
+        storage1,
     );
     node1.restore().await?;
 
@@ -60,13 +67,21 @@ async fn main() -> anyhow::Result<()> {
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
             read_index_timeout: std::time::Duration::from_millis(100),
+            storage_dir: std::path::PathBuf::from("."),
         }
+    };
+    let storage2 = {
+        use ikada::storage::FileStorage;
+        let storage_dir =
+            config2.storage_dir.join(format!("node_{}", port + 1));
+        Box::new(FileStorage::new(storage_dir))
     };
     let mut node2 = Node::new(
         port + 1,
         config2,
         KVStateMachine::default(),
         network_factory.clone(),
+        storage2,
     );
     node2.restore().await?;
 
@@ -85,13 +100,21 @@ async fn main() -> anyhow::Result<()> {
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
             read_index_timeout: std::time::Duration::from_millis(100),
+            storage_dir: std::path::PathBuf::from("."),
         }
+    };
+    let storage3 = {
+        use ikada::storage::FileStorage;
+        let storage_dir =
+            config3.storage_dir.join(format!("node_{}", port + 2));
+        Box::new(FileStorage::new(storage_dir))
     };
     let mut node3 = Node::new(
         port + 2,
         config3,
         KVStateMachine::default(),
         network_factory.clone(),
+        storage3,
     );
     node3.restore().await?;
 

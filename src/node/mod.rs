@@ -109,9 +109,13 @@ where
 {
     /// Creates a new Raft node.
     /// Port is used as node ID for simplicity in testing/demo scenarios.
-    pub fn new(port: u16, config: Config, sm: SM, network_factory: NF) -> Self {
-        use crate::storage::MemStorage;
-        let storage = Box::new(MemStorage::default());
+    pub fn new(
+        port: u16,
+        config: Config,
+        sm: SM,
+        network_factory: NF,
+        storage: Box<dyn crate::storage::Storage<T>>,
+    ) -> Self {
         let id = port as u32;
 
         let (apply_tx, mut apply_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -5,13 +5,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Entry<T: Send + Sync> {
     pub term: u32,
     pub command: T,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PersistentState<T: Send + Sync> {
     pub current_term: u32,
     pub voted_for: Option<u32>,
