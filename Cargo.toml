@@ -31,5 +31,9 @@ name = "maelstrom-ikada"
 path = "integ/main.rs"
 
 [[bin]]
+name = "ikada-server"
+path = "src/bin/server.rs"
+
+[[bin]]
 name = "ikada-repl"
 path = "src/bin/cli.rs"

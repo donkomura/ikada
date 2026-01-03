@@ -1,119 +1,105 @@
 # Ikada
 
-A Raft consensus algorithm implementation written in Rust for replication.
+A Raft consensus algorithm implementation written in Rust for distributed systems.
+
+**Ikada** (いかだ) is the Japanese word for "raft" - a simple floating platform that carries its load reliably across water, just as this library carries your data reliably across distributed nodes.
 
 ## Description
 
-Ikada provides an implementation of the distributed consensus algorithm based on the [Raft paper](https://raft.github.io/).
-It implements the core features of Raft including leader election, log replication, and safety guarantees.
+Ikada is a implementation of the Raft consensus algorithm based on the [Raft paper](https://raft.github.io/).
+This is a personal project aimed at deeply understanding the Raft consensus algorithm and experiencing the complexity and trade-offs involved in its optimization.
 
-### Key Features
+## Features
 
-- **Leader Election**: Automatic election process among three roles: Follower, Candidate, and Leader
-- **Log Replication**: Reliable replication of log entries from leader to followers
-- **State Machine**: Pluggable state machine interface with Key-Value store implementation included
-- **Persistence**: State persistence through storage abstraction layer
-- **Distributed Tracing**: Detailed operational logs with OpenTelemetry integration
-- **Client Library**: Client implementation with automatic leader redirection
+### Key Libraries & Architecture
+
+Ikada is built with a focus on learning and experimentation. The architecture emphasizes abstraction layers for state machines, storage, and networking, allowing easy customization and testing of different implementations.
+
+For RPC communication, we use [tarpc](https://github.com/google/tarpc), which provides a simple framework for defining RPC schemas concisely, making it ideal for educational purposes and rapid prototyping. The generic abstractions for state machines and storage enable users to plug in their own implementations without modifying the core Raft logic.
+
+To support deep understanding of the consensus algorithm, we integrate [OpenTelemetry SDK](https://opentelemetry.io/) for comprehensive logging and distributed tracing. This allows developers to visualize the flow of messages and state transitions across the cluster, making the complex interactions in Raft easier to comprehend.
+
+For correctness verification, we employ [Maelstrom](https://github.com/jepsen-io/maelstrom), a distributed systems testing tool from Jepsen. Maelstrom tests run in CI to continuously verify linearizability under network partition scenarios, ensuring the implementation maintains safety guarantees.
+
+### Implemented Features
+
+- ✅ **Leader Election**: Randomized timeout-based election with support for Follower, Candidate, and Leader roles (Raft §5.2)
+- ✅ **Log Replication**: Reliable append-entries mechanism with consistency checks (Raft §5.3)
+- ✅ **Safety Guarantees**: Election safety, leader append-only, log matching, leader completeness, and state machine safety (Raft §5.4)
+- ✅ **Batching & Pipelining**: Request batching and per-follower inflight window for optimized log replication throughput
+- ✅ **Conflict Detection**: Automatic detection and truncation of divergent log entries
+- ✅ **State Persistence**: Durable storage of Raft state (term, voted_for) and log entries
+- ✅ **Snapshot**: Log compaction with snapshot creation, installation, and automatic transmission via InstallSnapshot RPC (Raft §7)
+- ✅ **ReadIndex**: Linearizable reads without committing log entries, ensuring read operations reflect the latest committed state
+- ✅ **Leader Stepping Down**: Leaders can voluntarily step down when they detect they are no longer the legitimate leader
+- ✅ **Linearizability Testing**: Verified with [Maelstrom](https://github.com/jepsen-io/maelstrom) under network partitions and various failure scenarios
+- ⏳ **Dynamic Membership**: Runtime cluster configuration changes (Raft §6) - Planned
 
 ## Installation
 
+Clone the repository and build from source:
+
+```bash
+$ git clone https://github.com/donkomura/ikada.git
+$ cd ikada
+$ cargo build --release
+```
+
 ## Usage
 
-### Starting the Server
+### Quick Start with KVS example
+
+Ikada provides CLI tools for quickly setting up and testing a Raft cluster.
+
+#### Start a Cluster
+
+Start a 3-node cluster with a single command:
 
 ```bash
-cargo run --bin server
+$ ikada-server
+Raft cluster started with 3 nodes:
+  - Node 1: localhost:1111
+  - Node 2: localhost:1112
+  - Node 3: localhost:1113
 ```
 
-### Executing Commands from Client
+Available options:
+- `--port`: Starting port number (default: 1111)
+- `--node-count` or `-n`: Number of nodes to start (default: 3)
+- `--storage-dir`: Base directory for persistent storage (default: current directory)
 
-You can use the included client binary to send commands:
+#### Run a REPL
 
 ```bash
-cargo run --bin client
+$ ikada-repl
+Connected to cluster. Type 'help' for commands.
+> set key1 1
+OK
+> get key1
+1
+> cas key1 1 2
+OK
+> get key1
+2
+> delete key1
+2
+> get key1
+(nil)
 ```
-
-Or use the client library from your Rust code:
-
-```rust
-use ikada::client::RaftClient;
-use ikada::statemachine::KVCommand;
-use std::net::SocketAddr;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Connect to any node
-    let addr: SocketAddr = "127.0.0.1:1111".parse()?;
-    let mut client = RaftClient::connect(addr).await?;
-
-    // Create a command
-    let command = KVCommand::Set {
-        key: "name".to_string(),
-        value: "Alice".to_string(),
-    };
-
-    // Serialize and execute (automatically redirects to leader if not the leader)
-    let serialized = bincode::serialize(&command)?;
-    let result = client.execute(serialized).await?;
-
-    println!("Result: {:?}", result);
-    Ok(())
-}
-```
-
-### Implementing Custom State Machine
-
-You can implement your own state machine:
-
-```rust
-use ikada::statemachine::StateMachine;
-
-#[derive(Debug, Default)]
-struct MyStateMachine {
-    // Your state machine state
-}
-
-#[async_trait::async_trait]
-impl StateMachine for MyStateMachine {
-    type Command = Vec<u8>;
-    type Response = Vec<u8>;
-
-    async fn apply(
-        &mut self,
-        command: &Self::Command,
-    ) -> anyhow::Result<Self::Response> {
-        // Command application logic
-        Ok(vec![])
-    }
-}
-```
-
-### Enabling Tracing
-
-Set log level via environment variable:
-
-```bash
-RUST_LOG=info cargo run --bin server
-```
-
-To send traces to an OpenTelemetry collector, start the collector before running the application.
 
 ## Project Status
 
-This project is currently under active development. The following features are implemented:
+Ikada is currently under active development. Core Raft functionality is implemented and tested, but production readiness requires additional features.
 
-- [x] Leader Election (Raft §5.2)
-- [x] Log Replication (Raft §5.3)
-- [x] Safety Guarantees (Raft §5.4)
-- [x] Client Interaction
-- [x] State Persistence
-
-Planned features:
-
-- [ ] Cluster Membership Changes (Raft §6)
-- [ ] Log Compaction and Snapshots (Raft §7)
-- [ ] Performance Measurement and Optimizations
+**Roadmap**:
+- [ ] Dynamic Membership Changes (Raft §6)
+- [ ] MultiRaft Support (running multiple Raft groups in a single process)
+- [ ] Performance Optimizations
+  - [ ] PreVote (prevents unnecessary elections during network partitions)
+  - [ ] Further ReadIndex optimizations
+- [ ] Benchmarking Suite
+- [ ] Automatic Snapshot Triggers (configurable thresholds)
+- [ ] Monitoring and Metrics Dashboard
 
 ## License
 
