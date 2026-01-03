@@ -29,6 +29,18 @@ impl Default for Config {
         let max_ms = (base_ms as f64 * 3.0) as u64;
         let timeout_ms = rand::rng().random_range(min_ms..=max_ms);
 
+        let storage_dir = if cfg!(test) {
+            std::env::temp_dir().join(format!(
+                "ikada_test_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+        } else {
+            PathBuf::from(".")
+        };
+
         Self {
             heartbeat_interval: tokio::time::Duration::from_millis(1000),
             election_timeout: tokio::time::Duration::from_millis(timeout_ms),
@@ -40,7 +52,7 @@ impl Default for Config {
             replication_max_entries_per_rpc: 128,
             snapshot_threshold: 10000,
             read_index_timeout: Duration::from_millis(2000),
-            storage_dir: PathBuf::from("."),
+            storage_dir,
         }
     }
 }
