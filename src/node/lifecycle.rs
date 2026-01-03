@@ -244,23 +244,131 @@ where
         let batch_size = requests.len();
         tracing::debug!("Flushing batch of {} requests", batch_size);
 
-        let rpc_timeout = self.config.rpc_timeout;
+        // Leader-side batching pipeline:
+        // 1) append all valid commands contiguously (single persist)
+        // 2) kick replication immediately
+        // 3) kick commit/apply to unblock client responses quickly
+        // 4) wait for each index to reach majority + applied result (in background)
         let peer_count = self.peers.len();
+        let timeout =
+            self.config.rpc_timeout + std::time::Duration::from_millis(100);
 
-        for (req, resp_tx) in requests.drain(..) {
+        // Append to log in one lock/persist, and register RequestTracker entries.
+        let mut appended: Vec<(
+            u32,
+            tokio::sync::oneshot::Receiver<SM::Response>,
+            tokio::sync::oneshot::Sender<crate::rpc::CommandResponse>,
+        )> = Vec::new();
+
+        let mut immediate_responses: Vec<(
+            tokio::sync::oneshot::Sender<crate::rpc::CommandResponse>,
+            crate::rpc::CommandResponse,
+        )> = Vec::new();
+
+        {
+            let mut state_guard = self.state.lock().await;
+
+            if !state_guard.role.is_leader() {
+                let leader_hint = state_guard.leader_id;
+                for (_req, resp_tx) in requests.drain(..) {
+                    immediate_responses.push((
+                        resp_tx,
+                        crate::rpc::CommandResponse {
+                            success: false,
+                            leader_hint,
+                            data: None,
+                            error: Some("Not the leader".to_string()),
+                        },
+                    ));
+                }
+                return Ok(());
+            }
+
+            if state_guard.commit_index > state_guard.last_applied {
+                // Reduce backlog so newly committed entries can be applied quickly.
+                if let Err(e) = state_guard.apply_committed().await {
+                    tracing::warn!(error=?e, "Failed to apply committed entries before batching");
+                }
+            }
+
+            let term = state_guard.persistent.current_term;
+            let mut appended_count = 0usize;
+
+            // Build a temporary list of (log_index, resp_tx) for commands we accepted,
+            // and respond immediately for invalid requests.
+            let mut accepted: Vec<(
+                u32,
+                tokio::sync::oneshot::Sender<crate::rpc::CommandResponse>,
+            )> = Vec::new();
+
+            for (req, resp_tx) in requests.drain(..) {
+                let command: T = match bincode::deserialize(&req.command) {
+                    Ok(cmd) => cmd,
+                    Err(e) => {
+                        immediate_responses.push((
+                            resp_tx,
+                            crate::rpc::CommandResponse {
+                                success: false,
+                                leader_hint: None,
+                                data: None,
+                                error: Some(format!(
+                                    "Failed to deserialize command: {}",
+                                    e
+                                )),
+                            },
+                        ));
+                        continue;
+                    }
+                };
+
+                let log_index = state_guard.persistent.log.len() as u32 + 1;
+                state_guard
+                    .persistent
+                    .log
+                    .push(crate::raft::Entry { term, command });
+                accepted.push((log_index, resp_tx));
+                appended_count += 1;
+            }
+
+            if appended_count > 0 {
+                state_guard.persist().await?;
+            }
+
+            drop(state_guard);
+
+            // Register tracker entries after persist. This ensures the log index is durable
+            // before we expose it to the apply/response pipeline.
+            for (log_index, resp_tx) in accepted {
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                self.request_tracker.lock().await.track_write(
+                    log_index,
+                    result_tx,
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(30),
+                );
+                appended.push((log_index, result_rx, resp_tx));
+            }
+        }
+
+        for (resp_tx, resp) in immediate_responses {
+            let _ = resp_tx.send(resp);
+        }
+
+        // If we appended anything, push replication immediately to reduce latency.
+        if !appended.is_empty() {
+            let _ = self.broadcast_heartbeat().await?;
+            self.update_commit_index().await?;
+            self.apply_committed_entries_on_leader().await?;
+        }
+
+        // Respond to each client independently without blocking the leader loop.
+        for (log_index, result_rx, resp_tx) in appended {
             let state = self.state.clone();
-            let request_tracker = self.request_tracker.clone();
-
             tokio::spawn(async move {
-                let resp = handlers::handle_client_request_impl(
-                    &req,
-                    state,
-                    rpc_timeout + std::time::Duration::from_millis(100),
-                    peer_count,
-                    request_tracker,
+                let resp = handlers::wait_for_write_result::<T, SM>(
+                    state, log_index, peer_count, timeout, result_rx,
                 )
                 .await;
-
                 let _ = resp_tx.send(resp);
             });
         }

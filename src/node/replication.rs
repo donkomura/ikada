@@ -10,7 +10,7 @@ use crate::network::NetworkFactory;
 use crate::raft::{self};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,174 +34,258 @@ where
     NF: NetworkFactory + Clone + 'static,
 {
     /// Broadcasts AppendEntries RPCs to all followers.
-    /// Uses JoinSet to process completed tasks as they arrive and returns immediately
-    /// once majority is achieved, without waiting for all tasks to complete.
-    /// Individual RPCs timeout via tarpc deadline, overall broadcast times out via tokio::time::timeout.
+    ///
+    /// This function also performs *per-follower pipelining*:
+    /// if a follower is behind and has available inflight window capacity,
+    /// it may receive multiple AppendEntries RPCs in a single call.
+    ///
+    /// We intentionally wait for all spawned RPC tasks to complete to avoid
+    /// leaving inflight state stuck due to cancelled tasks.
     ///
     /// Raft Algorithm - Log Replication Step 3, 6-7:
     /// Step 3: Leader sends AppendEntries RPC to all followers in parallel
-    /// Step 6-7: Receives Acks from followers, stops as soon as majority is achieved
+    /// Step 6-7: Receives Acks from followers
     pub(super) async fn broadcast_heartbeat(&mut self) -> anyhow::Result<bool> {
         // Lock once and copy all needed data
-        let (leader_term, leader_id, leader_commit, log_data, peer_data) = {
+        let (leader_term, leader_id, leader_commit, log_data, peer_plan) = {
             let state = self.state.lock().await;
 
             // Copy log and peer state data
             let log_entries = state.persistent.log.clone();
-            let next_indices: Vec<_> =
-                if let Some(leader_state) = state.role.leader_state() {
-                    self.peers
+            let plan: Vec<(SocketAddr, u32, usize)> = if let Some(
+                leader_state,
+            ) =
+                state.role.leader_state()
+            {
+                self.peers
                         .keys()
                         .filter_map(|addr| {
-                            let inflight = leader_state
-                                .inflight_index
+                            let snapshot_inflight = leader_state
+                                .inflight_snapshot
                                 .get(addr)
                                 .copied()
-                                .flatten();
-
-                            if inflight.is_some() {
+                                .unwrap_or(false);
+                            if snapshot_inflight {
                                 tracing::debug!(
                                     peer = ?addr,
-                                    inflight_index = inflight,
-                                    "Skipping peer with inflight AppendEntries"
+                                    "Skipping peer with inflight InstallSnapshot"
                                 );
-                                None
+                                return None;
+                            }
+
+                            let inflight_len = leader_state
+                                .inflight_append
+                                .get(addr)
+                                .map(|q| q.len())
+                                .unwrap_or(0);
+                            let max_inflight =
+                                self.config.replication_max_inflight;
+                            if inflight_len >= max_inflight {
+                                tracing::debug!(
+                                    peer = ?addr,
+                                    inflight_len = inflight_len,
+                                    limit = max_inflight,
+                                    "Skipping peer: AppendEntries inflight window is full"
+                                );
+                                return None;
+                            }
+
+                            let base_next_idx = if inflight_len > 0 {
+                                leader_state
+                                    .inflight_append
+                                    .get(addr)
+                                    .and_then(|q| q.back().copied())
+                                    .unwrap_or_else(|| {
+                                        leader_state
+                                            .next_index
+                                            .get(addr)
+                                            .copied()
+                                            .unwrap_or(1)
+                                    })
+                                    .saturating_add(1)
                             } else {
-                                let next_idx = leader_state
+                                leader_state
                                     .next_index
                                     .get(addr)
                                     .copied()
-                                    .unwrap_or(1);
-                                Some((*addr, next_idx))
-                            }
+                                    .unwrap_or(1)
+                            };
+
+                            let slots = max_inflight.saturating_sub(inflight_len);
+                            Some((*addr, base_next_idx, slots))
                         })
                         .collect()
-                } else {
-                    vec![]
-                };
+            } else {
+                vec![]
+            };
 
             (
                 state.persistent.current_term,
                 state.leader_id.unwrap(),
                 state.commit_index,
                 log_entries,
-                next_indices,
+                plan,
             )
         };
 
-        let peer_count = peer_data.len();
-        let total_nodes = peer_count + 1; // peers + self
-        let majority_needed = total_nodes / 2; // Need > majority
+        let total_nodes = self.peers.len() + 1;
+        let majority = total_nodes / 2;
 
         let rpc_timeout = self.config.rpc_timeout;
         let mut tasks = JoinSet::new();
 
-        // Step 3: Spawn AppendEntries or InstallSnapshot RPC tasks for all followers
-        for (addr, next_idx) in peer_data {
+        // Step 3: Spawn AppendEntries/InstallSnapshot tasks, filling the inflight window per follower.
+        for (addr, mut next_idx, slots) in peer_plan {
             let client = self.peers.get(&addr).unwrap().clone();
 
-            if next_idx > 1 && (next_idx - 2) as usize >= log_data.len() {
-                tracing::debug!(
-                    peer = ?addr,
-                    next_idx = next_idx,
-                    log_len = log_data.len(),
-                    "next_idx points to compacted log, sending snapshot"
-                );
+            for _ in 0..slots {
+                if next_idx > 1 && (next_idx - 2) as usize >= log_data.len() {
+                    tracing::debug!(
+                        peer = ?addr,
+                        next_idx = next_idx,
+                        log_len = log_data.len(),
+                        "next_idx points to compacted log, sending snapshot"
+                    );
 
-                let state = self.state.lock().await;
-                let snapshot_result = state.get_snapshot().await;
-                drop(state);
+                    let state = self.state.lock().await;
+                    let snapshot_result = state.get_snapshot().await;
+                    drop(state);
 
-                match snapshot_result {
-                    Ok(Some((metadata, data))) => {
-                        let req = crate::rpc::InstallSnapshotRequest {
-                            term: leader_term,
-                            leader_id,
-                            last_included_index: metadata.last_included_index,
-                            last_included_term: metadata.last_included_term,
-                            data,
-                        };
+                    match snapshot_result {
+                        Ok(Some((metadata, data))) => {
+                            let req = crate::rpc::InstallSnapshotRequest {
+                                term: leader_term,
+                                leader_id,
+                                last_included_index: metadata
+                                    .last_included_index,
+                                last_included_term: metadata.last_included_term,
+                                data,
+                            };
 
-                        tasks.spawn(Self::send_install_snapshot(
-                            addr,
-                            client,
-                            req,
-                            rpc_timeout,
-                        ));
+                            {
+                                let mut state = self.state.lock().await;
+                                if let Some(leader_state) =
+                                    state.role.leader_state_mut()
+                                {
+                                    leader_state
+                                        .inflight_snapshot
+                                        .insert(addr, true);
+                                    tracing::debug!(
+                                        peer = ?addr,
+                                        last_included_index = metadata.last_included_index,
+                                        "Marked InstallSnapshot as inflight"
+                                    );
+                                }
+                            }
+
+                            tasks.spawn(Self::send_install_snapshot(
+                                addr,
+                                client,
+                                req,
+                                rpc_timeout,
+                            ));
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                peer = ?addr,
+                                "No snapshot available to send"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                peer = ?addr,
+                                error = ?e,
+                                "Failed to load snapshot"
+                            );
+                        }
                     }
-                    Ok(None) => {
-                        tracing::warn!(
+
+                    // Snapshot transfer is exclusive; do not pipeline AppendEntries concurrently.
+                    break;
+                }
+
+                let (prev_log_idx, prev_log_term) = if next_idx > 1 {
+                    (next_idx - 1, log_data[(next_idx - 2) as usize].term)
+                } else {
+                    (0, 0)
+                };
+
+                let max_entries = self.config.replication_max_entries_per_rpc;
+                let entries: Vec<LogEntry> = log_data
+                    .iter()
+                    .skip((next_idx - 1) as usize)
+                    .take(max_entries)
+                    .map(|e| {
+                        let command =
+                            bincode::serialize(&e.command).unwrap_or_default();
+                        LogEntry {
+                            term: e.term,
+                            command,
+                        }
+                    })
+                    .collect();
+
+                let sent_up_to_index = prev_log_idx + entries.len() as u32;
+
+                if !entries.is_empty() {
+                    let mut state = self.state.lock().await;
+                    if let Some(leader_state) = state.role.leader_state_mut() {
+                        leader_state
+                            .inflight_append
+                            .entry(addr)
+                            .or_default()
+                            .push_back(sent_up_to_index);
+                        let len = leader_state
+                            .inflight_append
+                            .get(&addr)
+                            .map(|q| q.len())
+                            .unwrap_or(0);
+                        tracing::debug!(
                             peer = ?addr,
-                            "No snapshot available to send"
+                            sent_up_to_index = sent_up_to_index,
+                            inflight_len = len,
+                            "Enqueued AppendEntries into inflight window"
                         );
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            peer = ?addr,
-                            error = ?e,
-                            "Failed to load snapshot"
-                        );
-                        continue;
                     }
                 }
-                continue;
-            }
 
-            let (prev_log_idx, prev_log_term) = if next_idx > 1 {
-                (next_idx - 1, log_data[(next_idx - 2) as usize].term)
-            } else {
-                (0, 0)
-            };
-            let entries: Vec<LogEntry> = log_data
-                .iter()
-                .skip((next_idx - 1) as usize)
-                .map(|e| {
-                    let command =
-                        bincode::serialize(&e.command).unwrap_or_default();
-                    LogEntry {
-                        term: e.term,
-                        command,
-                    }
-                })
-                .collect();
-            let sent_up_to_index = prev_log_idx + entries.len() as u32;
+                let req = AppendEntriesRequest {
+                    term: leader_term,
+                    leader_id,
+                    prev_log_index: prev_log_idx,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                };
 
-            {
-                let mut state = self.state.lock().await;
-                if let Some(leader_state) = state.role.leader_state_mut() {
-                    leader_state
-                        .inflight_index
-                        .insert(addr, Some(sent_up_to_index));
+                tasks.spawn(Self::send_heartbeat(
+                    addr,
+                    client.clone(),
+                    req,
+                    sent_up_to_index,
+                    rpc_timeout,
+                ));
+
+                // Nothing more to send for this follower in this call.
+                if sent_up_to_index < next_idx {
+                    break;
+                }
+                next_idx = sent_up_to_index.saturating_add(1);
+                if sent_up_to_index == prev_log_idx {
+                    // Heartbeat (no entries); don't spam more in this call.
+                    break;
                 }
             }
-
-            let req = AppendEntriesRequest {
-                term: leader_term,
-                leader_id,
-                prev_log_index: prev_log_idx,
-                prev_log_term,
-                entries,
-                leader_commit,
-            };
-
-            tasks.spawn(Self::send_heartbeat(
-                addr,
-                client,
-                req,
-                sent_up_to_index,
-                rpc_timeout,
-            ));
         }
 
-        // Step 6-7: Process Acks as they arrive, stop when majority is achieved
-        let mut success_count = 0; // Leader already counts as 1 in match_index logic
-        let mut failure_count = 0;
+        // Step 6-7: Process responses as they arrive.
+        // For liveness, we count unique peers we could contact at least once.
+        let mut contacted: HashSet<SocketAddr> = HashSet::new();
 
-        // Waiting Point 1: Collect responses for the current heartbeat round.
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok(Ok((server, response))) => {
+                    contacted.insert(server);
                     match response {
                         ReplicationResponse::AppendEntries(
                             res,
@@ -236,57 +320,19 @@ where
                         tracing::info!(
                             "Stepped down from leader, aborting broadcast"
                         );
-                        break;
-                    }
-
-                    success_count += 1;
-
-                    if success_count > majority_needed {
-                        tracing::debug!(
-                            success_count = success_count,
-                            majority_needed = majority_needed,
-                            "Achieved majority of Acks, proceeding immediately"
-                        );
-                        break;
+                        return Ok(false);
                     }
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Failed to send replication RPC: {:?}", e);
-                    failure_count += 1;
                 }
                 Err(e) => {
                     tracing::warn!("Task join error: {:?}", e);
-                    failure_count += 1;
                 }
             }
-
-            let remaining = tasks.len();
-            if success_count + remaining <= majority_needed {
-                tracing::warn!(
-                    success_count = success_count,
-                    remaining = remaining,
-                    majority_needed = majority_needed,
-                    "Cannot achieve majority, aborting"
-                );
-                break;
-            }
         }
 
-        // Abort remaining tasks if we already have majority or can't reach it
-        tasks.abort_all();
-
-        let has_majority = success_count > majority_needed;
-
-        if !has_majority {
-            tracing::warn!(
-                success_count = success_count,
-                failure_count = failure_count,
-                peer_count = peer_count,
-                majority_needed = majority_needed,
-                "Failed to achieve majority of Acks"
-            );
-        }
-
+        let has_majority = (contacted.len() + 1) > majority;
         Ok(has_majority)
     }
 
@@ -455,7 +501,10 @@ where
                 leader_state
                     .next_index
                     .insert(addr, last_included_index + 1);
-                leader_state.inflight_index.insert(addr, None);
+                leader_state.inflight_snapshot.insert(addr, false);
+                if let Some(q) = leader_state.inflight_append.get_mut(&addr) {
+                    q.clear();
+                }
             }
             state.replication_notifier.clone()
         };
@@ -515,12 +564,50 @@ where
         let notifier = {
             let mut state = self.state.lock().await;
             if let Some(leader_state) = state.role.leader_state_mut() {
-                leader_state.inflight_index.insert(addr, None);
-
                 if res.success {
-                    leader_state.match_index.insert(addr, sent_up_to_index);
-                    leader_state.next_index.insert(addr, sent_up_to_index + 1);
+                    let current_match = leader_state
+                        .match_index
+                        .get(&addr)
+                        .copied()
+                        .unwrap_or(0);
+                    let new_match = current_match.max(sent_up_to_index);
+                    leader_state.match_index.insert(addr, new_match);
+                    leader_state.next_index.insert(addr, new_match + 1);
+
+                    if let Some(q) = leader_state.inflight_append.get_mut(&addr)
+                    {
+                        let before = q.len();
+                        while let Some(front) = q.front().copied() {
+                            if front <= new_match {
+                                q.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        let after = q.len();
+                        if before != after {
+                            tracing::debug!(
+                                peer = ?addr,
+                                removed = before - after,
+                                inflight_len = after,
+                                match_index = new_match,
+                                "Consumed inflight AppendEntries on success"
+                            );
+                        }
+                    }
                 } else {
+                    if let Some(q) = leader_state.inflight_append.get_mut(&addr)
+                    {
+                        let cleared = q.len();
+                        q.clear();
+                        if cleared > 0 {
+                            tracing::debug!(
+                                peer = ?addr,
+                                cleared = cleared,
+                                "Cleared inflight window due to rejection"
+                            );
+                        }
+                    }
                     let current_next_idx = leader_state
                         .next_index
                         .get(&addr)

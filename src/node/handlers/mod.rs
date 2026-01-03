@@ -14,6 +14,7 @@ mod vote;
 pub use append_entries::handle_append_entries;
 pub use client_command::{
     handle_client_request_impl, handle_read_index_request,
+    wait_for_write_result,
 };
 pub use install_snapshot::handle_install_snapshot;
 pub use vote::handle_request_vote;

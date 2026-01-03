@@ -1,6 +1,6 @@
 use crate::statemachine::StateMachine;
 use crate::storage::Storage;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -22,7 +22,13 @@ pub struct PersistentState<T: Send + Sync> {
 pub struct LeaderState {
     pub next_index: HashMap<SocketAddr, u32>,
     pub match_index: HashMap<SocketAddr, u32>,
-    pub inflight_index: HashMap<SocketAddr, Option<u32>>,
+    /// AppendEntries in-flight window per peer.
+    /// Each element is the `sent_up_to_index` for a single AppendEntries RPC.
+    /// We allow multiple concurrent RPCs (pipelining) and compact the queue on acks.
+    pub inflight_append: HashMap<SocketAddr, VecDeque<u32>>,
+    /// True while an InstallSnapshot RPC is in-flight for the peer.
+    /// Snapshot transfer is exclusive with AppendEntries pipelining.
+    pub inflight_snapshot: HashMap<SocketAddr, bool>,
     pub noop_index: Option<u32>,
 }
 
@@ -30,18 +36,21 @@ impl LeaderState {
     pub fn new(peers: &[SocketAddr], last_log_index: u32) -> Self {
         let mut next_index = HashMap::new();
         let mut match_index = HashMap::new();
-        let mut inflight_index = HashMap::new();
+        let mut inflight_append = HashMap::new();
+        let mut inflight_snapshot = HashMap::new();
 
         for peer in peers {
             next_index.insert(*peer, last_log_index + 1);
             match_index.insert(*peer, 0);
-            inflight_index.insert(*peer, None);
+            inflight_append.insert(*peer, VecDeque::new());
+            inflight_snapshot.insert(*peer, false);
         }
 
         Self {
             next_index,
             match_index,
-            inflight_index,
+            inflight_append,
+            inflight_snapshot,
             noop_index: None,
         }
     }
