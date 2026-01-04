@@ -132,7 +132,6 @@ where
     ///
     /// Raft Algorithm - Log Replication Flow:
     /// This function coordinates steps 1-11 of the log replication process
-    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
     pub async fn run_leader(&mut self) -> anyhow::Result<()>
     where
         SM::Response: Clone + serde::Serialize,
@@ -170,11 +169,13 @@ where
                     self.flush_request_batch(&mut pending_requests).await?;
                 },
                 _ = heartbeat_watchdog.wait() => {
+                    let span = tracing::info_span!("leader_heartbeat_cycle");
+
                     if !pending_requests.is_empty() {
-                        self.flush_request_batch(&mut pending_requests).await?;
+                        self.flush_request_batch(&mut pending_requests).instrument(span.clone()).await?;
                     }
 
-                    let has_majority = self.broadcast_heartbeat().await?;
+                    let has_majority = self.broadcast_heartbeat().instrument(span.clone()).await?;
 
                     if !has_majority {
                         self.heartbeat_failure_count += 1;
@@ -200,8 +201,8 @@ where
                         self.heartbeat_failure_count = 0;
                     }
 
-                    self.update_commit_index().await?;
-                    self.apply_committed_entries_on_leader().await?;
+                    self.update_commit_index().instrument(span.clone()).await?;
+                    self.apply_committed_entries_on_leader().instrument(span.clone()).await?;
 
                     let should_snapshot = {
                         let state = self.state.lock().await;

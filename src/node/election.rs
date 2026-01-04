@@ -218,25 +218,28 @@ where
         req: RequestVoteRequest,
         rpc_timeout: Duration,
     ) -> anyhow::Result<RequestVoteResponse> {
-        let mut ctx = tarpc::context::current();
+        let mut injector = crate::trace::ContextInjector::new();
+        opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(
+                &tracing_opentelemetry::OpenTelemetrySpanExt::context(
+                    &tracing::Span::current(),
+                ),
+                &mut injector,
+            )
+        });
+
+        let mut ctx = injector.into_context();
         ctx.deadline = Instant::now() + rpc_timeout;
 
-        client
-            .request_vote(ctx, req.clone())
-            .instrument(tracing::info_span!(
-                "request vote from candidate {}",
-                req.candidate_id
-            ))
-            .await
-            .map_err(|e| {
-                tracing::warn!(
-                    candidate_id = req.candidate_id,
-                    peer_addr = ?peer_addr,
-                    error = ?e,
-                    "request_vote RPC failed to peer"
-                );
-                e
-            })
+        client.request_vote(ctx, req.clone()).await.map_err(|e| {
+            tracing::warn!(
+                candidate_id = req.candidate_id,
+                peer_addr = ?peer_addr,
+                error = ?e,
+                "request_vote RPC failed to peer"
+            );
+            e
+        })
     }
 }
 

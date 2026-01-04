@@ -4,7 +4,6 @@ use crate::statemachine::StateMachine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[tracing::instrument(skip(state), fields(term = req.term, candidate_id = req.candidate_id, last_log_index = req.last_log_index, last_log_term = req.last_log_term))]
 pub async fn handle_request_vote<T, SM>(
     req: &RequestVoteRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
