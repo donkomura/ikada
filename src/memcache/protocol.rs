@@ -1,4 +1,10 @@
-use crate::memcache::error::Result;
+use crate::memcache::error::{MemcacheError, Result};
+use nom::{
+    IResult,
+    bytes::complete::{tag, take, take_until},
+    character::complete::{digit1, space1},
+    combinator::map_res,
+};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum MemcacheCommand {
@@ -33,15 +39,104 @@ pub enum MemcacheResponse {
     ClientError(String),
 }
 
+fn parse_u32(input: &str) -> IResult<&str, u32> {
+    map_res(digit1, |s: &str| s.parse::<u32>())(input)
+}
+
+fn parse_usize(input: &str) -> IResult<&str, usize> {
+    map_res(digit1, |s: &str| s.parse::<usize>())(input)
+}
+
+fn parse_key(input: &str) -> IResult<&str, &str> {
+    take_until(" ")(input)
+}
+
+fn parse_set_command(input: &str) -> IResult<&str, MemcacheCommand> {
+    let (input, _) = tag("set ")(input)?;
+    let (input, key) = parse_key(input)?;
+    let (input, _) = space1(input)?;
+    let (input, flags) = parse_u32(input)?;
+    let (input, _) = space1(input)?;
+    let (input, exptime) = parse_u32(input)?;
+    let (input, _) = space1(input)?;
+    let (input, bytes) = parse_usize(input)?;
+    let (input, _) = tag("\r\n")(input)?;
+    let (input, data) = take(bytes)(input)?;
+    let (input, _) = tag("\r\n")(input)?;
+
+    Ok((
+        input,
+        MemcacheCommand::Set {
+            key: key.to_string(),
+            flags,
+            exptime,
+            bytes,
+            data: data.as_bytes().to_vec(),
+        },
+    ))
+}
+
+fn parse_get_command(input: &str) -> IResult<&str, MemcacheCommand> {
+    let (input, _) = tag("get ")(input)?;
+    let (input, keys_str) = take_until("\r\n")(input)?;
+    let (input, _) = tag("\r\n")(input)?;
+
+    let keys: Vec<String> =
+        keys_str.split(' ').map(|s| s.to_string()).collect();
+
+    Ok((input, MemcacheCommand::Get { keys }))
+}
+
+fn parse_delete_command(input: &str) -> IResult<&str, MemcacheCommand> {
+    let (input, _) = tag("delete ")(input)?;
+    let (input, key) = take_until("\r\n")(input)?;
+    let (input, _) = tag("\r\n")(input)?;
+
+    Ok((
+        input,
+        MemcacheCommand::Delete {
+            key: key.to_string(),
+        },
+    ))
+}
+
 impl MemcacheCommand {
-    pub fn parse(_input: &str) -> Result<Self> {
-        todo!()
+    pub fn parse(input: &str) -> Result<Self> {
+        let result = parse_set_command(input)
+            .or_else(|_| parse_get_command(input))
+            .or_else(|_| parse_delete_command(input));
+
+        match result {
+            Ok((_, cmd)) => Ok(cmd),
+            Err(_) => Err(MemcacheError::Protocol(
+                "Failed to parse command".to_string(),
+            )),
+        }
     }
 }
 
 impl MemcacheResponse {
     pub fn serialize(&self) -> String {
-        todo!()
+        match self {
+            MemcacheResponse::Stored => "STORED\r\n".to_string(),
+            MemcacheResponse::NotStored => "NOT_STORED\r\n".to_string(),
+            MemcacheResponse::Value { key, flags, data } => {
+                format!(
+                    "VALUE {} {} {}\r\n{}\r\n",
+                    key,
+                    flags,
+                    data.len(),
+                    String::from_utf8_lossy(data)
+                )
+            }
+            MemcacheResponse::End => "END\r\n".to_string(),
+            MemcacheResponse::Deleted => "DELETED\r\n".to_string(),
+            MemcacheResponse::NotFound => "NOT_FOUND\r\n".to_string(),
+            MemcacheResponse::Error(_) => "ERROR\r\n".to_string(),
+            MemcacheResponse::ClientError(msg) => {
+                format!("CLIENT_ERROR {}\r\n", msg)
+            }
+        }
     }
 }
 
