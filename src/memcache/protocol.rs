@@ -262,4 +262,63 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn test_serialize_stored_response() {
+        let response = MemcacheResponse::Stored;
+        assert_eq!(response.serialize(), b"STORED\r\n".to_vec());
+    }
+
+    #[test]
+    fn test_serialize_not_stored_response() {
+        let response = MemcacheResponse::NotStored;
+        assert_eq!(response.serialize(), b"NOT_STORED\r\n".to_vec());
+    }
+
+    #[test]
+    fn test_serialize_value_response() {
+        let response = MemcacheResponse::Value {
+            key: "mykey".to_string(),
+            flags: 0,
+            data: b"hello".to_vec(),
+        };
+        assert_eq!(
+            response.serialize(),
+            b"VALUE mykey 0 5\r\nhello\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_serialize_end_response() {
+        let response = MemcacheResponse::End;
+        assert_eq!(response.serialize(), b"END\r\n".to_vec());
+    }
+
+    #[test]
+    fn test_serialize_deleted_response() {
+        let response = MemcacheResponse::Deleted;
+        assert_eq!(response.serialize(), b"DELETED\r\n".to_vec());
+    }
+
+    #[test]
+    fn test_serialize_not_found_response() {
+        let response = MemcacheResponse::NotFound;
+        assert_eq!(response.serialize(), b"NOT_FOUND\r\n".to_vec());
+    }
+
+    #[test]
+    fn test_serialize_error_response() {
+        let response = MemcacheResponse::Error("command not found".to_string());
+        assert_eq!(response.serialize(), b"ERROR\r\n".to_vec());
+    }
+
+    #[test]
+    fn test_serialize_client_error_response() {
+        let response =
+            MemcacheResponse::ClientError("bad data chunk".to_string());
+        assert_eq!(
+            response.serialize(),
+            b"CLIENT_ERROR bad data chunk\r\n".to_vec()
+        );
+    }
 }
