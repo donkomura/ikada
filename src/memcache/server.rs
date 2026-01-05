@@ -72,27 +72,21 @@ async fn handle_connection(
                     Ok(cmd) => match handler.handle_command(cmd).await {
                         Ok(responses) => {
                             for response in responses {
-                                writer
-                                    .write_all(response.serialize().as_bytes())
-                                    .await?;
+                                writer.write_all(&response.serialize()).await?;
                             }
                         }
                         Err(e) => {
                             let error_response =
                                 MemcacheResponse::ClientError(format!("{}", e));
                             writer
-                                .write_all(
-                                    error_response.serialize().as_bytes(),
-                                )
+                                .write_all(&error_response.serialize())
                                 .await?;
                         }
                     },
                     Err(e) => {
                         let error_response =
                             MemcacheResponse::ClientError(format!("{}", e));
-                        writer
-                            .write_all(error_response.serialize().as_bytes())
-                            .await?;
+                        writer.write_all(&error_response.serialize()).await?;
                     }
                 }
             }
@@ -101,25 +95,19 @@ async fn handle_connection(
                 Ok(cmd) => match handler.handle_command(cmd).await {
                     Ok(responses) => {
                         for response in responses {
-                            writer
-                                .write_all(response.serialize().as_bytes())
-                                .await?;
+                            writer.write_all(&response.serialize()).await?;
                         }
                     }
                     Err(e) => {
                         let error_response =
                             MemcacheResponse::ClientError(format!("{}", e));
-                        writer
-                            .write_all(error_response.serialize().as_bytes())
-                            .await?;
+                        writer.write_all(&error_response.serialize()).await?;
                     }
                 },
                 Err(e) => {
                     let error_response =
                         MemcacheResponse::Error(format!("{}", e));
-                    writer
-                        .write_all(error_response.serialize().as_bytes())
-                        .await?;
+                    writer.write_all(&error_response.serialize()).await?;
                 }
             }
         }

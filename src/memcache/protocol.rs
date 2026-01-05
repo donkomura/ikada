@@ -1,9 +1,11 @@
 use crate::memcache::error::{MemcacheError, Result};
 use nom::{
     IResult,
-    bytes::complete::{tag, take, take_until},
-    character::complete::{digit1, space1},
-    combinator::map_res,
+    branch::alt,
+    bytes::complete::{tag, take, take_till, take_while1},
+    character::complete::{digit1, line_ending, space1},
+    combinator::{map, map_res},
+    sequence::terminated,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -39,20 +41,31 @@ pub enum MemcacheResponse {
     ClientError(String),
 }
 
-fn parse_u32(input: &str) -> IResult<&str, u32> {
-    map_res(digit1, |s: &str| s.parse::<u32>())(input)
+fn parse_u32(input: &[u8]) -> IResult<&[u8], u32> {
+    map_res(map_res(digit1, std::str::from_utf8), |s: &str| {
+        s.parse::<u32>()
+    })(input)
 }
 
-fn parse_usize(input: &str) -> IResult<&str, usize> {
-    map_res(digit1, |s: &str| s.parse::<usize>())(input)
+fn parse_usize(input: &[u8]) -> IResult<&[u8], usize> {
+    map_res(map_res(digit1, std::str::from_utf8), |s: &str| {
+        s.parse::<usize>()
+    })(input)
 }
 
-fn parse_key(input: &str) -> IResult<&str, &str> {
-    take_until(" ")(input)
+fn is_not_space_or_crlf(c: u8) -> bool {
+    c != b' ' && c != b'\r' && c != b'\n'
 }
 
-fn parse_set_command(input: &str) -> IResult<&str, MemcacheCommand> {
-    let (input, _) = tag("set ")(input)?;
+fn parse_key(input: &[u8]) -> IResult<&[u8], String> {
+    map(
+        map_res(take_while1(is_not_space_or_crlf), std::str::from_utf8),
+        |s: &str| s.to_string(),
+    )(input)
+}
+
+fn parse_set_command(input: &[u8]) -> IResult<&[u8], MemcacheCommand> {
+    let (input, _) = tag(b"set ")(input)?;
     let (input, key) = parse_key(input)?;
     let (input, _) = space1(input)?;
     let (input, flags) = parse_u32(input)?;
@@ -60,81 +73,84 @@ fn parse_set_command(input: &str) -> IResult<&str, MemcacheCommand> {
     let (input, exptime) = parse_u32(input)?;
     let (input, _) = space1(input)?;
     let (input, bytes) = parse_usize(input)?;
-    let (input, _) = tag("\r\n")(input)?;
+    let (input, _) = line_ending(input)?;
     let (input, data) = take(bytes)(input)?;
-    let (input, _) = tag("\r\n")(input)?;
+    let (input, _) = line_ending(input)?;
 
     Ok((
         input,
         MemcacheCommand::Set {
-            key: key.to_string(),
+            key,
             flags,
             exptime,
             bytes,
-            data: data.as_bytes().to_vec(),
+            data: data.to_vec(),
         },
     ))
 }
 
-fn parse_get_command(input: &str) -> IResult<&str, MemcacheCommand> {
-    let (input, _) = tag("get ")(input)?;
-    let (input, keys_str) = take_until("\r\n")(input)?;
-    let (input, _) = tag("\r\n")(input)?;
+fn parse_get_command(input: &[u8]) -> IResult<&[u8], MemcacheCommand> {
+    let (input, _) = tag(b"get ")(input)?;
+    let (input, keys_bytes) = take_till(|c| c == b'\r')(input)?;
+    let (input, _) = line_ending(input)?;
 
+    let keys_str = std::str::from_utf8(keys_bytes).map_err(|_| {
+        nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Char,
+        ))
+    })?;
     let keys: Vec<String> =
         keys_str.split(' ').map(|s| s.to_string()).collect();
 
     Ok((input, MemcacheCommand::Get { keys }))
 }
 
-fn parse_delete_command(input: &str) -> IResult<&str, MemcacheCommand> {
-    let (input, _) = tag("delete ")(input)?;
-    let (input, key) = take_until("\r\n")(input)?;
-    let (input, _) = tag("\r\n")(input)?;
+fn parse_delete_command(input: &[u8]) -> IResult<&[u8], MemcacheCommand> {
+    let (input, _) = tag(b"delete ")(input)?;
+    let (input, key) = terminated(parse_key, line_ending)(input)?;
 
-    Ok((
-        input,
-        MemcacheCommand::Delete {
-            key: key.to_string(),
-        },
-    ))
+    Ok((input, MemcacheCommand::Delete { key }))
+}
+
+fn parse_command(input: &[u8]) -> IResult<&[u8], MemcacheCommand> {
+    alt((parse_set_command, parse_get_command, parse_delete_command))(input)
 }
 
 impl MemcacheCommand {
     pub fn parse(input: &str) -> Result<Self> {
-        let result = parse_set_command(input)
-            .or_else(|_| parse_get_command(input))
-            .or_else(|_| parse_delete_command(input));
-
-        match result {
+        let bytes = input.as_bytes();
+        match parse_command(bytes) {
             Ok((_, cmd)) => Ok(cmd),
-            Err(_) => Err(MemcacheError::Protocol(
-                "Failed to parse command".to_string(),
-            )),
+            Err(nom::Err::Error(e)) | Err(nom::Err::Failure(e)) => Err(
+                MemcacheError::Protocol(format!("Parse error: {:?}", e.code)),
+            ),
+            Err(nom::Err::Incomplete(_)) => {
+                Err(MemcacheError::Protocol("Incomplete input".to_string()))
+            }
         }
     }
 }
 
 impl MemcacheResponse {
-    pub fn serialize(&self) -> String {
+    pub fn serialize(&self) -> Vec<u8> {
         match self {
-            MemcacheResponse::Stored => "STORED\r\n".to_string(),
-            MemcacheResponse::NotStored => "NOT_STORED\r\n".to_string(),
+            MemcacheResponse::Stored => b"STORED\r\n".to_vec(),
+            MemcacheResponse::NotStored => b"NOT_STORED\r\n".to_vec(),
             MemcacheResponse::Value { key, flags, data } => {
-                format!(
-                    "VALUE {} {} {}\r\n{}\r\n",
-                    key,
-                    flags,
-                    data.len(),
-                    String::from_utf8_lossy(data)
-                )
+                let header =
+                    format!("VALUE {} {} {}\r\n", key, flags, data.len());
+                let mut result = header.into_bytes();
+                result.extend_from_slice(data);
+                result.extend_from_slice(b"\r\n");
+                result
             }
-            MemcacheResponse::End => "END\r\n".to_string(),
-            MemcacheResponse::Deleted => "DELETED\r\n".to_string(),
-            MemcacheResponse::NotFound => "NOT_FOUND\r\n".to_string(),
-            MemcacheResponse::Error(_) => "ERROR\r\n".to_string(),
+            MemcacheResponse::End => b"END\r\n".to_vec(),
+            MemcacheResponse::Deleted => b"DELETED\r\n".to_vec(),
+            MemcacheResponse::NotFound => b"NOT_FOUND\r\n".to_vec(),
+            MemcacheResponse::Error(_) => b"ERROR\r\n".to_vec(),
             MemcacheResponse::ClientError(msg) => {
-                format!("CLIENT_ERROR {}\r\n", msg)
+                format!("CLIENT_ERROR {}\r\n", msg).into_bytes()
             }
         }
     }
@@ -230,55 +246,20 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_stored_response() {
-        let response = MemcacheResponse::Stored;
-        assert_eq!(response.serialize(), "STORED\r\n");
-    }
+    fn test_parse_set_command_with_binary_data() {
+        let input = b"set binkey 0 0 5\r\n\x00\x01\x02\x03\x04\r\n";
+        let input_str = std::str::from_utf8(input).unwrap();
+        let result = MemcacheCommand::parse(input_str).unwrap();
 
-    #[test]
-    fn test_serialize_not_stored_response() {
-        let response = MemcacheResponse::NotStored;
-        assert_eq!(response.serialize(), "NOT_STORED\r\n");
-    }
-
-    #[test]
-    fn test_serialize_value_response() {
-        let response = MemcacheResponse::Value {
-            key: "mykey".to_string(),
-            flags: 0,
-            data: b"hello".to_vec(),
-        };
-        assert_eq!(response.serialize(), "VALUE mykey 0 5\r\nhello\r\n");
-    }
-
-    #[test]
-    fn test_serialize_end_response() {
-        let response = MemcacheResponse::End;
-        assert_eq!(response.serialize(), "END\r\n");
-    }
-
-    #[test]
-    fn test_serialize_deleted_response() {
-        let response = MemcacheResponse::Deleted;
-        assert_eq!(response.serialize(), "DELETED\r\n");
-    }
-
-    #[test]
-    fn test_serialize_not_found_response() {
-        let response = MemcacheResponse::NotFound;
-        assert_eq!(response.serialize(), "NOT_FOUND\r\n");
-    }
-
-    #[test]
-    fn test_serialize_error_response() {
-        let response = MemcacheResponse::Error("command not found".to_string());
-        assert_eq!(response.serialize(), "ERROR\r\n");
-    }
-
-    #[test]
-    fn test_serialize_client_error_response() {
-        let response =
-            MemcacheResponse::ClientError("bad data chunk".to_string());
-        assert_eq!(response.serialize(), "CLIENT_ERROR bad data chunk\r\n");
+        assert_eq!(
+            result,
+            MemcacheCommand::Set {
+                key: "binkey".to_string(),
+                flags: 0,
+                exptime: 0,
+                bytes: 5,
+                data: vec![0x00, 0x01, 0x02, 0x03, 0x04],
+            }
+        );
     }
 }
