@@ -365,13 +365,19 @@ impl MaelstromRaftNode {
         let cmd_tx = self.get_command_channel().await?;
         let cmd_bytes = bincode::serialize(&cmd)?;
         let (resp_tx, resp_rx) = oneshot::channel();
+        let span = tracing::Span::current();
 
         let command = if use_read_index {
-            Command::ReadRequest(CommandRequest { command: cmd_bytes }, resp_tx)
+            Command::ReadRequest(
+                CommandRequest { command: cmd_bytes },
+                resp_tx,
+                span,
+            )
         } else {
             Command::ClientRequest(
                 CommandRequest { command: cmd_bytes },
                 resp_tx,
+                span,
             )
         };
 
@@ -941,7 +947,10 @@ impl MaelstromRaftNode {
         };
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        cmd_tx.send(Command::AppendEntries(req, resp_tx)).await?;
+        let span = tracing::Span::current();
+        cmd_tx
+            .send(Command::AppendEntries(req, resp_tx, span))
+            .await?;
 
         let response = resp_rx.await?;
 
@@ -977,7 +986,10 @@ impl MaelstromRaftNode {
         };
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        cmd_tx.send(Command::RequestVote(req, resp_tx)).await?;
+        let span = tracing::Span::current();
+        cmd_tx
+            .send(Command::RequestVote(req, resp_tx, span))
+            .await?;
 
         let response = resp_rx.await?;
 

@@ -345,7 +345,9 @@ where
         sent_up_to_index: u32,
         rpc_timeout: Duration,
     ) -> anyhow::Result<(SocketAddr, ReplicationResponse)> {
-        let mut ctx = tarpc::context::current();
+        use crate::trace::TraceContextInjector;
+
+        let mut ctx = tarpc::context::Context::current().with_current_trace();
         ctx.deadline = Instant::now() + rpc_timeout;
         let res = client.append_entries(ctx, req.clone()).await?;
         Ok((

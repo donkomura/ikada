@@ -27,13 +27,30 @@ use tracing::Instrument;
 /// This enum exists to bridge the RPC server (which receives requests)
 /// and the consensus logic (which processes them asynchronously).
 pub enum Command {
-    AppendEntries(AppendEntriesRequest, oneshot::Sender<AppendEntriesResponse>),
-    RequestVote(RequestVoteRequest, oneshot::Sender<RequestVoteResponse>),
-    ClientRequest(CommandRequest, oneshot::Sender<CommandResponse>),
-    ReadRequest(CommandRequest, oneshot::Sender<CommandResponse>),
+    AppendEntries(
+        AppendEntriesRequest,
+        oneshot::Sender<AppendEntriesResponse>,
+        tracing::Span,
+    ),
+    RequestVote(
+        RequestVoteRequest,
+        oneshot::Sender<RequestVoteResponse>,
+        tracing::Span,
+    ),
+    ClientRequest(
+        CommandRequest,
+        oneshot::Sender<CommandResponse>,
+        tracing::Span,
+    ),
+    ReadRequest(
+        CommandRequest,
+        oneshot::Sender<CommandResponse>,
+        tracing::Span,
+    ),
     InstallSnapshot(
         InstallSnapshotRequest,
         oneshot::Sender<InstallSnapshotResponse>,
+        tracing::Span,
     ),
 }
 
@@ -268,14 +285,17 @@ where
         let request_tracker = Arc::clone(&self.request_tracker);
         let config = self.config.clone();
 
-        tokio::spawn(Self::rpc_handler(
-            state,
-            cmd_rx,
-            heartbeat_tx,
-            client_request_tx,
-            request_tracker,
-            config,
-        ));
+        tokio::spawn(
+            Self::rpc_handler(
+                state,
+                cmd_rx,
+                heartbeat_tx,
+                client_request_tx,
+                request_tracker,
+                config,
+            )
+            .instrument(tracing::Span::current()),
+        );
 
         self.main(vec![]).await
     }
@@ -295,11 +315,10 @@ where
     ) -> anyhow::Result<()> {
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                Command::AppendEntries(req, resp_tx) => {
+                Command::AppendEntries(req, resp_tx, span) => {
                     let state_clone = Arc::clone(&state);
                     let heartbeat_tx = heartbeat_tx.clone();
                     let tracker_clone = Arc::clone(&request_tracker);
-                    let span = tracing::Span::current();
                     tokio::spawn(async move {
                         let current_term =
                             state_clone.lock().await.persistent.current_term;
@@ -323,9 +342,8 @@ where
                         }
                     }.instrument(span));
                 }
-                Command::RequestVote(req, resp_tx) => {
+                Command::RequestVote(req, resp_tx, span) => {
                     let state_clone = Arc::clone(&state);
-                    let span = tracing::Span::current();
                     tokio::spawn(
                         async move {
                             let resp = handlers::handle_request_vote(
@@ -338,10 +356,9 @@ where
                         .instrument(span),
                     );
                 }
-                Command::ClientRequest(req, resp_tx) => {
+                Command::ClientRequest(req, resp_tx, span) => {
                     let state_clone = Arc::clone(&state);
                     let client_request_tx_clone = client_request_tx.clone();
-                    let span = tracing::Span::current();
                     tokio::spawn(
                         async move {
                             // Check if this node is the leader
@@ -373,9 +390,8 @@ where
                         .instrument(span),
                     );
                 }
-                Command::ReadRequest(req, resp_tx) => {
+                Command::ReadRequest(req, resp_tx, span) => {
                     let state_clone = Arc::clone(&state);
-                    let span = tracing::Span::current();
                     tokio::spawn(
                         async move {
                             // Check if this node is the leader
@@ -421,10 +437,9 @@ where
                         .instrument(span),
                     );
                 }
-                Command::InstallSnapshot(req, resp_tx) => {
+                Command::InstallSnapshot(req, resp_tx, span) => {
                     let state_clone = Arc::clone(&state);
                     let heartbeat_tx = heartbeat_tx.clone();
-                    let span = tracing::Span::current();
                     tokio::spawn(async move {
                         let current_term =
                             state_clone.lock().await.persistent.current_term;

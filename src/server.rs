@@ -57,7 +57,11 @@ impl RaftRpc for RaftServer {
         req: AppendEntriesRequest,
     ) -> AppendEntriesResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let _ = self.tx.send(Command::AppendEntries(req, resp_tx)).await;
+        let span = tracing::Span::current();
+        let _ = self
+            .tx
+            .send(Command::AppendEntries(req, resp_tx, span))
+            .await;
         resp_rx.await.unwrap_or(AppendEntriesResponse {
             term: 0,
             success: false,
@@ -71,7 +75,8 @@ impl RaftRpc for RaftServer {
         req: RequestVoteRequest,
     ) -> RequestVoteResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let _ = self.tx.send(Command::RequestVote(req, resp_tx)).await;
+        let span = tracing::Span::current();
+        let _ = self.tx.send(Command::RequestVote(req, resp_tx, span)).await;
         resp_rx.await.unwrap_or(RequestVoteResponse {
             term: 0,
             vote_granted: false,
@@ -85,7 +90,11 @@ impl RaftRpc for RaftServer {
         req: CommandRequest,
     ) -> CommandResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let _ = self.tx.send(Command::ClientRequest(req, resp_tx)).await;
+        let span = tracing::Span::current();
+        let _ = self
+            .tx
+            .send(Command::ClientRequest(req, resp_tx, span))
+            .await;
         resp_rx.await.unwrap_or(CommandResponse {
             success: false,
             leader_hint: None,
@@ -103,7 +112,11 @@ impl RaftRpc for RaftServer {
         req: InstallSnapshotRequest,
     ) -> InstallSnapshotResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let _ = self.tx.send(Command::InstallSnapshot(req, resp_tx)).await;
+        let span = tracing::Span::current();
+        let _ = self
+            .tx
+            .send(Command::InstallSnapshot(req, resp_tx, span))
+            .await;
         resp_rx.await.unwrap_or(InstallSnapshotResponse { term: 0 })
     }
 }
