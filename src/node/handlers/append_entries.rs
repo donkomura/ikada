@@ -257,6 +257,7 @@ where
     Ok(())
 }
 
+#[tracing::instrument(skip(state, request_tracker), fields(term = req.term, leader_id = req.leader_id, prev_log_index = req.prev_log_index, entries_count = req.entries.len()))]
 pub async fn handle_append_entries<T, SM>(
     req: &AppendEntriesRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
@@ -375,7 +376,7 @@ mod tests {
 
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
-                if let Command::AppendEntries(req, resp_tx) = cmd {
+                if let Command::AppendEntries(req, resp_tx, _span) = cmd {
                     let resp =
                         handle_append_entries(&req, state_clone.clone(), None)
                             .await
@@ -395,7 +396,13 @@ mod tests {
             leader_commit: 0,
         };
 
-        cmd_tx.send(Command::AppendEntries(req, resp_tx)).await?;
+        cmd_tx
+            .send(Command::AppendEntries(
+                req,
+                resp_tx,
+                tracing::Span::current(),
+            ))
+            .await?;
 
         let _response = resp_rx.await?;
 

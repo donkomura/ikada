@@ -50,39 +50,51 @@ struct RaftServer {
 }
 
 impl RaftRpc for RaftServer {
+    #[tracing::instrument(skip(self, _ctx), fields(term = req.term, leader_id = req.leader_id, entries_count = req.entries.len()))]
     async fn append_entries(
         self,
-        _: tarpc::context::Context,
+        _ctx: tarpc::context::Context,
         req: AppendEntriesRequest,
     ) -> AppendEntriesResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let _ = self.tx.send(Command::AppendEntries(req, resp_tx)).await;
+        let span = tracing::Span::current();
+        let _ = self
+            .tx
+            .send(Command::AppendEntries(req, resp_tx, span))
+            .await;
         resp_rx.await.unwrap_or(AppendEntriesResponse {
             term: 0,
             success: false,
         })
     }
 
+    #[tracing::instrument(skip(self, _ctx), fields(term = req.term, candidate_id = req.candidate_id))]
     async fn request_vote(
         self,
-        _: tarpc::context::Context,
+        _ctx: tarpc::context::Context,
         req: RequestVoteRequest,
     ) -> RequestVoteResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let _ = self.tx.send(Command::RequestVote(req, resp_tx)).await;
+        let span = tracing::Span::current();
+        let _ = self.tx.send(Command::RequestVote(req, resp_tx, span)).await;
         resp_rx.await.unwrap_or(RequestVoteResponse {
             term: 0,
             vote_granted: false,
         })
     }
 
+    #[tracing::instrument(skip(self, _ctx, req))]
     async fn client_request(
         self,
-        _: tarpc::context::Context,
+        _ctx: tarpc::context::Context,
         req: CommandRequest,
     ) -> CommandResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let _ = self.tx.send(Command::ClientRequest(req, resp_tx)).await;
+        let span = tracing::Span::current();
+        let _ = self
+            .tx
+            .send(Command::ClientRequest(req, resp_tx, span))
+            .await;
         resp_rx.await.unwrap_or(CommandResponse {
             success: false,
             leader_hint: None,
@@ -93,13 +105,18 @@ impl RaftRpc for RaftServer {
         })
     }
 
+    #[tracing::instrument(skip(self, _ctx), fields(term = req.term, leader_id = req.leader_id, last_included_index = req.last_included_index))]
     async fn install_snapshot(
         self,
-        _: tarpc::context::Context,
+        _ctx: tarpc::context::Context,
         req: InstallSnapshotRequest,
     ) -> InstallSnapshotResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
-        let _ = self.tx.send(Command::InstallSnapshot(req, resp_tx)).await;
+        let span = tracing::Span::current();
+        let _ = self
+            .tx
+            .send(Command::InstallSnapshot(req, resp_tx, span))
+            .await;
         resp_rx.await.unwrap_or(InstallSnapshotResponse { term: 0 })
     }
 }

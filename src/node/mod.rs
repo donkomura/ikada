@@ -21,18 +21,36 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinSet;
+use tracing::Instrument;
 
 /// Command represents RPC requests with response channels.
 /// This enum exists to bridge the RPC server (which receives requests)
 /// and the consensus logic (which processes them asynchronously).
 pub enum Command {
-    AppendEntries(AppendEntriesRequest, oneshot::Sender<AppendEntriesResponse>),
-    RequestVote(RequestVoteRequest, oneshot::Sender<RequestVoteResponse>),
-    ClientRequest(CommandRequest, oneshot::Sender<CommandResponse>),
-    ReadRequest(CommandRequest, oneshot::Sender<CommandResponse>),
+    AppendEntries(
+        AppendEntriesRequest,
+        oneshot::Sender<AppendEntriesResponse>,
+        tracing::Span,
+    ),
+    RequestVote(
+        RequestVoteRequest,
+        oneshot::Sender<RequestVoteResponse>,
+        tracing::Span,
+    ),
+    ClientRequest(
+        CommandRequest,
+        oneshot::Sender<CommandResponse>,
+        tracing::Span,
+    ),
+    ReadRequest(
+        CommandRequest,
+        oneshot::Sender<CommandResponse>,
+        tracing::Span,
+    ),
     InstallSnapshot(
         InstallSnapshotRequest,
         oneshot::Sender<InstallSnapshotResponse>,
+        tracing::Span,
     ),
 }
 
@@ -267,14 +285,17 @@ where
         let request_tracker = Arc::clone(&self.request_tracker);
         let config = self.config.clone();
 
-        tokio::spawn(Self::rpc_handler(
-            state,
-            cmd_rx,
-            heartbeat_tx,
-            client_request_tx,
-            request_tracker,
-            config,
-        ));
+        tokio::spawn(
+            Self::rpc_handler(
+                state,
+                cmd_rx,
+                heartbeat_tx,
+                client_request_tx,
+                request_tracker,
+                config,
+            )
+            .instrument(tracing::Span::current()),
+        );
 
         self.main(vec![]).await
     }
@@ -294,7 +315,7 @@ where
     ) -> anyhow::Result<()> {
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                Command::AppendEntries(req, resp_tx) => {
+                Command::AppendEntries(req, resp_tx, span) => {
                     let state_clone = Arc::clone(&state);
                     let heartbeat_tx = heartbeat_tx.clone();
                     let tracker_clone = Arc::clone(&request_tracker);
@@ -319,93 +340,104 @@ where
                             let _ =
                                 heartbeat_tx.send((req.term, req.leader_id));
                         }
-                    });
+                    }.instrument(span));
                 }
-                Command::RequestVote(req, resp_tx) => {
+                Command::RequestVote(req, resp_tx, span) => {
                     let state_clone = Arc::clone(&state);
-                    tokio::spawn(async move {
-                        let resp =
-                            handlers::handle_request_vote(&req, state_clone)
-                                .await;
-                        let _ = resp_tx.send(resp);
-                    });
-                }
-                Command::ClientRequest(req, resp_tx) => {
-                    let state_clone = Arc::clone(&state);
-                    let client_request_tx_clone = client_request_tx.clone();
-                    tokio::spawn(async move {
-                        // Check if this node is the leader
-                        let is_leader = {
-                            let state = state_clone.lock().await;
-                            state.role.is_leader()
-                        };
-
-                        if is_leader {
-                            // Send to leader loop for processing
-                            let _ =
-                                client_request_tx_clone.send((req, resp_tx));
-                        } else {
-                            // Not a leader, return error with leader hint
-                            let leader_hint = {
-                                let state = state_clone.lock().await;
-                                state.leader_id
-                            };
-                            let _ = resp_tx.send(CommandResponse {
-                                success: false,
-                                leader_hint,
-                                data: None,
-                                error: Some(
-                                    crate::rpc::CommandError::NotLeader,
-                                ),
-                            });
-                        }
-                    });
-                }
-                Command::ReadRequest(req, resp_tx) => {
-                    let state_clone = Arc::clone(&state);
-                    tokio::spawn(async move {
-                        // Check if this node is the leader
-                        let is_leader = {
-                            let state = state_clone.lock().await;
-                            state.role.is_leader()
-                        };
-
-                        if is_leader {
-                            // Use ReadIndex optimization for reads
-                            let peer_count = {
-                                let state = state_clone.lock().await;
-                                state
-                                    .role
-                                    .leader_state()
-                                    .map(|ls| ls.match_index.len())
-                                    .unwrap_or(0)
-                            };
-                            let resp = handlers::handle_read_index_request(
+                    tokio::spawn(
+                        async move {
+                            let resp = handlers::handle_request_vote(
                                 &req,
                                 state_clone,
-                                config.read_index_timeout,
-                                peer_count,
                             )
                             .await;
                             let _ = resp_tx.send(resp);
-                        } else {
-                            // Not a leader, return error with leader hint
-                            let leader_hint = {
-                                let state = state_clone.lock().await;
-                                state.leader_id
-                            };
-                            let _ = resp_tx.send(CommandResponse {
-                                success: false,
-                                leader_hint,
-                                data: None,
-                                error: Some(
-                                    crate::rpc::CommandError::NotLeader,
-                                ),
-                            });
                         }
-                    });
+                        .instrument(span),
+                    );
                 }
-                Command::InstallSnapshot(req, resp_tx) => {
+                Command::ClientRequest(req, resp_tx, span) => {
+                    let state_clone = Arc::clone(&state);
+                    let client_request_tx_clone = client_request_tx.clone();
+                    tokio::spawn(
+                        async move {
+                            // Check if this node is the leader
+                            let is_leader = {
+                                let state = state_clone.lock().await;
+                                state.role.is_leader()
+                            };
+
+                            if is_leader {
+                                // Send to leader loop for processing
+                                let _ = client_request_tx_clone
+                                    .send((req, resp_tx));
+                            } else {
+                                // Not a leader, return error with leader hint
+                                let leader_hint = {
+                                    let state = state_clone.lock().await;
+                                    state.leader_id
+                                };
+                                let _ = resp_tx.send(CommandResponse {
+                                    success: false,
+                                    leader_hint,
+                                    data: None,
+                                    error: Some(
+                                        crate::rpc::CommandError::NotLeader,
+                                    ),
+                                });
+                            }
+                        }
+                        .instrument(span),
+                    );
+                }
+                Command::ReadRequest(req, resp_tx, span) => {
+                    let state_clone = Arc::clone(&state);
+                    tokio::spawn(
+                        async move {
+                            // Check if this node is the leader
+                            let is_leader = {
+                                let state = state_clone.lock().await;
+                                state.role.is_leader()
+                            };
+
+                            if is_leader {
+                                // Use ReadIndex optimization for reads
+                                let peer_count = {
+                                    let state = state_clone.lock().await;
+                                    state
+                                        .role
+                                        .leader_state()
+                                        .map(|ls| ls.match_index.len())
+                                        .unwrap_or(0)
+                                };
+                                let resp = handlers::handle_read_index_request(
+                                    &req,
+                                    state_clone,
+                                    config.read_index_timeout,
+                                    peer_count,
+                                )
+                                .await;
+                                let _ = resp_tx.send(resp);
+                            } else {
+                                // Not a leader, return error with leader hint
+                                let leader_hint = {
+                                    let state = state_clone.lock().await;
+                                    state.leader_id
+                                };
+                                let _ = resp_tx.send(CommandResponse {
+                                    success: false,
+                                    leader_hint,
+                                    data: None,
+                                    error: Some(
+                                        crate::rpc::CommandError::NotLeader,
+                                    ),
+                                });
+                            }
+                        }
+                        .instrument(span),
+                    );
+                }
+                Command::InstallSnapshot(req, resp_tx, span) => {
                     let state_clone = Arc::clone(&state);
                     let heartbeat_tx = heartbeat_tx.clone();
                     tokio::spawn(async move {
@@ -427,7 +459,7 @@ where
                             let _ =
                                 heartbeat_tx.send((req.term, req.leader_id));
                         }
-                    });
+                    }.instrument(span));
                 }
             }
         }

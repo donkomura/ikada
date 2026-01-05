@@ -1,9 +1,51 @@
-use opentelemetry::propagation::{Extractor, Injector};
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::Sampler};
-use std::collections::HashMap;
 use tracing_subscriber::{fmt::format::FmtSpan, prelude::*};
+
+/// Trait for RPC context types that can be enriched with distributed tracing information.
+///
+/// This trait provides a type-safe way to propagate OpenTelemetry trace context
+/// to various RPC frameworks without coupling the tracing logic to a specific framework.
+pub trait TraceContextInjector: Sized {
+    /// Injects the current OpenTelemetry span context into this RPC context.
+    fn with_current_trace(self) -> Self;
+}
+
+/// Implementation for tarpc's Context type.
+impl TraceContextInjector for tarpc::context::Context {
+    fn with_current_trace(mut self) -> Self {
+        // Get the current OpenTelemetry span context
+        let otel_ctx = tracing_opentelemetry::OpenTelemetrySpanExt::context(
+            &tracing::Span::current(),
+        );
+        let span_ref = otel_ctx.span();
+        let span_ctx = span_ref.span_context();
+
+        // Only propagate if the span context is valid (not a no-op span)
+        if span_ctx.is_valid() {
+            let trace_id = span_ctx.trace_id();
+            let span_id = span_ctx.span_id();
+            let is_sampled = span_ctx.trace_flags().is_sampled();
+
+            self.trace_context = tarpc::trace::Context {
+                trace_id: tarpc::trace::TraceId::from(u128::from_be_bytes(
+                    trace_id.to_bytes(),
+                )),
+                span_id: tarpc::trace::SpanId::from(u64::from_be_bytes(
+                    span_id.to_bytes(),
+                )),
+                sampling_decision: if is_sampled {
+                    tarpc::trace::SamplingDecision::Sampled
+                } else {
+                    tarpc::trace::SamplingDecision::Unsampled
+                },
+            };
+        }
+
+        self
+    }
+}
 
 pub fn init_tracing(
     service_name: &'static str,
@@ -66,117 +108,6 @@ pub fn init_tracing(
         .try_init()?;
 
     Ok(tracer_provider)
-}
-
-/// Injector implementation for tarpc::context::Context
-///
-/// This collects trace context in W3C Trace Context format and provides
-/// a method to create a tarpc::Context with the propagated trace information.
-pub struct ContextInjector {
-    inner: HashMap<String, String>,
-}
-
-impl Default for ContextInjector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ContextInjector {
-    pub fn new() -> Self {
-        Self {
-            inner: HashMap::new(),
-        }
-    }
-
-    /// Creates a tarpc::Context with trace context propagated from OpenTelemetry.
-    ///
-    /// This method extracts trace_id and span_id from the W3C Trace Context format
-    /// and constructs a tarpc::trace::Context with that information.
-    pub fn into_context(self) -> tarpc::context::Context {
-        let mut ctx = tarpc::context::Context::current();
-
-        if let Some(traceparent) = self.inner.get("traceparent")
-            && let Some(trace_ctx) = Self::parse_traceparent(traceparent)
-        {
-            ctx.trace_context = trace_ctx;
-        }
-
-        ctx
-    }
-
-    /// Parses W3C Trace Context traceparent header format:
-    /// version-trace_id-span_id-trace_flags
-    /// Example: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
-    fn parse_traceparent(traceparent: &str) -> Option<tarpc::trace::Context> {
-        let parts: Vec<&str> = traceparent.split('-').collect();
-        if parts.len() != 4 {
-            return None;
-        }
-
-        let trace_id_hex = parts[1];
-        let span_id_hex = parts[2];
-        let trace_flags_hex = parts[3];
-
-        let trace_id_u128 = u128::from_str_radix(trace_id_hex, 16).ok()?;
-        let span_id_u64 = u64::from_str_radix(span_id_hex, 16).ok()?;
-
-        let sampled = trace_flags_hex == "01";
-        let sampling_decision = if sampled {
-            tarpc::trace::SamplingDecision::Sampled
-        } else {
-            tarpc::trace::SamplingDecision::Unsampled
-        };
-
-        Some(tarpc::trace::Context {
-            trace_id: trace_id_u128.into(),
-            span_id: span_id_u64.into(),
-            sampling_decision,
-        })
-    }
-}
-
-impl Injector for ContextInjector {
-    fn set(&mut self, key: &str, value: String) {
-        self.inner.insert(key.to_string(), value);
-    }
-}
-
-/// Extractor implementation for tarpc::context::Context
-///
-/// This extracts trace context from tarpc::Context and provides it in
-/// W3C Trace Context format for OpenTelemetry propagation.
-pub struct ContextExtractor {
-    traceparent: String,
-}
-
-impl ContextExtractor {
-    pub fn new(ctx: &tarpc::context::Context) -> Self {
-        let trace_id: u128 = ctx.trace_context.trace_id.into();
-        let span_id: u64 = ctx.trace_context.span_id.into();
-        let trace_flags = match ctx.trace_context.sampling_decision {
-            tarpc::trace::SamplingDecision::Sampled => "01",
-            tarpc::trace::SamplingDecision::Unsampled => "00",
-        };
-
-        let traceparent =
-            format!("00-{:032x}-{:016x}-{}", trace_id, span_id, trace_flags);
-        Self { traceparent }
-    }
-}
-
-impl Extractor for ContextExtractor {
-    fn get(&self, key: &str) -> Option<&str> {
-        if key == "traceparent" {
-            Some(&self.traceparent)
-        } else {
-            None
-        }
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        vec!["traceparent"]
-    }
 }
 
 pub fn init_tracing_stderr(

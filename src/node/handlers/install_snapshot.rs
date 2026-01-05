@@ -14,6 +14,7 @@ use crate::statemachine::StateMachine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[tracing::instrument(skip(state), fields(term = req.term, leader_id = req.leader_id, last_included_index = req.last_included_index, last_included_term = req.last_included_term))]
 pub async fn handle_install_snapshot<T, SM>(
     req: &InstallSnapshotRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,

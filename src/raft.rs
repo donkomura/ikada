@@ -385,7 +385,11 @@ mod tests {
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         follower_cmd_tx
-            .send(Command::ClientRequest(get_command.clone(), resp_tx))
+            .send(Command::ClientRequest(
+                get_command.clone(),
+                resp_tx,
+                tracing::Span::current(),
+            ))
             .await?;
 
         let follower_response = resp_rx.await?;
@@ -482,6 +486,7 @@ mod tests {
             .send(Command::AppendEntries(
                 append_entries_from_new_leader,
                 resp_tx,
+                tracing::Span::current(),
             ))
             .await?;
 
@@ -515,7 +520,11 @@ mod tests {
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         cmd_tx
-            .send(Command::ClientRequest(get_command, resp_tx))
+            .send(Command::ClientRequest(
+                get_command,
+                resp_tx,
+                tracing::Span::current(),
+            ))
             .await?;
 
         let response = resp_rx.await?;
