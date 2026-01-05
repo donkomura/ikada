@@ -38,3 +38,7 @@ path = "src/bin/server.rs"
 [[bin]]
 name = "ikada-repl"
 path = "src/bin/cli.rs"
+
+[[bin]]
+name = "ikada-memcache"
+path = "src/bin/ikada-memcache.rs"
