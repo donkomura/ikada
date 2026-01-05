@@ -50,9 +50,10 @@ struct RaftServer {
 }
 
 impl RaftRpc for RaftServer {
+    #[tracing::instrument(skip(self, _ctx), fields(term = req.term, leader_id = req.leader_id, entries_count = req.entries.len()))]
     async fn append_entries(
         self,
-        _: tarpc::context::Context,
+        _ctx: tarpc::context::Context,
         req: AppendEntriesRequest,
     ) -> AppendEntriesResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -63,9 +64,10 @@ impl RaftRpc for RaftServer {
         })
     }
 
+    #[tracing::instrument(skip(self, _ctx), fields(term = req.term, candidate_id = req.candidate_id))]
     async fn request_vote(
         self,
-        _: tarpc::context::Context,
+        _ctx: tarpc::context::Context,
         req: RequestVoteRequest,
     ) -> RequestVoteResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -76,9 +78,10 @@ impl RaftRpc for RaftServer {
         })
     }
 
+    #[tracing::instrument(skip(self, _ctx, req))]
     async fn client_request(
         self,
-        _: tarpc::context::Context,
+        _ctx: tarpc::context::Context,
         req: CommandRequest,
     ) -> CommandResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -93,9 +96,10 @@ impl RaftRpc for RaftServer {
         })
     }
 
+    #[tracing::instrument(skip(self, _ctx), fields(term = req.term, leader_id = req.leader_id, last_included_index = req.last_included_index))]
     async fn install_snapshot(
         self,
-        _: tarpc::context::Context,
+        _ctx: tarpc::context::Context,
         req: InstallSnapshotRequest,
     ) -> InstallSnapshotResponse {
         let (resp_tx, resp_rx) = oneshot::channel();

@@ -218,17 +218,7 @@ where
         req: RequestVoteRequest,
         rpc_timeout: Duration,
     ) -> anyhow::Result<RequestVoteResponse> {
-        let mut injector = crate::trace::ContextInjector::new();
-        opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.inject_context(
-                &tracing_opentelemetry::OpenTelemetrySpanExt::context(
-                    &tracing::Span::current(),
-                ),
-                &mut injector,
-            )
-        });
-
-        let mut ctx = injector.into_context();
+        let mut ctx = tarpc::context::Context::current();
         ctx.deadline = Instant::now() + rpc_timeout;
 
         client.request_vote(ctx, req.clone()).await.map_err(|e| {
