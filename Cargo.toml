@@ -42,3 +42,6 @@ path = "src/bin/cli.rs"
 [[bin]]
 name = "ikada-memcache"
 path = "src/bin/ikada-memcache.rs"
+
+[profile.release]
+debug = "line-tables-only"
