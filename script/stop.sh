@@ -27,3 +27,4 @@ pkill -9 -f "ikada-server" 2>/dev/null || true
 pkill -9 -f "ikada-memcache" 2>/dev/null || true
 
 echo "All processes stopped"
+
