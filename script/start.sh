@@ -7,8 +7,6 @@ BASE_PORT=${BASE_PORT:-7000}
 MEMCACHED_PORT=${MEMCACHED_PORT:-11211}
 LOG_LEVEL=${LOG_LEVEL:-off}
 PROFILE=${PROFILE:-false}
-PROFILE_NODE=${PROFILE_NODE:-1}
-BUILD_MODE=${BUILD_MODE:-dev}
 
 # Build peer list for each node
 build_peers() {
@@ -26,18 +24,7 @@ build_peers() {
     echo "$peers"
 }
 
-# Determine build command based on mode
-if [ "$BUILD_MODE" = "release" ]; then
-    BUILD_FLAG="--release"
-    BUILD_DIR="release"
-else
-    BUILD_FLAG=""
-    BUILD_DIR="debug"
-fi
-
-# Build binaries first
-echo "Building binaries in $BUILD_MODE mode..."
-cargo build $BUILD_FLAG --bin ikada-server --bin ikada-memcache
+cargo build debug --bin ikada-server --bin ikada-memcache
 
 # Start each node as separate process
 for i in $(seq 0 $((NODE_COUNT - 1))); do
@@ -88,10 +75,3 @@ RUST_LOG=$LOG_LEVEL ./target/$BUILD_DIR/ikada-memcache \
 
 echo $! > /tmp/memcached.pid
 echo "Started memcached on port $MEMCACHED_PORT (PID: $!)"
-
-if [ "$PROFILE" = "true" ]; then
-    echo ""
-    echo "All nodes started with perf profiling"
-    echo "Run benchmark, then use stop.sh to stop and generate flamegraphs"
-    echo ""
-fi

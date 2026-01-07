@@ -1,7 +1,6 @@
 #!/bin/bash
 
 NODE_COUNT=${NODE_COUNT:-3}
-GENERATE_FLAMEGRAPH=${GENERATE_FLAMEGRAPH:-false}
 
 # Kill nodes by PID
 for i in $(seq 1 $NODE_COUNT); do
@@ -29,20 +28,3 @@ pkill -9 -f "ikada-memcache" 2>/dev/null || true
 
 echo "All processes stopped"
 
-# Generate flamegraphs if profiling data exists
-if [ "$GENERATE_FLAMEGRAPH" = "true" ]; then
-    echo ""
-    echo "Generating flamegraphs..."
-
-    for i in $(seq 1 $NODE_COUNT); do
-        if [ -f "/tmp/node$i.perf.data" ]; then
-            echo "Generating flamegraph for node $i..."
-            perf script -i "/tmp/node$i.perf.data" | \
-                inferno-collapse-perf | \
-                inferno-flamegraph > "/tmp/node$i-flamegraph.svg"
-            echo "  -> /tmp/node$i-flamegraph.svg"
-        fi
-    done
-
-    echo "Flamegraphs generated"
-fi
