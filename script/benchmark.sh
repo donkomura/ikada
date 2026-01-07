@@ -18,6 +18,7 @@ memtier_benchmark \
     --port="$MEMCACHED_PORT" \
     --clients=10 \
     --threads=2 \
+    --test-time=30 \
     --ratio=1:10
 
 echo "Benchmark completed!"

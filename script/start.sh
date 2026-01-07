@@ -24,7 +24,7 @@ build_peers() {
     echo "$peers"
 }
 
-cargo build debug --bin ikada-server --bin ikada-memcache
+cargo build --bin ikada-server --bin ikada-memcache
 
 # Start each node as separate process
 for i in $(seq 0 $((NODE_COUNT - 1))); do
@@ -39,7 +39,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
         # Start with perf profiling
         RUST_LOG=$LOG_LEVEL perf record -F 99 -g --call-graph fp \
             -o "/tmp/node$NODE_NUM.perf.data" \
-            ./target/$BUILD_DIR/ikada-server \
+            ./target/debug/ikada-server \
             --port "$PORT" \
             --storage-dir "$STORAGE_DIR" \
             --peers "$PEERS" \
@@ -48,7 +48,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
         echo $! > "/tmp/node$NODE_NUM.pid"
         echo "Started node $NODE_NUM on port $PORT with profiling (PID: $!)"
     else
-        RUST_LOG=$LOG_LEVEL ./target/$BUILD_DIR/ikada-server \
+        RUST_LOG=$LOG_LEVEL ./target/debug/ikada-server \
             --port "$PORT" \
             --storage-dir "$STORAGE_DIR" \
             --peers "$PEERS" \
@@ -68,7 +68,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     CLUSTER_ARGS="$CLUSTER_ARGS --cluster 127.0.0.1:$PORT"
 done
 
-RUST_LOG=$LOG_LEVEL ./target/$BUILD_DIR/ikada-memcache \
+RUST_LOG=$LOG_LEVEL ./target/debug/ikada-memcache \
     --listen "0.0.0.0:$MEMCACHED_PORT" \
     $CLUSTER_ARGS \
     > /tmp/memcached.log 2>&1 &
