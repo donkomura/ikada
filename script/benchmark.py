@@ -9,6 +9,7 @@ and optional graphs using matplotlib.
 import argparse
 import csv
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -16,6 +17,8 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, stdev
+
+import structlog
 
 try:
     import matplotlib.pyplot as plt
@@ -52,6 +55,24 @@ def get_git_info() -> dict:
     return info
 
 
+def setup_run_logger(output_dir: Path, run_number: int):
+    """Setup a structured logger for a single benchmark run."""
+    log_file = output_dir / f"run_{run_number}.log"
+    log_file_handle = open(log_file, 'w')
+
+    structlog.configure(
+        processors=[
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
+        context_class=dict,
+        logger_factory=structlog.WriteLoggerFactory(file=log_file_handle),
+        cache_logger_on_first_use=False,
+    )
+    return structlog.get_logger(), log_file_handle
+
+
 def run_benchmark(
     host: str,
     port: int,
@@ -67,7 +88,6 @@ def run_benchmark(
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
         json_file = f.name
 
-    log_file = output_dir / f"run_{run_number}.log"
     start_time = datetime.now()
 
     cmd = [
@@ -83,24 +103,7 @@ def run_benchmark(
         f"--json-out-file={json_file}",
     ]
 
-    def write_log(status: str, exit_code: int, duration: float, stdout: str, stderr: str, error: str = ""):
-        """Write execution log to file."""
-        with open(log_file, "w") as f:
-            f.write("=" * 50 + "\n")
-            f.write(f"Benchmark Run {run_number}\n")
-            f.write("=" * 50 + "\n")
-            f.write(f"Timestamp: {start_time.isoformat()}\n")
-            f.write(f"Command: {' '.join(cmd)}\n")
-            f.write(f"Timeout: {timeout}s\n")
-            f.write(f"Status: {status}\n")
-            f.write(f"Exit Code: {exit_code}\n")
-            f.write(f"Duration: {duration:.1f}s\n")
-            if error:
-                f.write(f"Error: {error}\n")
-            f.write("\nSTDOUT:\n")
-            f.write(stdout if stdout else "(empty)\n")
-            f.write("\nSTDERR:\n")
-            f.write(stderr if stderr else "(empty)\n")
+    logger, log_file_handle = setup_run_logger(output_dir, run_number)
 
     try:
         result = subprocess.run(
@@ -111,7 +114,18 @@ def run_benchmark(
             timeout=timeout
         )
         duration = (datetime.now() - start_time).total_seconds()
-        write_log("SUCCESS", 0, duration, result.stdout, result.stderr)
+
+        logger.info(
+            "benchmark_completed",
+            run_number=run_number,
+            status="SUCCESS",
+            exit_code=0,
+            duration=round(duration, 1),
+            command=' '.join(cmd),
+            timeout=timeout,
+            stdout=result.stdout if result.stdout else "",
+            stderr=result.stderr if result.stderr else "",
+        )
 
         with open(json_file) as f:
             data = json.load(f)
@@ -136,22 +150,63 @@ def run_benchmark(
         duration = (datetime.now() - start_time).total_seconds()
         stdout = e.stdout.decode() if e.stdout else ""
         stderr = e.stderr.decode() if e.stderr else ""
-        write_log("TIMEOUT", -1, duration, stdout, stderr, f"Command timed out after {timeout} seconds")
+
+        logger.warning(
+            "benchmark_timeout",
+            run_number=run_number,
+            status="TIMEOUT",
+            exit_code=-1,
+            duration=round(duration, 1),
+            command=' '.join(cmd),
+            timeout=timeout,
+            error=f"Command timed out after {timeout} seconds",
+            stdout=stdout,
+            stderr=stderr,
+        )
+
         raise TimeoutError(f"Benchmark timed out after {timeout}s")
 
     except subprocess.CalledProcessError as e:
         duration = (datetime.now() - start_time).total_seconds()
-        write_log("FAILED", e.returncode, duration, e.stdout, e.stderr, str(e))
+
+        logger.error(
+            "benchmark_failed",
+            run_number=run_number,
+            status="FAILED",
+            exit_code=e.returncode,
+            duration=round(duration, 1),
+            command=' '.join(cmd),
+            timeout=timeout,
+            error=str(e),
+            stdout=e.stdout if e.stdout else "",
+            stderr=e.stderr if e.stderr else "",
+        )
+
         raise
 
     except (json.JSONDecodeError, KeyError, FileNotFoundError) as e:
         duration = (datetime.now() - start_time).total_seconds()
-        write_log("FAILED", -1, duration, "", "", f"Failed to parse results: {e}")
+
+        logger.error(
+            "benchmark_parse_error",
+            run_number=run_number,
+            status="FAILED",
+            exit_code=-1,
+            duration=round(duration, 1),
+            command=' '.join(cmd),
+            timeout=timeout,
+            error=f"Failed to parse results: {e}",
+            stdout="",
+            stderr="",
+        )
+
         raise
 
     finally:
         if os.path.exists(json_file):
             os.unlink(json_file)
+
+        log_file_handle.close()
 
 
 def calculate_stats(results: list[dict]) -> dict:
