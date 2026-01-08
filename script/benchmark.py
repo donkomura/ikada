@@ -290,36 +290,6 @@ def generate_graphs(results: list[dict], stats: dict, output_dir: Path) -> None:
     print(f"Graph saved to {output_dir / 'benchmark_summary.png'}")
 
 
-def print_summary(stats: dict, config: dict) -> None:
-    """Print benchmark summary to console."""
-    print("\n" + "=" * 60)
-    print("BENCHMARK SUMMARY")
-    print("=" * 60)
-    print(f"Git: {config['git']['branch']} ({config['git']['commit']})")
-    print(f"Runs: {config['runs']}, Test time: {config['test_time']}s")
-    print(f"Threads: {config['threads']}, Clients: {config['clients']}")
-    print()
-
-    print("Throughput (ops/sec):")
-    for metric in ["total_ops", "set_ops", "get_ops"]:
-        s = stats[metric]
-        name = metric.replace("_ops", "").capitalize()
-        print(f"  {name:8s}  avg: {s['avg']:8.2f}  min: {s['min']:8.2f}  max: {s['max']:8.2f}  stdev: {s['stdev']:6.2f}")
-
-    print()
-    print("Latency (ms):")
-    for metric, label in [
-        ("avg_latency", "Average"),
-        ("p50_latency", "p50"),
-        ("p99_latency", "p99"),
-        ("p999_latency", "p99.9"),
-    ]:
-        s = stats[metric]
-        print(f"  {label:8s}  avg: {s['avg']:8.2f}  min: {s['min']:8.2f}  max: {s['max']:8.2f}  stdev: {s['stdev']:6.2f}")
-
-    print("=" * 60)
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Run memtier_benchmark and generate statistics",
@@ -413,8 +383,6 @@ Examples:
         if not args.no_graph:
             generate_graphs(results, stats, output_dir)
 
-        # Print summary
-        print_summary(stats, config)
         print(f"\nAnalysis complete. Output saved to: {output_dir}")
         sys.exit(0)
 
@@ -536,10 +504,7 @@ Examples:
     if not args.no_graph:
         generate_graphs(results, stats, output_dir)
 
-    # Print summary
-    print_summary(stats, config)
-
-    print(f"\nAll outputs saved to: {output_dir}")
+    print(f"\nBenchmark complete. Output saved to: {output_dir}")
 
 
 if __name__ == "__main__":
