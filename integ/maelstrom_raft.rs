@@ -32,7 +32,7 @@ struct NodeInfo {
 /// ikada Raft state management
 struct RaftContext {
     state: Option<RaftStateHandle>,
-    cmd_tx: Option<mpsc::Sender<Command<KVCommand>>>,
+    cmd_tx: Option<mpsc::Sender<Command>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -388,7 +388,7 @@ impl MaelstromRaftNode {
 
     async fn get_command_channel(
         &self,
-    ) -> anyhow::Result<mpsc::Sender<Command<KVCommand>>> {
+    ) -> anyhow::Result<mpsc::Sender<Command>> {
         let context = self.raft_context.lock().await;
         context
             .cmd_tx

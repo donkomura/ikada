@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cluster_addrs = cli.parse_addresses()?;
 
-    let mut store: KVStore<()> = KVStore::connect(cluster_addrs).await?;
+    let mut store: KVStore = KVStore::connect(cluster_addrs).await?;
     println!("Connected to cluster. Type 'help' for commands.");
 
     repl(&mut store).await?;
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn repl(store: &mut KVStore<()>) -> anyhow::Result<()> {
+async fn repl(store: &mut KVStore) -> anyhow::Result<()> {
     use std::io::{self, Write};
 
     loop {
@@ -73,7 +73,7 @@ async fn repl(store: &mut KVStore<()>) -> anyhow::Result<()> {
 }
 
 async fn process_command(
-    store: &mut KVStore<()>,
+    store: &mut KVStore,
     input: &str,
 ) -> anyhow::Result<Option<String>> {
     let mut parts = input.split_whitespace();

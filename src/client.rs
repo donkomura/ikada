@@ -7,14 +7,13 @@ use crate::network::{NetworkFactory, TarpcNetworkFactory};
 use crate::rpc::{CommandRequest, RaftRpcTrait};
 use crate::statemachine::{KVCommand, KVResponse};
 
-pub struct RaftClient<T, NF: NetworkFactory<T>> {
+pub struct RaftClient<NF: NetworkFactory> {
     client: Arc<dyn RaftRpcTrait>,
     addr: SocketAddr,
     network_factory: NF,
-    _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T, NF: NetworkFactory<T>> RaftClient<T, NF> {
+impl<NF: NetworkFactory> RaftClient<NF> {
     pub async fn connect(
         addr: SocketAddr,
         network_factory: NF,
@@ -25,7 +24,6 @@ impl<T, NF: NetworkFactory<T>> RaftClient<T, NF> {
             client,
             addr,
             network_factory,
-            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -74,15 +72,14 @@ impl<T, NF: NetworkFactory<T>> RaftClient<T, NF> {
     }
 }
 
-pub struct KVStore<T> {
+pub struct KVStore {
     cluster_addrs: Vec<SocketAddr>,
-    current_client: Option<RaftClient<T, TarpcNetworkFactory>>,
+    current_client: Option<RaftClient<TarpcNetworkFactory>>,
     network_factory: TarpcNetworkFactory,
     current_addr_index: usize,
-    _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T> KVStore<T> {
+impl KVStore {
     pub async fn connect(
         cluster_addrs: Vec<SocketAddr>,
     ) -> anyhow::Result<Self> {
@@ -92,7 +89,6 @@ impl<T> KVStore<T> {
             current_client: None,
             network_factory,
             current_addr_index: 0,
-            _phantom: std::marker::PhantomData,
         };
 
         store.ensure_connection().await?;

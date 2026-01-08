@@ -368,7 +368,7 @@ mod tests {
             ));
         let state = Arc::new(Mutex::new(initial_state));
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command<bytes::Bytes>>(32);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(32);
         let (_heartbeat_tx, _heartbeat_rx) =
             mpsc::unbounded_channel::<(u32, u32)>();
         let (_client_tx, _client_rx) = mpsc::channel::<bytes::Bytes>(32);

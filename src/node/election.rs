@@ -25,7 +25,7 @@ where
         + serde::de::DeserializeOwned
         + 'static,
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
-    NF: NetworkFactory<T> + Clone + 'static,
+    NF: NetworkFactory + Clone + 'static,
 {
     /// Initiates an election by requesting votes from all peers.
     ///

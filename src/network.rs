@@ -6,7 +6,7 @@ use tarpc::{client, tokio_serde::formats::Json};
 use crate::rpc::{RaftRpcClient, RaftRpcTrait};
 
 #[async_trait]
-pub trait NetworkFactory<T>: Send + Sync {
+pub trait NetworkFactory: Send + Sync {
     async fn connect(
         &self,
         addr: SocketAddr,
@@ -53,7 +53,7 @@ impl Default for TarpcNetworkFactory {
 }
 
 #[async_trait]
-impl<T> NetworkFactory<T> for TarpcNetworkFactory {
+impl NetworkFactory for TarpcNetworkFactory {
     async fn connect(
         &self,
         addr: SocketAddr,
@@ -224,7 +224,7 @@ pub mod mock {
     }
 
     #[async_trait]
-    impl<T> NetworkFactory<T> for MockNetworkFactory {
+    impl NetworkFactory for MockNetworkFactory {
         async fn connect(
             &self,
             addr: SocketAddr,
@@ -310,9 +310,8 @@ mod tests {
         let factory = MockNetworkFactory::new();
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
-        let _ =
-            <MockNetworkFactory as NetworkFactory<()>>::connect(&factory, addr)
-                .await;
+        let _ = <MockNetworkFactory as NetworkFactory>::connect(&factory, addr)
+            .await;
 
         let calls = factory.get_connect_calls().await;
         assert_eq!(calls.len(), 1);
@@ -325,7 +324,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
         let result =
-            <MockNetworkFactory as NetworkFactory<()>>::connect(&factory, addr)
+            <MockNetworkFactory as NetworkFactory>::connect(&factory, addr)
                 .await;
 
         assert!(result.is_err());
@@ -345,14 +344,12 @@ mod tests {
         let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
 
-        let _ = <MockNetworkFactory as NetworkFactory<()>>::connect(
-            &factory, addr1,
-        )
-        .await;
-        let _ = <MockNetworkFactory as NetworkFactory<()>>::connect(
-            &factory, addr2,
-        )
-        .await;
+        let _ =
+            <MockNetworkFactory as NetworkFactory>::connect(&factory, addr1)
+                .await;
+        let _ =
+            <MockNetworkFactory as NetworkFactory>::connect(&factory, addr2)
+                .await;
 
         let calls = factory.get_connect_calls().await;
         assert_eq!(calls.len(), 2);
@@ -368,7 +365,7 @@ mod tests {
 
         assert!(!factory.is_partitioned(addr1, addr2).await);
 
-        <MockNetworkFactory as NetworkFactory<()>>::partition(
+        <MockNetworkFactory as NetworkFactory>::partition(
             &factory, addr1, addr2,
         )
         .await;
@@ -383,16 +380,14 @@ mod tests {
         let addr1: SocketAddr = "127.0.0.1:8001".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:8002".parse().unwrap();
 
-        <MockNetworkFactory as NetworkFactory<()>>::partition(
+        <MockNetworkFactory as NetworkFactory>::partition(
             &factory, addr1, addr2,
         )
         .await;
         assert!(factory.is_partitioned(addr1, addr2).await);
 
-        <MockNetworkFactory as NetworkFactory<()>>::heal(
-            &factory, addr1, addr2,
-        )
-        .await;
+        <MockNetworkFactory as NetworkFactory>::heal(&factory, addr1, addr2)
+            .await;
         assert!(!factory.is_partitioned(addr1, addr2).await);
     }
 
@@ -403,16 +398,16 @@ mod tests {
         let addr2: SocketAddr = "127.0.0.1:8002".parse().unwrap();
         let addr3: SocketAddr = "127.0.0.1:8003".parse().unwrap();
 
-        <MockNetworkFactory as NetworkFactory<()>>::partition(
+        <MockNetworkFactory as NetworkFactory>::partition(
             &factory, addr1, addr2,
         )
         .await;
-        <MockNetworkFactory as NetworkFactory<()>>::partition(
+        <MockNetworkFactory as NetworkFactory>::partition(
             &factory, addr1, addr3,
         )
         .await;
 
-        <MockNetworkFactory as NetworkFactory<()>>::heal_all(&factory).await;
+        <MockNetworkFactory as NetworkFactory>::heal_all(&factory).await;
 
         assert!(!factory.is_partitioned(addr1, addr2).await);
         assert!(!factory.is_partitioned(addr1, addr3).await);

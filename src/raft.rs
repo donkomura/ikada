@@ -371,8 +371,7 @@ mod tests {
             follower_network_factory,
         );
 
-        let (follower_cmd_tx, follower_cmd_rx) =
-            mpsc::channel::<Command<bytes::Bytes>>(32);
+        let (follower_cmd_tx, follower_cmd_rx) = mpsc::channel::<Command>(32);
 
         let follower_handle = tokio::spawn(async move {
             follower_node
@@ -466,7 +465,7 @@ mod tests {
             network_factory,
         );
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command<KVCommand>>(32);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(32);
         let node_handle = tokio::spawn(async move {
             old_leader_node
                 .run_with_handler(vec![new_leader_addr], cmd_rx)
