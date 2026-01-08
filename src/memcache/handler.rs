@@ -11,12 +11,12 @@ struct MemcacheValue {
     data: Vec<u8>,
 }
 
-pub struct MemcacheHandler {
-    kv_store: Arc<Mutex<KVStore>>,
+pub struct MemcacheHandler<T> {
+    kv_store: Arc<Mutex<KVStore<T>>>,
 }
 
-impl MemcacheHandler {
-    pub fn new(kv_store: Arc<Mutex<KVStore>>) -> Self {
+impl<T> MemcacheHandler<T> {
+    pub fn new(kv_store: Arc<Mutex<KVStore<T>>>) -> Self {
         Self { kv_store }
     }
 

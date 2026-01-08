@@ -65,7 +65,7 @@ impl Clone for MaelstromNetworkFactory {
 }
 
 #[async_trait]
-impl NetworkFactory for MaelstromNetworkFactory {
+impl<T> NetworkFactory<T> for MaelstromNetworkFactory {
     async fn connect(
         &self,
         _addr: SocketAddr,

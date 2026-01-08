@@ -368,7 +368,7 @@ mod tests {
             ));
         let state = Arc::new(Mutex::new(initial_state));
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(32);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command<bytes::Bytes>>(32);
         let (_heartbeat_tx, _heartbeat_rx) =
             mpsc::unbounded_channel::<(u32, u32)>();
         let (_client_tx, _client_rx) = mpsc::channel::<bytes::Bytes>(32);
@@ -452,21 +452,24 @@ mod tests {
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd3_new"[..],
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 },
                 LogEntry {
                     term: 3,
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd4_new"[..],
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 },
                 LogEntry {
                     term: 3,
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd5_new"[..],
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 },
             ],
             leader_commit: 0,
@@ -530,14 +533,16 @@ mod tests {
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd3"[..],
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 },
                 LogEntry {
                     term: 2,
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd4"[..],
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 },
             ],
             leader_commit: 0,
@@ -653,7 +658,8 @@ mod tests {
                 command: bincode::serialize(&bytes::Bytes::from(
                     &b"cmd2_new"[..],
                 ))
-                .unwrap(),
+                .unwrap()
+                .into(),
             }],
             leader_commit: 0,
         };
@@ -911,7 +917,8 @@ mod tests {
             entries: vec![LogEntry {
                 term: 2,
                 command: bincode::serialize(&bytes::Bytes::from(&b"cmd2"[..]))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
             }],
             leader_commit: 2,
         };
@@ -1003,14 +1010,16 @@ mod tests {
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd1"[..],
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 },
                 LogEntry {
                     term: 1,
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd2"[..],
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 },
             ],
             leader_commit: 0,
@@ -1071,14 +1080,16 @@ mod tests {
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd4_new"[..],
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 },
                 LogEntry {
                     term: 3,
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd5_new"[..],
                     ))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 },
             ],
             leader_commit: 0,

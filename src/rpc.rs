@@ -1,10 +1,35 @@
+use std::sync::Arc;
 use tarpc::serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "tarpc::serde")]
 pub struct LogEntry {
     pub term: u32,
-    pub command: Vec<u8>,
+    #[serde(with = "arc_bytes")]
+    pub command: Arc<[u8]>,
+}
+
+mod arc_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::sync::Arc;
+
+    pub fn serialize<S>(
+        arc: &Arc<[u8]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        arc.as_ref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Arc<[u8]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec = Vec::<u8>::deserialize(deserializer)?;
+        Ok(Arc::from(vec.into_boxed_slice()))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

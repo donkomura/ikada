@@ -32,7 +32,7 @@ struct NodeInfo {
 /// ikada Raft state management
 struct RaftContext {
     state: Option<RaftStateHandle>,
-    cmd_tx: Option<mpsc::Sender<Command>>,
+    cmd_tx: Option<mpsc::Sender<Command<KVCommand>>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -388,7 +388,7 @@ impl MaelstromRaftNode {
 
     async fn get_command_channel(
         &self,
-    ) -> anyhow::Result<mpsc::Sender<Command>> {
+    ) -> anyhow::Result<mpsc::Sender<Command<KVCommand>>> {
         let context = self.raft_context.lock().await;
         context
             .cmd_tx
@@ -933,7 +933,10 @@ impl MaelstromRaftNode {
                 let command = base64::engine::general_purpose::STANDARD
                     .decode(command_b64)
                     .ok()?;
-                Some(LogEntry { term, command })
+                Some(LogEntry {
+                    term,
+                    command: std::sync::Arc::from(command.into_boxed_slice()),
+                })
             })
             .collect();
 

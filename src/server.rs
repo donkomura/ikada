@@ -16,10 +16,13 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Starts the RPC server on the specified port.
 /// Listens for incoming tarpc connections and dispatches to RaftServer handlers.
-pub async fn rpc_server(
-    tx: mpsc::Sender<Command>,
+pub async fn rpc_server<T>(
+    tx: mpsc::Sender<Command<T>>,
     port: u16,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    T: Clone + Send + 'static,
+{
     let addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let mut listener =
         tarpc::serde_transport::tcp::listen(&addr, Json::default)
@@ -45,11 +48,14 @@ pub async fn rpc_server(
 
 /// RPC server implementation that forwards requests to the node via channels.
 #[derive(Clone)]
-struct RaftServer {
-    tx: mpsc::Sender<Command>,
+struct RaftServer<T>
+where
+    T: Clone + Send,
+{
+    tx: mpsc::Sender<Command<T>>,
 }
 
-impl RaftRpc for RaftServer {
+impl<T: Clone + Send + 'static> RaftRpc for RaftServer<T> {
     #[tracing::instrument(skip(self, _ctx), fields(term = req.term, leader_id = req.leader_id, entries_count = req.entries.len()))]
     async fn append_entries(
         self,

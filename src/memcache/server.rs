@@ -4,12 +4,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-pub struct MemcacheServer {
-    handler: Arc<MemcacheHandler>,
+pub struct MemcacheServer<T> {
+    handler: Arc<MemcacheHandler<T>>,
 }
 
-impl MemcacheServer {
-    pub fn new(handler: Arc<MemcacheHandler>) -> Self {
+impl<T: 'static + Send> MemcacheServer<T> {
+    pub fn new(handler: Arc<MemcacheHandler<T>>) -> Self {
         Self { handler }
     }
 
@@ -35,9 +35,9 @@ impl MemcacheServer {
     }
 }
 
-async fn handle_connection(
+async fn handle_connection<T>(
     socket: TcpStream,
-    handler: Arc<MemcacheHandler>,
+    handler: Arc<MemcacheHandler<T>>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);

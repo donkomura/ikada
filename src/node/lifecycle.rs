@@ -23,7 +23,7 @@ where
         + serde::de::DeserializeOwned
         + 'static,
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
-    NF: NetworkFactory + Clone + 'static,
+    NF: NetworkFactory<T> + Clone + 'static,
 {
     /// Main event loop that dispatches to role-specific handlers.
     /// Runs indefinitely until an error occurs.

@@ -32,7 +32,7 @@ where
         + serde::de::DeserializeOwned
         + 'static,
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
-    NF: NetworkFactory + Clone + 'static,
+    NF: NetworkFactory<T> + Clone + 'static,
 {
     /// Broadcasts AppendEntries RPCs to all followers.
     ///
@@ -218,7 +218,7 @@ where
                             bincode::serialize(&e.command).unwrap_or_default();
                         LogEntry {
                             term: e.term,
-                            command,
+                            command: Arc::from(command.into_boxed_slice()),
                         }
                     })
                     .collect();
@@ -802,7 +802,10 @@ mod tests {
             .register_mock_client(addr2, Arc::new(MockRpcClient))
             .await;
 
-        let client = factory.connect(addr2).await?;
+        let client = <MockNetworkFactory as crate::network::NetworkFactory<
+            (),
+        >>::connect(&factory, addr2)
+        .await?;
 
         let req = AppendEntriesRequest {
             term: 1,
@@ -822,7 +825,10 @@ mod tests {
             result
         );
 
-        factory.partition(addr1, addr2).await;
+        <MockNetworkFactory as crate::network::NetworkFactory<()>>::partition(
+            &factory, addr1, addr2,
+        )
+        .await;
 
         let result = client
             .append_entries(tarpc::context::current(), req.clone())
@@ -839,7 +845,10 @@ mod tests {
             err_msg
         );
 
-        factory.heal(addr1, addr2).await;
+        <MockNetworkFactory as crate::network::NetworkFactory<()>>::heal(
+            &factory, addr1, addr2,
+        )
+        .await;
 
         let result =
             client.append_entries(tarpc::context::current(), req).await;

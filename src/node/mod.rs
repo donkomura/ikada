@@ -26,12 +26,14 @@ use tracing::Instrument;
 /// Command represents RPC requests with response channels.
 /// This enum exists to bridge the RPC server (which receives requests)
 /// and the consensus logic (which processes them asynchronously).
-pub enum Command {
+pub enum Command<T> {
     AppendEntries(
         AppendEntriesRequest,
         oneshot::Sender<AppendEntriesResponse>,
         tracing::Span,
     ),
+    #[allow(dead_code)]
+    _Phantom(std::marker::PhantomData<T>),
     RequestVote(
         RequestVoteRequest,
         oneshot::Sender<RequestVoteResponse>,
@@ -102,7 +104,7 @@ impl Chan {
 pub struct Node<
     T: Send + Sync,
     SM: StateMachine<Command = T>,
-    NF: NetworkFactory,
+    NF: NetworkFactory<T>,
 > {
     pub config: Config,
     pub peers: HashMap<SocketAddr, Arc<dyn RaftRpcTrait>>,
@@ -123,7 +125,7 @@ where
         + serde::de::DeserializeOwned
         + 'static,
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
-    NF: NetworkFactory + Clone + 'static,
+    NF: NetworkFactory<T> + Clone + 'static,
 {
     /// Creates a new Raft node.
     /// Port is used as node ID for simplicity in testing/demo scenarios.
@@ -246,7 +248,7 @@ where
     {
         use tracing::Instrument;
 
-        let (tx, rx) = mpsc::channel::<Command>(32);
+        let (tx, rx) = mpsc::channel::<Command<T>>(32);
         let mut workers = JoinSet::new();
         workers.spawn(
             self.run_with_handler(servers, rx)
@@ -272,7 +274,7 @@ where
     pub async fn run_with_handler(
         mut self,
         servers: Vec<SocketAddr>,
-        cmd_rx: mpsc::Receiver<Command>,
+        cmd_rx: mpsc::Receiver<Command<T>>,
     ) -> anyhow::Result<()>
     where
         T: Default,
@@ -304,7 +306,7 @@ where
     /// Runs in a separate task to avoid blocking the main consensus loop.
     pub(crate) async fn rpc_handler(
         state: Arc<Mutex<RaftState<T, SM>>>,
-        mut rx: mpsc::Receiver<Command>,
+        mut rx: mpsc::Receiver<Command<T>>,
         heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
         client_request_tx: mpsc::UnboundedSender<(
             CommandRequest,
@@ -460,6 +462,13 @@ where
                                 heartbeat_tx.send((req.term, req.leader_id));
                         }
                     }.instrument(span));
+                }
+                Command::_Phantom(_) => {
+                    // This variant is never actually constructed; it exists only to satisfy
+                    // the type parameter requirement
+                    unreachable!(
+                        "_Phantom variant should never be instantiated"
+                    )
                 }
             }
         }
