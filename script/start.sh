@@ -35,11 +35,12 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
 
     mkdir -p "$STORAGE_DIR"
 
+    BUILD_TYPE=${BUILD_TYPE:-debug}
     if [ "$PROFILE" = "true" ]; then
         # Start with perf profiling
-        RUST_LOG=$LOG_LEVEL perf record -F 99 -g --call-graph fp \
+        RUST_LOG=$LOG_LEVEL perf record -F 99 -g --call-graph dwarf \
             -o "/tmp/node$NODE_NUM.perf.data" \
-            ./target/debug/ikada-server \
+            ./target/$BUILD_TYPE/ikada-server \
             --port "$PORT" \
             --storage-dir "$STORAGE_DIR" \
             --peers "$PEERS" \
@@ -48,7 +49,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
         echo $! > "/tmp/node$NODE_NUM.pid"
         echo "Started node $NODE_NUM on port $PORT with profiling (PID: $!)"
     else
-        RUST_LOG=$LOG_LEVEL ./target/debug/ikada-server \
+        RUST_LOG=$LOG_LEVEL ./target/$BUILD_TYPE/ikada-server \
             --port "$PORT" \
             --storage-dir "$STORAGE_DIR" \
             --peers "$PEERS" \
@@ -68,7 +69,8 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     CLUSTER_ARGS="$CLUSTER_ARGS --cluster 127.0.0.1:$PORT"
 done
 
-RUST_LOG=$LOG_LEVEL ./target/debug/ikada-memcache \
+BUILD_TYPE=${BUILD_TYPE:-debug}
+RUST_LOG=$LOG_LEVEL ./target/$BUILD_TYPE/ikada-memcache \
     --listen "0.0.0.0:$MEMCACHED_PORT" \
     $CLUSTER_ARGS \
     > /tmp/memcached.log 2>&1 &

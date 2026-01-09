@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     tracing::info!("Connecting to Raft cluster: {:?}", args.cluster);
-    let kv_store = KVStore::connect(args.cluster).await?;
+    let kv_store: KVStore = KVStore::connect(args.cluster).await?;
 
     let handler =
         Arc::new(MemcacheHandler::new(Arc::new(Mutex::new(kv_store))));

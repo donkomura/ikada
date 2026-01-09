@@ -310,7 +310,8 @@ mod tests {
         let factory = MockNetworkFactory::new();
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
-        let _ = factory.connect(addr).await;
+        let _ = <MockNetworkFactory as NetworkFactory>::connect(&factory, addr)
+            .await;
 
         let calls = factory.get_connect_calls().await;
         assert_eq!(calls.len(), 1);
@@ -322,7 +323,9 @@ mod tests {
         let factory = MockNetworkFactory::with_failure();
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
-        let result = factory.connect(addr).await;
+        let result =
+            <MockNetworkFactory as NetworkFactory>::connect(&factory, addr)
+                .await;
 
         assert!(result.is_err());
         if let Err(err) = result {
@@ -341,8 +344,12 @@ mod tests {
         let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
 
-        let _ = factory.connect(addr1).await;
-        let _ = factory.connect(addr2).await;
+        let _ =
+            <MockNetworkFactory as NetworkFactory>::connect(&factory, addr1)
+                .await;
+        let _ =
+            <MockNetworkFactory as NetworkFactory>::connect(&factory, addr2)
+                .await;
 
         let calls = factory.get_connect_calls().await;
         assert_eq!(calls.len(), 2);
@@ -358,7 +365,10 @@ mod tests {
 
         assert!(!factory.is_partitioned(addr1, addr2).await);
 
-        factory.partition(addr1, addr2).await;
+        <MockNetworkFactory as NetworkFactory>::partition(
+            &factory, addr1, addr2,
+        )
+        .await;
 
         assert!(factory.is_partitioned(addr1, addr2).await);
         assert!(factory.is_partitioned(addr2, addr1).await);
@@ -370,10 +380,14 @@ mod tests {
         let addr1: SocketAddr = "127.0.0.1:8001".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:8002".parse().unwrap();
 
-        factory.partition(addr1, addr2).await;
+        <MockNetworkFactory as NetworkFactory>::partition(
+            &factory, addr1, addr2,
+        )
+        .await;
         assert!(factory.is_partitioned(addr1, addr2).await);
 
-        factory.heal(addr1, addr2).await;
+        <MockNetworkFactory as NetworkFactory>::heal(&factory, addr1, addr2)
+            .await;
         assert!(!factory.is_partitioned(addr1, addr2).await);
     }
 
@@ -384,10 +398,16 @@ mod tests {
         let addr2: SocketAddr = "127.0.0.1:8002".parse().unwrap();
         let addr3: SocketAddr = "127.0.0.1:8003".parse().unwrap();
 
-        factory.partition(addr1, addr2).await;
-        factory.partition(addr1, addr3).await;
+        <MockNetworkFactory as NetworkFactory>::partition(
+            &factory, addr1, addr2,
+        )
+        .await;
+        <MockNetworkFactory as NetworkFactory>::partition(
+            &factory, addr1, addr3,
+        )
+        .await;
 
-        factory.heal_all().await;
+        <MockNetworkFactory as NetworkFactory>::heal_all(&factory).await;
 
         assert!(!factory.is_partitioned(addr1, addr2).await);
         assert!(!factory.is_partitioned(addr1, addr3).await);

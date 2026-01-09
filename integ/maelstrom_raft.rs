@@ -933,7 +933,10 @@ impl MaelstromRaftNode {
                 let command = base64::engine::general_purpose::STANDARD
                     .decode(command_b64)
                     .ok()?;
-                Some(LogEntry { term, command })
+                Some(LogEntry {
+                    term,
+                    command: std::sync::Arc::from(command.into_boxed_slice()),
+                })
             })
             .collect();
 

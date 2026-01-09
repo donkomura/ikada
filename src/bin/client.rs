@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
         "127.0.0.1:1113".parse()?,
     ];
 
-    let mut store = KVStore::connect(cluster_addrs).await?;
+    let mut store: KVStore = KVStore::connect(cluster_addrs).await?;
     tracing::info!("Connected to cluster");
 
     store.set("name".to_string(), "Alice".to_string()).await?;

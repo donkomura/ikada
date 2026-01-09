@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cluster_addrs = cli.parse_addresses()?;
 
-    let mut store = KVStore::connect(cluster_addrs).await?;
+    let mut store: KVStore = KVStore::connect(cluster_addrs).await?;
     println!("Connected to cluster. Type 'help' for commands.");
 
     repl(&mut store).await?;
