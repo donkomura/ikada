@@ -329,10 +329,9 @@ def generate_graphs(results: list[dict], stats: dict, output_dir: Path) -> None:
     fig.suptitle(f'Benchmark Results Summary ({len(results)} runs)',
                 fontsize=14, fontweight='bold', y=0.98)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(output_dir / "benchmark_summary.png", dpi=150, bbox_inches='tight')
+    graph_path = output_dir / "benchmark_summary.png"
+    fig.savefig(graph_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-
-    print(f"Graph saved to {output_dir / 'benchmark_summary.png'}")
 
 
 def main():
@@ -365,10 +364,8 @@ Examples:
     if args.analyze:
         csv_path = Path(args.analyze)
         if not csv_path.exists():
-            print(f"Error: CSV file not found: {csv_path}")
+            print(f"Error: CSV file not found: {csv_path}", file=sys.stderr)
             sys.exit(1)
-
-        print(f"Analyzing existing results from: {csv_path}")
 
         # Load CSV data
         results = []
@@ -388,7 +385,7 @@ Examples:
                 })
 
         if not results:
-            print("Error: No data found in CSV file")
+            print("Error: No data found in CSV file", file=sys.stderr)
             sys.exit(1)
 
         # Calculate statistics
@@ -422,13 +419,12 @@ Examples:
         summary_path = output_dir / "summary.json"
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
-        print(f"Summary saved to {summary_path}")
 
         # Generate graphs
         if not args.no_graph:
             generate_graphs(results, stats, output_dir)
 
-        print(f"\nAnalysis complete. Output saved to: {output_dir}")
+        print(f"Analysis complete. Output saved to: {output_dir}")
         sys.exit(0)
 
     # Normal benchmark mode
@@ -436,8 +432,8 @@ Examples:
     try:
         subprocess.run(["memtier_benchmark", "--version"], capture_output=True, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Error: memtier_benchmark not found")
-        print("Install with: apt-get install memtier-benchmark")
+        print("Error: memtier_benchmark not found", file=sys.stderr)
+        print("Install with: apt-get install memtier-benchmark", file=sys.stderr)
         sys.exit(1)
 
     # Create output directory
@@ -504,17 +500,17 @@ Examples:
             print(f"done (total: {result['total_ops']:.2f} ops/sec, latency: {result['avg_latency']:.2f} ms)")
             print(f"  Log: {log_path}")
         except TimeoutError:
-            print(f"TIMEOUT ({timeout}s exceeded)")
-            print(f"  Log: {log_path}")
+            print(f"TIMEOUT ({timeout}s exceeded)", file=sys.stderr)
+            print(f"  Log: {log_path}", file=sys.stderr)
             continue
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr.strip() if e.stderr else str(e)
-            print(f"FAILED: {error_msg.split(chr(10))[0][:60]}")
-            print(f"  Log: {log_path}")
+            print(f"FAILED: {error_msg.split(chr(10))[0][:60]}", file=sys.stderr)
+            print(f"  Log: {log_path}", file=sys.stderr)
             continue
         except Exception as e:
-            print(f"ERROR: {str(e)[:60]}")
-            print(f"  Log: {log_path}")
+            print(f"ERROR: {str(e)[:60]}", file=sys.stderr)
+            print(f"  Log: {log_path}", file=sys.stderr)
             continue
 
         if i < args.runs:
@@ -523,7 +519,7 @@ Examples:
             time.sleep(5)
 
     if not results:
-        print("Error: No successful benchmark runs")
+        print("Error: No successful benchmark runs", file=sys.stderr)
         sys.exit(1)
 
     # Calculate statistics
@@ -532,7 +528,6 @@ Examples:
     # Write CSV
     csv_path = output_dir / "results.csv"
     write_csv(results, csv_path)
-    print(f"\nCSV saved to {csv_path}")
 
     # Write summary JSON
     summary = {
@@ -543,13 +538,12 @@ Examples:
     summary_path = output_dir / "summary.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"Summary saved to {summary_path}")
 
     # Generate graphs
     if not args.no_graph:
         generate_graphs(results, stats, output_dir)
 
-    print(f"\nBenchmark complete. Output saved to: {output_dir}")
+    print(f"Benchmark complete. Output saved to: {output_dir}")
 
 
 if __name__ == "__main__":
