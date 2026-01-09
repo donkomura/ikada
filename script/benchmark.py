@@ -19,12 +19,8 @@ from pathlib import Path
 from statistics import mean, stdev
 
 import structlog
-
-try:
-    import matplotlib.pyplot as plt
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 def get_git_info() -> dict:
@@ -265,12 +261,6 @@ def write_csv(results: list[dict], filepath: Path) -> None:
 
 def generate_graphs(results: list[dict], stats: dict, output_dir: Path) -> None:
     """Generate benchmark graphs using matplotlib."""
-    if not HAS_MATPLOTLIB:
-        print("matplotlib not available, skipping graph generation")
-        return
-
-    import numpy as np
-
     # Create a single figure with 3 subplots
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
