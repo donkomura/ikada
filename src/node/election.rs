@@ -9,6 +9,7 @@ use super::Node;
 use crate::network::NetworkFactory;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
+use anyhow::Context;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,8 +61,7 @@ where
             )
         };
 
-        let is_granted =
-            { voted_for.is_none() || (voted_for.unwrap() == candidate_id) };
+        let is_granted = voted_for.map(|v| v == candidate_id).unwrap_or(true);
 
         if !is_granted {
             tracing::info!(
@@ -155,7 +155,7 @@ where
             );
             {
                 let mut state = self.state.lock().await;
-                let new_term = new_terms.first().unwrap().term;
+                let new_term = new_terms[0].term;
                 state.persistent.current_term = new_term;
                 state.become_follower(new_term, None);
             }
@@ -195,7 +195,10 @@ where
                 if let Some(leader_state) = state.role.leader_state_mut() {
                     leader_state.noop_index = Some(noop_idx);
                 }
-                state.persist().await?;
+                state
+                    .persist()
+                    .await
+                    .context("failed to persist state after leader election")?;
 
                 tracing::info!(
                     id = ?state.id,

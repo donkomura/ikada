@@ -11,6 +11,7 @@
 use crate::raft::RaftState;
 use crate::rpc::{InstallSnapshotRequest, InstallSnapshotResponse};
 use crate::statemachine::StateMachine;
+use anyhow::Context;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -45,7 +46,13 @@ where
             req.last_included_term,
             &req.data,
         )
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "failed to install snapshot (last_included_index={}, last_included_term={})",
+                req.last_included_index, req.last_included_term
+            )
+        })?;
 
     Ok(InstallSnapshotResponse {
         term: state.persistent.current_term,

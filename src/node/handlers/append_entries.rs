@@ -2,6 +2,7 @@ use crate::raft::{self, RaftState};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use crate::types::{LogIndex, NodeId, Term};
+use anyhow::Context;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -80,8 +81,14 @@ where
             }));
         }
 
-        let prev_log_entry =
-            &state.persistent.log[prev_log_index.checked_prev_usize().unwrap()];
+        let prev_idx =
+            prev_log_index.checked_prev_usize().ok_or_else(|| {
+                AppendEntriesError::Internal(anyhow::anyhow!(
+                    "prev_log_index {} has no valid array index",
+                    prev_log_index
+                ))
+            })?;
+        let prev_log_entry = &state.persistent.log[prev_idx];
         if prev_log_entry.term != prev_log_term {
             tracing::warn!(
                 id=?state.id,
@@ -113,15 +120,13 @@ where
         let log_index = start_index + i as u32;
 
         if log_index <= state.get_last_log_idx() {
-            let existing_term = state.persistent.log
-                [log_index.checked_prev_usize().unwrap()]
-            .term;
+            let Some(arr_idx) = log_index.checked_prev_usize() else {
+                continue;
+            };
+            let existing_term = state.persistent.log[arr_idx].term;
 
             if existing_term != entry.term {
-                state
-                    .persistent
-                    .log
-                    .truncate(log_index.checked_prev_usize().unwrap());
+                state.persistent.log.truncate(arr_idx);
                 tracing::info!(
                     id=?state.id,
                     conflict_index=%log_index,
@@ -256,7 +261,10 @@ where
             last_applied=%state.last_applied,
             "Applying committed entries to state machine"
         );
-        state.apply_committed().await?;
+        state
+            .apply_committed()
+            .await
+            .context("failed to apply committed entries")?;
     }
 
     Ok(())

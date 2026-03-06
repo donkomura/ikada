@@ -1,6 +1,7 @@
 use crate::statemachine::StateMachine;
 use crate::storage::Storage;
 use crate::types::{LogIndex, NodeId, Term};
+use anyhow::Context;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -134,14 +135,20 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     }
 
     pub async fn persist(&mut self) -> anyhow::Result<()> {
-        self.storage.save(&self.persistent).await?;
+        self.storage
+            .save(&self.persistent)
+            .await
+            .context("failed to persist raft state")?;
         Ok(())
     }
 
     pub async fn load_persisted(
         &mut self,
     ) -> anyhow::Result<Option<PersistentState<T>>> {
-        self.storage.load().await
+        self.storage
+            .load()
+            .await
+            .context("failed to load persisted state")
     }
 
     pub fn restore_from(&mut self, persisted: PersistentState<T>) {
@@ -154,9 +161,24 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         let mut responses = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            let entry = &self.persistent.log
-                [self.last_applied.checked_prev_usize().unwrap()];
-            let response = self.state_machine.apply(&entry.command).await?;
+            let idx =
+                self.last_applied.checked_prev_usize().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "log index {} has no valid array index",
+                        self.last_applied
+                    )
+                })?;
+            let entry = &self.persistent.log[idx];
+            let response = self
+                .state_machine
+                .apply(&entry.command)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to apply log entry at index {}",
+                        self.last_applied
+                    )
+                })?;
 
             if let Some(apply_tx) = &self.apply_tx {
                 let _ = apply_tx.send((self.last_applied, response.clone()));
@@ -220,21 +242,34 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         }
 
         let last_included_index = self.last_applied;
+        let prev_usize = last_included_index.checked_prev_usize().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot create snapshot: last_applied index {} has no valid array index",
+                last_included_index
+            )
+        })?;
         let last_included_term = self
             .persistent
             .log
-            .get(last_included_index.checked_prev_usize().unwrap())
+            .get(prev_usize)
             .map(|e| e.term)
             .unwrap_or_default();
 
-        let data = self.state_machine.snapshot().await?;
+        let data = self
+            .state_machine
+            .snapshot()
+            .await
+            .context("failed to create state machine snapshot")?;
 
         let metadata = SnapshotMetadata {
             last_included_index,
             last_included_term,
         };
 
-        self.storage.save_snapshot(&metadata, &data).await?;
+        self.storage
+            .save_snapshot(&metadata, &data)
+            .await
+            .context("failed to save snapshot to storage")?;
 
         self.persistent.log.drain(0..last_included_index.as_usize());
 
@@ -242,10 +277,17 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     }
 
     pub async fn restore_from_snapshot(&mut self) -> anyhow::Result<bool> {
-        let snapshot = self.storage.load_snapshot().await?;
+        let snapshot = self
+            .storage
+            .load_snapshot()
+            .await
+            .context("failed to load snapshot from storage")?;
 
         if let Some((metadata, data)) = snapshot {
-            self.state_machine.restore(&data).await?;
+            self.state_machine
+                .restore(&data)
+                .await
+                .context("failed to restore state machine from snapshot")?;
 
             self.last_applied = metadata.last_included_index;
             self.commit_index = metadata.last_included_index;
@@ -300,7 +342,10 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             self.persistent.log.clear();
         }
 
-        self.state_machine.restore(data).await?;
+        self.state_machine
+            .restore(data)
+            .await
+            .context("failed to restore state machine from leader snapshot")?;
 
         self.commit_index = last_included_index;
         self.last_applied = last_included_index;
@@ -319,7 +364,10 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         &self,
     ) -> anyhow::Result<Option<(crate::snapshot::SnapshotMetadata, Vec<u8>)>>
     {
-        self.storage.load_snapshot().await
+        self.storage
+            .load_snapshot()
+            .await
+            .context("failed to load snapshot")
     }
 }
 

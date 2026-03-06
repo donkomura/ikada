@@ -38,8 +38,10 @@ where
                 "RequestVote rejected: candidate term is older"
             );
             false
-        } else if state.persistent.voted_for.is_some()
-            && state.persistent.voted_for.unwrap() != req.candidate_id
+        } else if state
+            .persistent
+            .voted_for
+            .is_some_and(|v| v != req.candidate_id)
         {
             tracing::warn!(
                 id=?state.id,

@@ -472,7 +472,9 @@ where
         &mut self,
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
-        let client = self.network_factory.connect(addr).await?;
+        let client = self.network_factory.connect(addr).await.map_err(|e| {
+            anyhow::anyhow!("failed to connect to peer {}: {}", addr, e)
+        })?;
         self.peers.insert(addr, client);
         Ok(())
     }
