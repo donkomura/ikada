@@ -7,11 +7,10 @@
 
 use super::Node;
 use crate::network::NetworkFactory;
-use crate::raft::{self};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use crate::types::{LogIndex, Term};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -394,38 +393,6 @@ where
         ))
     }
 
-    /// Calculates the new commit index based on match_index from peers.
-    /// Returns the highest index replicated on a majority of nodes in the current term (Raft §5.4.2).
-    fn new_commit_index(
-        current_commit_index: LogIndex,
-        current_term: Term,
-        log: &[raft::Entry<T>],
-        match_index: &HashMap<SocketAddr, LogIndex>,
-        peer_count: usize,
-    ) -> LogIndex {
-        let log_len = log.len() as u32;
-        let total_nodes = peer_count + 1;
-
-        let mut new_commit_index = current_commit_index;
-        for n in (current_commit_index.as_u32() + 1)..=log_len {
-            if log[(n - 1) as usize].term != current_term {
-                continue;
-            }
-            let mut count = 1;
-            let n_idx = LogIndex::new(n);
-            for match_idx in match_index.values() {
-                if *match_idx >= n_idx {
-                    count += 1;
-                }
-            }
-            let majority = total_nodes / 2;
-            if count > majority {
-                new_commit_index = n_idx;
-            }
-        }
-        new_commit_index
-    }
-
     /// Updates commit_index if a majority of nodes have replicated an entry.
     /// Only the leader can advance commit_index this way (Raft Figure 2).
     /// This is part of Step 8 (commit index calculation only, not state machine application).
@@ -444,7 +411,7 @@ where
         let current_commit_index = state.commit_index;
         let new_commit_index =
             if let Some(leader_state) = state.role.leader_state() {
-                Self::new_commit_index(
+                crate::core::log::new_commit_index(
                     state.commit_index,
                     state.persistent.current_term,
                     &state.persistent.log,
@@ -730,15 +697,10 @@ mod tests {
             }
         }
 
-        // new_commit_index()を直接テスト
         let new_commit_index = {
             let state = node.state.lock().await;
             if let Some(leader_state) = state.role.leader_state() {
-                Node::<
-                    bytes::Bytes,
-                    crate::statemachine::NoOpStateMachine,
-                    crate::network::mock::MockNetworkFactory,
-                >::new_commit_index(
+                crate::core::log::new_commit_index(
                     state.commit_index,
                     state.persistent.current_term,
                     &state.persistent.log,
