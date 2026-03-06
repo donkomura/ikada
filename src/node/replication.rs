@@ -59,7 +59,9 @@ where
 
             // Copy log and peer state data
             let log_entries = state.persistent.log.clone();
-            let leader_state = state.role.leader_state().unwrap();
+            let Some(leader_state) = state.role.leader_state() else {
+                return Ok(false);
+            };
             let plan: Vec<(SocketAddr, LogIndex, usize)> = self.peers
                 .keys()
                 .filter_map(|addr| {
@@ -118,9 +120,13 @@ where
                 })
                 .collect();
 
+            let Some(leader_id) = state.leader_id else {
+                return Ok(false);
+            };
+
             (
                 state.persistent.current_term,
-                state.leader_id.unwrap(),
+                leader_id,
                 state.commit_index,
                 log_entries,
                 plan,
@@ -135,7 +141,10 @@ where
 
         // Step 3: Spawn AppendEntries/InstallSnapshot tasks, filling the inflight window per follower.
         for (addr, mut next_idx, slots) in peer_plan {
-            let client = self.peers.get(&addr).unwrap().clone();
+            let Some(client) = self.peers.get(&addr).cloned() else {
+                tracing::warn!(peer = ?addr, "peer not found in connection map, skipping");
+                continue;
+            };
 
             for _ in 0..slots {
                 if next_idx > LogIndex::new(1)
@@ -221,12 +230,16 @@ where
                     .iter()
                     .skip(next_idx.checked_prev_usize().unwrap_or(0))
                     .take(max_entries)
-                    .map(|e| {
-                        let command =
-                            bincode::serialize(&e.command).unwrap_or_default();
-                        LogEntry {
-                            term: e.term,
-                            command: Arc::from(command.into_boxed_slice()),
+                    .filter_map(|e| {
+                        match bincode::serialize(&e.command) {
+                            Ok(command) => Some(LogEntry {
+                                term: e.term,
+                                command: Arc::from(command.into_boxed_slice()),
+                            }),
+                            Err(err) => {
+                                tracing::error!(error = ?err, "failed to serialize log entry command for replication");
+                                None
+                            }
                         }
                     })
                     .collect();

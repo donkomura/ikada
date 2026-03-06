@@ -7,6 +7,7 @@
 use crate::node::Command;
 use crate::rpc::*;
 use crate::types::Term;
+use anyhow::Context;
 use futures::{future, prelude::*};
 use std::net::{IpAddr, Ipv4Addr};
 use tarpc::{
@@ -25,12 +26,17 @@ pub async fn rpc_server(
     let mut listener =
         tarpc::serde_transport::tcp::listen(&addr, Json::default)
             .await
-            .expect("failed to start RPC server");
+            .context("failed to start RPC server")?;
     listener.config_mut().max_frame_length(usize::MAX);
     listener
         .filter_map(|r| future::ready(r.ok()))
         .map(server::BaseChannel::with_defaults)
-        .max_channels_per_key(10, |t| t.transport().peer_addr().unwrap().ip())
+        .max_channels_per_key(10, |t| {
+            t.transport()
+                .peer_addr()
+                .map(|a| a.ip())
+                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        })
         .for_each_concurrent(10, |channel| async {
             let server = RaftServer { tx: tx.clone() };
             channel

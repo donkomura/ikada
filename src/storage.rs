@@ -1,6 +1,6 @@
 use crate::raft::PersistentState;
 use crate::snapshot::SnapshotMetadata;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -118,10 +118,20 @@ where
 {
     async fn save(&mut self, state: &PersistentState<T>) -> Result<()> {
         if !self.base_dir.exists() {
-            fs::create_dir_all(&self.base_dir).await?;
+            fs::create_dir_all(&self.base_dir).await.with_context(|| {
+                format!(
+                    "failed to create storage directory {:?}",
+                    self.base_dir
+                )
+            })?;
         }
-        let serialized = bincode::serialize(state)?;
-        fs::write(self.state_path(), serialized).await?;
+        let serialized = bincode::serialize(state)
+            .context("failed to serialize persistent state")?;
+        fs::write(self.state_path(), serialized)
+            .await
+            .with_context(|| {
+                format!("failed to write state to {:?}", self.state_path())
+            })?;
         Ok(())
     }
 
@@ -130,8 +140,11 @@ where
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(path).await?;
-        let state: PersistentState<T> = bincode::deserialize(&bytes)?;
+        let bytes = fs::read(&path)
+            .await
+            .with_context(|| format!("failed to read state from {:?}", path))?;
+        let state: PersistentState<T> = bincode::deserialize(&bytes)
+            .context("failed to deserialize persistent state")?;
         Ok(Some(state))
     }
 
@@ -141,11 +154,31 @@ where
         data: &[u8],
     ) -> Result<()> {
         if !self.base_dir.exists() {
-            fs::create_dir_all(&self.base_dir).await?;
+            fs::create_dir_all(&self.base_dir).await.with_context(|| {
+                format!(
+                    "failed to create storage directory {:?}",
+                    self.base_dir
+                )
+            })?;
         }
-        let metadata_serialized = bincode::serialize(metadata)?;
-        fs::write(self.snapshot_metadata_path(), metadata_serialized).await?;
-        fs::write(self.snapshot_data_path(), data).await?;
+        let metadata_serialized = bincode::serialize(metadata)
+            .context("failed to serialize snapshot metadata")?;
+        fs::write(self.snapshot_metadata_path(), metadata_serialized)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to write snapshot metadata to {:?}",
+                    self.snapshot_metadata_path()
+                )
+            })?;
+        fs::write(self.snapshot_data_path(), data)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to write snapshot data to {:?}",
+                    self.snapshot_data_path()
+                )
+            })?;
         Ok(())
     }
 
@@ -159,9 +192,18 @@ where
             return Ok(None);
         }
 
-        let metadata_bytes = fs::read(metadata_path).await?;
-        let metadata: SnapshotMetadata = bincode::deserialize(&metadata_bytes)?;
-        let data = fs::read(data_path).await?;
+        let metadata_bytes =
+            fs::read(&metadata_path).await.with_context(|| {
+                format!(
+                    "failed to read snapshot metadata from {:?}",
+                    metadata_path
+                )
+            })?;
+        let metadata: SnapshotMetadata = bincode::deserialize(&metadata_bytes)
+            .context("failed to deserialize snapshot metadata")?;
+        let data = fs::read(&data_path).await.with_context(|| {
+            format!("failed to read snapshot data from {:?}", data_path)
+        })?;
 
         Ok(Some((metadata, data)))
     }

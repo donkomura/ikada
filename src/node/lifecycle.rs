@@ -11,6 +11,7 @@ use crate::raft::Role;
 use crate::statemachine::StateMachine;
 use crate::types::LogIndex;
 use crate::watchdog::WatchDog;
+use anyhow::Context;
 use std::net::SocketAddr;
 use tracing::Instrument;
 
@@ -79,7 +80,10 @@ where
                     {
                         let mut state = self.state.lock().await;
                         state.become_candidate();
-                        state.persist().await?;
+                        state
+                            .persist()
+                            .await
+                            .context("failed to persist state after becoming candidate")?;
                     }
                     break;
                 }
@@ -340,7 +344,9 @@ where
             }
 
             if appended_count > 0 {
-                state_guard.persist().await?;
+                state_guard.persist().await.context(
+                    "failed to persist state after batched log append",
+                )?;
             }
 
             drop(state_guard);

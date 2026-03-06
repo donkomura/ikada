@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -38,8 +39,10 @@ impl StateMachine for NoOpStateMachine {
     }
     async fn restore(&mut self, data: &[u8]) -> anyhow::Result<()> {
         if data.len() >= std::mem::size_of::<usize>() {
-            let bytes: [u8; std::mem::size_of::<usize>()] =
-                data[0..std::mem::size_of::<usize>()].try_into()?;
+            let bytes: [u8; std::mem::size_of::<usize>()] = data
+                [0..std::mem::size_of::<usize>()]
+                .try_into()
+                .context("failed to convert snapshot bytes to usize array")?;
             self.applied_count = usize::from_le_bytes(bytes);
         }
         Ok(())
@@ -118,12 +121,14 @@ impl StateMachine for KVStateMachine {
     }
 
     async fn snapshot(&self) -> anyhow::Result<Vec<u8>> {
-        let serialized = bincode::serialize(&self.data).unwrap();
+        let serialized = bincode::serialize(&self.data)
+            .context("failed to serialize KV state machine snapshot")?;
         Ok(serialized)
     }
 
     async fn restore(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        self.data = bincode::deserialize(data)?;
+        self.data = bincode::deserialize(data)
+            .context("failed to deserialize KV state machine snapshot")?;
         Ok(())
     }
 }
