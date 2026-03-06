@@ -4,7 +4,7 @@ use crate::statemachine::StateMachine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[tracing::instrument(skip(state), fields(term = req.term, candidate_id = req.candidate_id, last_log_index = req.last_log_index, last_log_term = req.last_log_term))]
+#[tracing::instrument(skip(state), fields(term = %req.term, candidate_id = %req.candidate_id, last_log_index = %req.last_log_index, last_log_term = %req.last_log_term))]
 pub async fn handle_request_vote<T, SM>(
     req: &RequestVoteRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
@@ -32,9 +32,9 @@ where
         let vote_granted = if req.term < state.persistent.current_term {
             tracing::warn!(
                 id=?state.id,
-                candidate_id=req.candidate_id,
-                req_term=req.term,
-                current_term=state.persistent.current_term,
+                candidate_id=%req.candidate_id,
+                req_term=%req.term,
+                current_term=%state.persistent.current_term,
                 "RequestVote rejected: candidate term is older"
             );
             false
@@ -43,7 +43,7 @@ where
         {
             tracing::warn!(
                 id=?state.id,
-                candidate_id=req.candidate_id,
+                candidate_id=%req.candidate_id,
                 voted_for=?state.persistent.voted_for,
                 "RequestVote rejected: already voted for another candidate"
             );
@@ -71,11 +71,11 @@ where
             } else {
                 tracing::warn!(
                     id=?state.id,
-                    candidate_id=req.candidate_id,
-                    req_last_log_term=req.last_log_term,
-                    req_last_log_index=req.last_log_index,
-                    last_log_term=last_log_term,
-                    last_log_idx=last_log_idx,
+                    candidate_id=%req.candidate_id,
+                    req_last_log_term=%req.last_log_term,
+                    req_last_log_index=%req.last_log_index,
+                    last_log_term=%last_log_term,
+                    last_log_idx=%last_log_idx,
                     "RequestVote rejected: candidate's log is not up-to-date"
                 );
                 false
@@ -95,6 +95,7 @@ where
 mod tests {
     use super::*;
     use crate::raft;
+    use crate::types::{LogIndex, NodeId, Term};
 
     fn create_test_storage<T: Send + Sync + Clone + 'static>()
     -> Box<dyn crate::storage::Storage<T>> {
@@ -109,11 +110,11 @@ mod tests {
     async fn test_request_vote_with_higher_term_converts_to_follower()
     -> anyhow::Result<()> {
         let mut initial_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.persistent.current_term = 50;
+        initial_state.persistent.current_term = Term::new(50);
         initial_state.role =
             crate::raft::Role::Leader(crate::raft::LeaderState::new(
                 &[],
@@ -122,16 +123,16 @@ mod tests {
         let state = Arc::new(Mutex::new(initial_state));
 
         let req = RequestVoteRequest {
-            term: 100,
-            candidate_id: 99999,
-            last_log_index: 0,
-            last_log_term: 0,
+            term: Term::new(100),
+            candidate_id: NodeId::new(99999),
+            last_log_index: LogIndex::new(0),
+            last_log_term: Term::new(0),
         };
 
         let _response = handle_request_vote(&req, state.clone()).await;
 
         let final_state = state.lock().await;
-        assert_eq!(final_state.persistent.current_term, 100);
+        assert_eq!(final_state.persistent.current_term, Term::new(100));
         assert!(final_state.role.is_follower());
 
         Ok(())
@@ -141,28 +142,28 @@ mod tests {
     async fn test_request_vote_rejected_by_older_log_term() -> anyhow::Result<()>
     {
         let mut initial_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.persistent.current_term = 10;
+        initial_state.persistent.current_term = Term::new(10);
         initial_state.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         let state = Arc::new(Mutex::new(initial_state));
 
         let req = RequestVoteRequest {
-            term: 10,
-            candidate_id: 2,
-            last_log_index: 1,
-            last_log_term: 3,
+            term: Term::new(10),
+            candidate_id: NodeId::new(2),
+            last_log_index: LogIndex::new(1),
+            last_log_term: Term::new(3),
         };
 
         let response = handle_request_vote(&req, state.clone()).await;
 
         assert!(!response.vote_granted);
-        assert_eq!(response.term, 10);
+        assert_eq!(response.term, Term::new(10));
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.voted_for, None);
@@ -174,93 +175,99 @@ mod tests {
     async fn test_request_vote_log_index_comparison_with_same_term()
     -> anyhow::Result<()> {
         let mut state1 = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        state1.persistent.current_term = 10;
+        state1.persistent.current_term = Term::new(10);
         state1.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         state1.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         state1.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         let state1 = Arc::new(Mutex::new(state1));
         let req1 = RequestVoteRequest {
-            term: 10,
-            candidate_id: 2,
-            last_log_index: 3,
-            last_log_term: 5,
+            term: Term::new(10),
+            candidate_id: NodeId::new(2),
+            last_log_index: LogIndex::new(3),
+            last_log_term: Term::new(5),
         };
         let response1 = handle_request_vote(&req1, state1.clone()).await;
         assert!(
             response1.vote_granted,
             "Same term and same index should grant vote"
         );
-        assert_eq!(state1.lock().await.persistent.voted_for, Some(2));
+        assert_eq!(
+            state1.lock().await.persistent.voted_for,
+            Some(NodeId::new(2))
+        );
 
         let mut state2 = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        state2.persistent.current_term = 10;
+        state2.persistent.current_term = Term::new(10);
         state2.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         state2.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         state2.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         let state2 = Arc::new(Mutex::new(state2));
         let req2 = RequestVoteRequest {
-            term: 10,
-            candidate_id: 3,
-            last_log_index: 5,
-            last_log_term: 5,
+            term: Term::new(10),
+            candidate_id: NodeId::new(3),
+            last_log_index: LogIndex::new(5),
+            last_log_term: Term::new(5),
         };
         let response2 = handle_request_vote(&req2, state2.clone()).await;
         assert!(
             response2.vote_granted,
             "Same term and longer index should grant vote"
         );
-        assert_eq!(state2.lock().await.persistent.voted_for, Some(3));
+        assert_eq!(
+            state2.lock().await.persistent.voted_for,
+            Some(NodeId::new(3))
+        );
 
         let mut state3 = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        state3.persistent.current_term = 10;
+        state3.persistent.current_term = Term::new(10);
         state3.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         state3.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         state3.persistent.log.push(raft::Entry {
-            term: 5,
+            term: Term::new(5),
             command: bytes::Bytes::new(),
         });
         let state3 = Arc::new(Mutex::new(state3));
         let req3 = RequestVoteRequest {
-            term: 10,
-            candidate_id: 4,
-            last_log_index: 2,
-            last_log_term: 5,
+            term: Term::new(10),
+            candidate_id: NodeId::new(4),
+            last_log_index: LogIndex::new(2),
+            last_log_term: Term::new(5),
         };
         let response3 = handle_request_vote(&req3, state3.clone()).await;
         assert!(

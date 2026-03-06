@@ -10,6 +10,7 @@ use crate::network::NetworkFactory;
 use crate::raft::{self};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
+use crate::types::{LogIndex, Term};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,8 +19,8 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 enum ReplicationResponse {
-    AppendEntries(AppendEntriesResponse, u32),
-    InstallSnapshot(InstallSnapshotResponse, u32),
+    AppendEntries(AppendEntriesResponse, LogIndex),
+    InstallSnapshot(InstallSnapshotResponse, LogIndex),
 }
 
 impl<T, SM, NF> Node<T, SM, NF>
@@ -46,7 +47,7 @@ where
     /// Raft Algorithm - Log Replication Step 3, 6-7:
     /// Step 3: Leader sends AppendEntries RPC to all followers in parallel
     /// Step 6-7: Receives Acks from followers
-    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
+    #[tracing::instrument(skip(self), fields(node_id = ?self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn broadcast_heartbeat(&mut self) -> anyhow::Result<bool> {
         // Lock once and copy all needed data
         let (leader_term, leader_id, leader_commit, log_data, peer_plan) = {
@@ -59,7 +60,7 @@ where
             // Copy log and peer state data
             let log_entries = state.persistent.log.clone();
             let leader_state = state.role.leader_state().unwrap();
-            let plan: Vec<(SocketAddr, u32, usize)> = self.peers
+            let plan: Vec<(SocketAddr, LogIndex, usize)> = self.peers
                 .keys()
                 .filter_map(|addr| {
                     let snapshot_inflight = leader_state
@@ -101,7 +102,7 @@ where
                                     .next_index
                                     .get(addr)
                                     .copied()
-                                    .unwrap_or(1)
+                                    .unwrap_or(LogIndex::new(1))
                             })
                             .saturating_add(1)
                     } else {
@@ -109,7 +110,7 @@ where
                             .next_index
                             .get(addr)
                             .copied()
-                            .unwrap_or(1)
+                            .unwrap_or(LogIndex::new(1))
                     };
 
                     let slots = max_inflight.saturating_sub(inflight_len);
@@ -137,10 +138,12 @@ where
             let client = self.peers.get(&addr).unwrap().clone();
 
             for _ in 0..slots {
-                if next_idx > 1 && (next_idx - 2) as usize >= log_data.len() {
+                if next_idx > LogIndex::new(1)
+                    && next_idx.saturating_sub(2).as_usize() >= log_data.len()
+                {
                     tracing::debug!(
                         peer = ?addr,
-                        next_idx = next_idx,
+                        next_idx = %next_idx,
                         log_len = log_data.len(),
                         "next_idx points to compacted log, sending snapshot"
                     );
@@ -170,7 +173,7 @@ where
                                         .insert(addr, true);
                                     tracing::debug!(
                                         peer = ?addr,
-                                        last_included_index = metadata.last_included_index,
+                                        last_included_index = %metadata.last_included_index,
                                         "Marked InstallSnapshot as inflight"
                                     );
                                 }
@@ -202,16 +205,21 @@ where
                     break;
                 }
 
-                let (prev_log_idx, prev_log_term) = if next_idx > 1 {
-                    (next_idx - 1, log_data[(next_idx - 2) as usize].term)
+                let (prev_log_idx, prev_log_term) = if next_idx
+                    > LogIndex::new(1)
+                {
+                    (
+                        next_idx.saturating_sub(1),
+                        log_data[next_idx.saturating_sub(2).as_usize()].term,
+                    )
                 } else {
-                    (0, 0)
+                    (LogIndex::default(), Term::default())
                 };
 
                 let max_entries = self.config.replication_max_entries_per_rpc;
                 let entries: Vec<LogEntry> = log_data
                     .iter()
-                    .skip((next_idx - 1) as usize)
+                    .skip(next_idx.checked_prev_usize().unwrap_or(0))
                     .take(max_entries)
                     .map(|e| {
                         let command =
@@ -240,7 +248,7 @@ where
                             .unwrap_or(0);
                         tracing::debug!(
                             peer = ?addr,
-                            sent_up_to_index = sent_up_to_index,
+                            sent_up_to_index = %sent_up_to_index,
                             inflight_len = len,
                             "Enqueued AppendEntries into inflight window"
                         );
@@ -342,7 +350,7 @@ where
         server: SocketAddr,
         client: Arc<dyn RaftRpcTrait>,
         req: AppendEntriesRequest,
-        sent_up_to_index: u32,
+        sent_up_to_index: LogIndex,
         rpc_timeout: Duration,
     ) -> anyhow::Result<(SocketAddr, ReplicationResponse)> {
         use crate::trace::TraceContextInjector;
@@ -376,29 +384,30 @@ where
     /// Calculates the new commit index based on match_index from peers.
     /// Returns the highest index replicated on a majority of nodes in the current term (Raft §5.4.2).
     fn new_commit_index(
-        current_commit_index: u32,
-        current_term: u32,
+        current_commit_index: LogIndex,
+        current_term: Term,
         log: &[raft::Entry<T>],
-        match_index: &HashMap<SocketAddr, u32>,
+        match_index: &HashMap<SocketAddr, LogIndex>,
         peer_count: usize,
-    ) -> u32 {
+    ) -> LogIndex {
         let log_len = log.len() as u32;
         let total_nodes = peer_count + 1;
 
         let mut new_commit_index = current_commit_index;
-        for n in (current_commit_index + 1)..=log_len {
+        for n in (current_commit_index.as_u32() + 1)..=log_len {
             if log[(n - 1) as usize].term != current_term {
                 continue;
             }
-            let mut count = 1; // Leader always has the entry
+            let mut count = 1;
+            let n_idx = LogIndex::new(n);
             for match_idx in match_index.values() {
-                if *match_idx >= n {
+                if *match_idx >= n_idx {
                     count += 1;
                 }
             }
             let majority = total_nodes / 2;
             if count > majority {
-                new_commit_index = n;
+                new_commit_index = n_idx;
             }
         }
         new_commit_index
@@ -410,7 +419,7 @@ where
     ///
     /// Raft Algorithm - Log Replication Step 8 (Part 1):
     /// Step 8 (Part 1): Calculate new commit_index based on majority replication
-    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
+    #[tracing::instrument(skip(self), fields(node_id = ?self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn update_commit_index(&mut self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
 
@@ -437,9 +446,9 @@ where
         if new_commit_index > current_commit_index {
             state.commit_index = new_commit_index;
             tracing::info!(
-                id = state.id,
-                old_commit = current_commit_index,
-                new_commit = new_commit_index,
+                id = %state.id,
+                old_commit = %current_commit_index,
+                new_commit = %new_commit_index,
                 "Leader advanced commit_index"
             );
         }
@@ -451,7 +460,7 @@ where
     ///
     /// Raft Algorithm - Log Replication Step 8 (Part 2):
     /// Step 8 (Part 2): Leader applies committed entries to its own state machine
-    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
+    #[tracing::instrument(skip(self), fields(node_id = ?self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn apply_committed_entries_on_leader(
         &mut self,
     ) -> anyhow::Result<()> {
@@ -480,7 +489,7 @@ where
         &mut self,
         addr: SocketAddr,
         res: InstallSnapshotResponse,
-        last_included_index: u32,
+        last_included_index: LogIndex,
     ) -> anyhow::Result<()> {
         // Check if we need to step down due to higher term
         let check_term = {
@@ -520,7 +529,7 @@ where
 
         tracing::info!(
             peer = ?addr,
-            last_included_index = last_included_index,
+            last_included_index = %last_included_index,
             "InstallSnapshot succeeded"
         );
 
@@ -536,7 +545,7 @@ where
         &mut self,
         addr: SocketAddr,
         res: AppendEntriesResponse,
-        sent_up_to_index: u32,
+        sent_up_to_index: LogIndex,
     ) -> anyhow::Result<()> {
         let check_term = {
             let state = self.state.lock().await;
@@ -574,7 +583,7 @@ where
                         .match_index
                         .get(&addr)
                         .copied()
-                        .unwrap_or(0);
+                        .unwrap_or(LogIndex::default());
                     let new_match = current_match.max(sent_up_to_index);
                     leader_state.match_index.insert(addr, new_match);
                     leader_state.next_index.insert(addr, new_match + 1);
@@ -595,7 +604,7 @@ where
                                 peer = ?addr,
                                 removed = before - after,
                                 inflight_len = after,
-                                match_index = new_match,
+                                match_index = %new_match,
                                 "Consumed inflight AppendEntries on success"
                             );
                         }
@@ -617,9 +626,10 @@ where
                         .next_index
                         .get(&addr)
                         .copied()
-                        .unwrap_or(1);
-                    let new_next_idx =
-                        current_next_idx.saturating_sub(1).max(1);
+                        .unwrap_or(LogIndex::new(1));
+                    let new_next_idx = current_next_idx
+                        .saturating_sub(1)
+                        .max(LogIndex::new(1));
                     leader_state.next_index.insert(addr, new_next_idx);
                 }
             }
@@ -640,6 +650,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::raft;
+    use crate::types::NodeId;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn create_test_state_machine() -> crate::statemachine::NoOpStateMachine {
@@ -672,37 +683,37 @@ mod tests {
         // ログエントリを追加: 古いterm と 現在のterm
         {
             let mut state = node.state.lock().await;
-            state.persistent.current_term = 5;
+            state.persistent.current_term = Term::new(5);
             state.role = raft::Role::Leader(raft::LeaderState::new(
                 &[peer1, peer2],
                 state.get_last_log_idx(),
             ));
-            state.commit_index = 0;
+            state.commit_index = LogIndex::new(0);
 
             // 古いterm=3のエントリ
             state.persistent.log.push(raft::Entry {
-                term: 3,
+                term: Term::new(3),
                 command: bytes::Bytes::from("old_term_cmd1"),
             });
             state.persistent.log.push(raft::Entry {
-                term: 3,
+                term: Term::new(3),
                 command: bytes::Bytes::from("old_term_cmd2"),
             });
 
             // 現在のterm=5のエントリ
             state.persistent.log.push(raft::Entry {
-                term: 5,
+                term: Term::new(5),
                 command: bytes::Bytes::from("current_term_cmd1"),
             });
             state.persistent.log.push(raft::Entry {
-                term: 5,
+                term: Term::new(5),
                 command: bytes::Bytes::from("current_term_cmd2"),
             });
 
             // match_indexを設定: すべてのエントリが過半数に複製されている
             if let Some(leader_state) = state.role.leader_state_mut() {
-                leader_state.match_index.insert(peer1, 4);
-                leader_state.match_index.insert(peer2, 4);
+                leader_state.match_index.insert(peer1, LogIndex::new(4));
+                leader_state.match_index.insert(peer2, LogIndex::new(4));
             }
         }
 
@@ -730,7 +741,8 @@ mod tests {
         // term=5のエントリ（index 3,4）のみがコミット対象
         // → commit_index = 4
         assert_eq!(
-            new_commit_index, 4,
+            new_commit_index,
+            LogIndex::new(4),
             "Should only commit current term entries (term=5), not old term entries (term=3)"
         );
 
@@ -758,7 +770,7 @@ mod tests {
                 _req: AppendEntriesRequest,
             ) -> anyhow::Result<AppendEntriesResponse> {
                 Ok(AppendEntriesResponse {
-                    term: 1,
+                    term: Term::new(1),
                     success: true,
                 })
             }
@@ -769,7 +781,7 @@ mod tests {
                 _req: RequestVoteRequest,
             ) -> anyhow::Result<RequestVoteResponse> {
                 Ok(RequestVoteResponse {
-                    term: 1,
+                    term: Term::new(1),
                     vote_granted: true,
                 })
             }
@@ -792,7 +804,7 @@ mod tests {
                 _ctx: tarpc::context::Context,
                 _req: InstallSnapshotRequest,
             ) -> anyhow::Result<InstallSnapshotResponse> {
-                Ok(InstallSnapshotResponse { term: 1 })
+                Ok(InstallSnapshotResponse { term: Term::new(1) })
             }
         }
 
@@ -809,12 +821,12 @@ mod tests {
             .await?;
 
         let req = AppendEntriesRequest {
-            term: 1,
-            leader_id: 1,
-            prev_log_index: 0,
-            prev_log_term: 0,
+            term: Term::new(1),
+            leader_id: NodeId::new(1),
+            prev_log_index: LogIndex::new(0),
+            prev_log_term: Term::new(0),
             entries: vec![],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let result = client

@@ -1,5 +1,6 @@
 use crate::statemachine::StateMachine;
 use crate::storage::Storage;
+use crate::types::{LogIndex, NodeId, Term};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -7,33 +8,28 @@ use tokio::sync::Notify;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Entry<T: Send + Sync> {
-    pub term: u32,
+    pub term: Term,
     pub command: T,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PersistentState<T: Send + Sync> {
-    pub current_term: u32,
-    pub voted_for: Option<u32>,
+    pub current_term: Term,
+    pub voted_for: Option<NodeId>,
     pub log: Vec<Entry<T>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LeaderState {
-    pub next_index: HashMap<SocketAddr, u32>,
-    pub match_index: HashMap<SocketAddr, u32>,
-    /// AppendEntries in-flight window per peer.
-    /// Each element is the `sent_up_to_index` for a single AppendEntries RPC.
-    /// We allow multiple concurrent RPCs (pipelining) and compact the queue on acks.
-    pub inflight_append: HashMap<SocketAddr, VecDeque<u32>>,
-    /// True while an InstallSnapshot RPC is in-flight for the peer.
-    /// Snapshot transfer is exclusive with AppendEntries pipelining.
+    pub next_index: HashMap<SocketAddr, LogIndex>,
+    pub match_index: HashMap<SocketAddr, LogIndex>,
+    pub inflight_append: HashMap<SocketAddr, VecDeque<LogIndex>>,
     pub inflight_snapshot: HashMap<SocketAddr, bool>,
-    pub noop_index: Option<u32>,
+    pub noop_index: Option<LogIndex>,
 }
 
 impl LeaderState {
-    pub fn new(peers: &[SocketAddr], last_log_index: u32) -> Self {
+    pub fn new(peers: &[SocketAddr], last_log_index: LogIndex) -> Self {
         let mut next_index = HashMap::new();
         let mut match_index = HashMap::new();
         let mut inflight_append = HashMap::new();
@@ -41,7 +37,7 @@ impl LeaderState {
 
         for peer in peers {
             next_index.insert(*peer, last_log_index + 1);
-            match_index.insert(*peer, 0);
+            match_index.insert(*peer, LogIndex::default());
             inflight_append.insert(*peer, VecDeque::new());
             inflight_snapshot.insert(*peer, false);
         }
@@ -92,41 +88,43 @@ impl Role {
 }
 
 pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
-    // Persistent state on all services
     pub persistent: PersistentState<T>,
 
-    // Volatile state on all servers
-    pub commit_index: u32,
-    pub last_applied: u32,
+    pub commit_index: LogIndex,
+    pub last_applied: LogIndex,
 
     pub role: Role,
 
-    pub leader_id: Option<u32>,
-    pub id: u32,
+    pub leader_id: Option<NodeId>,
+    pub id: NodeId,
 
     storage: Box<dyn Storage<T>>,
     pub state_machine: SM,
 
     pub apply_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<(u32, SM::Response)>>,
+        Option<tokio::sync::mpsc::UnboundedSender<(LogIndex, SM::Response)>>,
 
     pub replication_notifier: Arc<Notify>,
     pub last_applied_notifier: Arc<Notify>,
 }
 
 impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
-    pub fn new(id: u32, storage: Box<dyn Storage<T>>, sm: SM) -> Self {
+    pub fn new(
+        id: impl Into<NodeId>,
+        storage: Box<dyn Storage<T>>,
+        sm: SM,
+    ) -> Self {
         Self {
             persistent: PersistentState {
-                current_term: 1,
+                current_term: Term::new(1),
                 voted_for: None,
                 log: Vec::new(),
             },
             role: Role::Follower,
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: LogIndex::default(),
+            last_applied: LogIndex::default(),
             leader_id: None,
-            id,
+            id: id.into(),
             storage,
             state_machine: sm,
             apply_tx: None,
@@ -156,7 +154,8 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         let mut responses = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            let entry = &self.persistent.log[(self.last_applied - 1) as usize];
+            let entry = &self.persistent.log
+                [self.last_applied.checked_prev_usize().unwrap()];
             let response = self.state_machine.apply(&entry.command).await?;
 
             if let Some(apply_tx) = &self.apply_tx {
@@ -172,36 +171,40 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
 
         Ok(responses)
     }
-    pub fn get_last_log_idx(&self) -> u32 {
-        self.persistent.log.len() as u32
+    pub fn get_last_log_idx(&self) -> LogIndex {
+        LogIndex::new(self.persistent.log.len() as u32)
     }
     pub fn get_last_log_entry(&self) -> Option<&Entry<T>> {
         self.persistent.log.last()
     }
-    pub fn get_last_log_term(&self) -> u32 {
-        self.persistent.log.last().map(|e| e.term).unwrap_or(0)
+    pub fn get_last_log_term(&self) -> Term {
+        self.persistent
+            .log
+            .last()
+            .map(|e| e.term)
+            .unwrap_or_default()
     }
-    pub fn get_last_voted_term(&self) -> u32 {
-        0u32
+    pub fn get_last_voted_term(&self) -> Term {
+        Term::default()
     }
 
-    #[tracing::instrument(skip(self), fields(node_id = self.id, term = term, leader_id = ?leader_id))]
-    pub fn become_follower(&mut self, term: u32, leader_id: Option<u32>) {
+    #[tracing::instrument(skip(self), fields(node_id = %self.id, term = %term, leader_id = ?leader_id))]
+    pub fn become_follower(&mut self, term: Term, leader_id: Option<NodeId>) {
         self.persistent.current_term = term;
         self.persistent.voted_for = None;
         self.role = Role::Follower;
         self.leader_id = leader_id;
     }
 
-    #[tracing::instrument(skip(self), fields(node_id = self.id, new_term = self.persistent.current_term + 1))]
+    #[tracing::instrument(skip(self), fields(node_id = %self.id, new_term = %self.persistent.current_term.increment()))]
     pub fn become_candidate(&mut self) {
-        self.persistent.current_term += 1;
+        self.persistent.current_term = self.persistent.current_term.increment();
         self.persistent.voted_for = Some(self.id);
         self.role = Role::Candidate;
         self.leader_id = None;
     }
 
-    #[tracing::instrument(skip(self, peers), fields(node_id = self.id, peer_count = peers.len()))]
+    #[tracing::instrument(skip(self, peers), fields(node_id = %self.id, peer_count = peers.len()))]
     pub fn become_leader(&mut self, peers: &[SocketAddr]) {
         let last_log_index = self.get_last_log_idx();
         let leader_state = LeaderState::new(peers, last_log_index);
@@ -212,7 +215,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     pub async fn create_snapshot(&mut self) -> anyhow::Result<()> {
         use crate::snapshot::SnapshotMetadata;
 
-        if self.last_applied == 0 {
+        if self.last_applied == LogIndex::default() {
             return Ok(());
         }
 
@@ -220,9 +223,9 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         let last_included_term = self
             .persistent
             .log
-            .get((last_included_index - 1) as usize)
+            .get(last_included_index.checked_prev_usize().unwrap())
             .map(|e| e.term)
-            .unwrap_or(0);
+            .unwrap_or_default();
 
         let data = self.state_machine.snapshot().await?;
 
@@ -233,7 +236,7 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
 
         self.storage.save_snapshot(&metadata, &data).await?;
 
-        self.persistent.log.drain(0..(last_included_index as usize));
+        self.persistent.log.drain(0..last_included_index.as_usize());
 
         Ok(())
     }
@@ -247,18 +250,19 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             self.last_applied = metadata.last_included_index;
             self.commit_index = metadata.last_included_index;
 
-            if self.persistent.log.len() > metadata.last_included_index as usize
+            if self.persistent.log.len()
+                > metadata.last_included_index.as_usize()
             {
                 self.persistent
                     .log
-                    .drain(0..(metadata.last_included_index as usize));
+                    .drain(0..metadata.last_included_index.as_usize());
             } else {
                 self.persistent.log.clear();
             }
 
             tracing::info!(
-                last_included_index = metadata.last_included_index,
-                last_included_term = metadata.last_included_term,
+                last_included_index = %metadata.last_included_index,
+                last_included_term = %metadata.last_included_term,
                 "Snapshot restored successfully"
             );
 
@@ -277,38 +281,33 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
     /// - Reset state machine using snapshot contents
     pub async fn restore_from_snapshot_data(
         &mut self,
-        last_included_index: u32,
-        last_included_term: u32,
+        last_included_index: LogIndex,
+        last_included_term: Term,
         data: &[u8],
     ) -> anyhow::Result<()> {
-        // Check if existing log entry has same index and term as snapshot's last included entry
-        let should_retain_log = if last_included_index > 0
-            && (last_included_index as usize) <= self.persistent.log.len()
+        let should_retain_log = if let Some(prev_usize) =
+            last_included_index.checked_prev_usize()
         {
-            let log_index = (last_included_index - 1) as usize;
-            self.persistent.log[log_index].term == last_included_term
+            prev_usize < self.persistent.log.len()
+                && self.persistent.log[prev_usize].term == last_included_term
         } else {
             false
         };
 
         if should_retain_log {
-            // Retain log entries following the snapshot's last included entry
-            self.persistent.log.drain(0..(last_included_index as usize));
+            self.persistent.log.drain(0..last_included_index.as_usize());
         } else {
-            // Discard the entire log
             self.persistent.log.clear();
         }
 
-        // Reset state machine using snapshot contents
         self.state_machine.restore(data).await?;
 
-        // Update commit_index and last_applied to snapshot's last included index
         self.commit_index = last_included_index;
         self.last_applied = last_included_index;
 
         tracing::info!(
-            last_included_index = last_included_index,
-            last_included_term = last_included_term,
+            last_included_index = %last_included_index,
+            last_included_term = %last_included_term,
             log_retained = should_retain_log,
             "Snapshot installed from leader"
         );
@@ -331,6 +330,7 @@ mod tests {
         KVCommand, KVResponse, KVStateMachine, NoOpStateMachine,
     };
     use crate::storage::MemStorage;
+    use crate::types::{LogIndex, NodeId, Term};
 
     /// Test that followers reject read requests (linearizability protection)
     ///
@@ -353,15 +353,15 @@ mod tests {
         use tokio::sync::{Mutex, mpsc};
 
         let follower_state = Arc::new(Mutex::new(RaftState::new(
-            10002,
+            10002u32,
             Box::new(MemStorage::default()),
             NoOpStateMachine::default(),
         )));
         {
             let mut state = follower_state.lock().await;
-            state.persistent.current_term = 1;
+            state.persistent.current_term = Term::new(1);
             // Follower state set via become_follower
-            state.leader_id = Some(10001);
+            state.leader_id = Some(NodeId::new(10001));
         }
 
         let follower_network_factory = MockNetworkFactory::new();
@@ -401,7 +401,7 @@ mod tests {
         );
         assert_eq!(
             follower_response.leader_hint,
-            Some(10001),
+            Some(NodeId::new(10001)),
             "Follower should hint the leader"
         );
 
@@ -438,23 +438,23 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10012);
 
         let old_leader_state = Arc::new(Mutex::new(RaftState::new(
-            10011,
+            10011u32,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         )));
         {
             let mut state = old_leader_state.lock().await;
-            state.persistent.current_term = 1;
+            state.persistent.current_term = Term::new(1);
             state.role =
                 Role::Leader(LeaderState::new(&[], state.get_last_log_idx()));
             state.persistent.log.push(Entry {
-                term: 1,
+                term: Term::new(1),
                 command: KVCommand::Set {
                     key: "test_key".to_string(),
                     value: "value2".to_string(),
                 },
             });
-            state.commit_index = 1;
+            state.commit_index = LogIndex::new(1);
             state.apply_committed().await?;
         }
 
@@ -473,12 +473,12 @@ mod tests {
         });
 
         let append_entries_from_new_leader = AppendEntriesRequest {
-            term: 2,
-            leader_id: 10012,
-            prev_log_index: 0,
-            prev_log_term: 0,
+            term: Term::new(2),
+            leader_id: NodeId::new(10012),
+            prev_log_index: LogIndex::new(0),
+            prev_log_term: Term::new(0),
             entries: vec![],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -496,7 +496,8 @@ mod tests {
             "Old leader should accept AppendEntries from new leader"
         );
         assert_eq!(
-            ae_response.term, 2,
+            ae_response.term,
+            Term::new(2),
             "Old leader should update its term to 2"
         );
 
@@ -507,7 +508,8 @@ mod tests {
                 "Old leader should have stepped down to follower"
             );
             assert_eq!(
-                state.persistent.current_term, 2,
+                state.persistent.current_term,
+                Term::new(2),
                 "Old leader should have updated term"
             );
         }
@@ -554,11 +556,11 @@ mod tests {
     #[tokio::test]
     async fn test_linearizable_read_through_leader() -> anyhow::Result<()> {
         let mut leader_state = RaftState::new(
-            1,
+            1u32,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         );
-        leader_state.persistent.current_term = 1;
+        leader_state.persistent.current_term = Term::new(1);
         leader_state.role = Role::Leader(LeaderState::new(
             &[],
             leader_state.get_last_log_idx(),
@@ -566,13 +568,13 @@ mod tests {
 
         // Leader commits and applies value 1
         leader_state.persistent.log.push(Entry {
-            term: 1,
+            term: Term::new(1),
             command: KVCommand::Set {
                 key: "test_key".to_string(),
                 value: "value1".to_string(),
             },
         });
-        leader_state.commit_index = 1;
+        leader_state.commit_index = LogIndex::new(1);
 
         // CORRECT: Apply before serving read
         leader_state.apply_committed().await?;
@@ -599,37 +601,37 @@ mod tests {
     #[tokio::test]
     async fn test_create_snapshot() -> anyhow::Result<()> {
         let mut state = RaftState::new(
-            1,
+            1u32,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         );
 
         state.persistent.log.push(Entry {
-            term: 1,
+            term: Term::new(1),
             command: KVCommand::Set {
                 key: "key1".to_string(),
                 value: "value1".to_string(),
             },
         });
         state.persistent.log.push(Entry {
-            term: 1,
+            term: Term::new(1),
             command: KVCommand::Set {
                 key: "key2".to_string(),
                 value: "value2".to_string(),
             },
         });
         state.persistent.log.push(Entry {
-            term: 2,
+            term: Term::new(2),
             command: KVCommand::Set {
                 key: "key3".to_string(),
                 value: "value3".to_string(),
             },
         });
 
-        state.commit_index = 3;
+        state.commit_index = LogIndex::new(3);
         state.apply_committed().await?;
 
-        assert_eq!(state.last_applied, 3);
+        assert_eq!(state.last_applied, LogIndex::new(3));
         assert_eq!(state.persistent.log.len(), 3);
 
         state.create_snapshot().await?;
@@ -643,13 +645,13 @@ mod tests {
     async fn test_create_snapshot_with_no_applied_entries() -> anyhow::Result<()>
     {
         let mut state = RaftState::new(
-            1,
+            1u32,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         );
 
         state.persistent.log.push(Entry {
-            term: 1,
+            term: Term::new(1),
             command: KVCommand::Set {
                 key: "key1".to_string(),
                 value: "value1".to_string(),
@@ -667,14 +669,14 @@ mod tests {
     async fn test_create_snapshot_preserves_unapplied_entries()
     -> anyhow::Result<()> {
         let mut state = RaftState::new(
-            1,
+            1u32,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         );
 
         for i in 1..=5 {
             state.persistent.log.push(Entry {
-                term: 1,
+                term: Term::new(1),
                 command: KVCommand::Set {
                     key: format!("key{}", i),
                     value: format!("value{}", i),
@@ -682,23 +684,23 @@ mod tests {
             });
         }
 
-        state.commit_index = 3;
+        state.commit_index = LogIndex::new(3);
         state.apply_committed().await?;
 
-        assert_eq!(state.last_applied, 3);
+        assert_eq!(state.last_applied, LogIndex::new(3));
         assert_eq!(state.persistent.log.len(), 5);
 
         state.create_snapshot().await?;
 
         assert_eq!(state.persistent.log.len(), 2);
 
-        assert_eq!(state.persistent.log[0].term, 1);
+        assert_eq!(state.persistent.log[0].term, Term::new(1));
         assert!(matches!(
             state.persistent.log[0].command,
             KVCommand::Set { ref key, ref value } if key == "key4" && value == "value4"
         ));
 
-        assert_eq!(state.persistent.log[1].term, 1);
+        assert_eq!(state.persistent.log[1].term, Term::new(1));
         assert!(matches!(
             state.persistent.log[1].command,
             KVCommand::Set { ref key, ref value } if key == "key5" && value == "value5"
@@ -710,14 +712,14 @@ mod tests {
     #[tokio::test]
     async fn test_restore_from_snapshot() -> anyhow::Result<()> {
         let mut state = RaftState::new(
-            1,
+            1u32,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         );
 
         for i in 1..=5 {
             state.persistent.log.push(Entry {
-                term: 1,
+                term: Term::new(1),
                 command: KVCommand::Set {
                     key: format!("key{}", i),
                     value: format!("value{}", i),
@@ -725,22 +727,22 @@ mod tests {
             });
         }
 
-        state.commit_index = 5;
+        state.commit_index = LogIndex::new(5);
         state.apply_committed().await?;
 
         state.create_snapshot().await?;
 
-        assert_eq!(state.last_applied, 5);
+        assert_eq!(state.last_applied, LogIndex::new(5));
         assert_eq!(state.persistent.log.len(), 0);
 
         let mut new_state =
-            RaftState::new(1, state.storage, KVStateMachine::default());
+            RaftState::new(1u32, state.storage, KVStateMachine::default());
 
         let restored = new_state.restore_from_snapshot().await?;
         assert!(restored, "Snapshot should be restored");
 
-        assert_eq!(new_state.last_applied, 5);
-        assert_eq!(new_state.commit_index, 5);
+        assert_eq!(new_state.last_applied, LogIndex::new(5));
+        assert_eq!(new_state.commit_index, LogIndex::new(5));
         assert_eq!(new_state.persistent.log.len(), 0);
 
         let result = new_state
@@ -761,14 +763,14 @@ mod tests {
     async fn test_restore_from_snapshot_with_remaining_log()
     -> anyhow::Result<()> {
         let mut state = RaftState::new(
-            1,
+            1u32,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         );
 
         for i in 1..=5 {
             state.persistent.log.push(Entry {
-                term: 1,
+                term: Term::new(1),
                 command: KVCommand::Set {
                     key: format!("key{}", i),
                     value: format!("value{}", i),
@@ -776,20 +778,20 @@ mod tests {
             });
         }
 
-        state.commit_index = 3;
+        state.commit_index = LogIndex::new(3);
         state.apply_committed().await?;
 
         state.create_snapshot().await?;
 
-        assert_eq!(state.last_applied, 3);
+        assert_eq!(state.last_applied, LogIndex::new(3));
         assert_eq!(state.persistent.log.len(), 2);
 
         let mut new_state =
-            RaftState::new(1, state.storage, KVStateMachine::default());
+            RaftState::new(1u32, state.storage, KVStateMachine::default());
 
         for i in 1..=5 {
             new_state.persistent.log.push(Entry {
-                term: 1,
+                term: Term::new(1),
                 command: KVCommand::Set {
                     key: format!("key{}", i),
                     value: format!("value{}", i),
@@ -800,11 +802,11 @@ mod tests {
         let restored = new_state.restore_from_snapshot().await?;
         assert!(restored, "Snapshot should be restored");
 
-        assert_eq!(new_state.last_applied, 3);
-        assert_eq!(new_state.commit_index, 3);
+        assert_eq!(new_state.last_applied, LogIndex::new(3));
+        assert_eq!(new_state.commit_index, LogIndex::new(3));
         assert_eq!(new_state.persistent.log.len(), 2);
 
-        assert_eq!(new_state.persistent.log[0].term, 1);
+        assert_eq!(new_state.persistent.log[0].term, Term::new(1));
         assert!(matches!(
             new_state.persistent.log[0].command,
             KVCommand::Set { ref key, ref value } if key == "key4" && value == "value4"
@@ -816,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn test_restore_from_snapshot_no_snapshot() -> anyhow::Result<()> {
         let mut state = RaftState::new(
-            1,
+            1u32,
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         );
@@ -824,8 +826,8 @@ mod tests {
         let restored = state.restore_from_snapshot().await?;
         assert!(!restored, "No snapshot should be found");
 
-        assert_eq!(state.last_applied, 0);
-        assert_eq!(state.commit_index, 0);
+        assert_eq!(state.last_applied, LogIndex::new(0));
+        assert_eq!(state.commit_index, LogIndex::new(0));
 
         Ok(())
     }

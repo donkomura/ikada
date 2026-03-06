@@ -171,21 +171,22 @@ where
 mod tests {
     use super::*;
     use crate::raft::Entry;
+    use crate::types::{LogIndex, NodeId, Term};
 
     #[tokio::test]
     async fn test_storage_save_and_load_state() {
         let mut storage = MemStorage::<String>::default();
 
         let state = PersistentState {
-            current_term: 5,
-            voted_for: Some(2),
+            current_term: Term::new(5),
+            voted_for: Some(NodeId::new(2)),
             log: vec![
                 Entry {
-                    term: 1,
+                    term: Term::new(1),
                     command: "cmd1".to_string(),
                 },
                 Entry {
-                    term: 2,
+                    term: Term::new(2),
                     command: "cmd2".to_string(),
                 },
             ],
@@ -196,8 +197,8 @@ mod tests {
         let loaded = storage.load().await.unwrap();
         assert!(loaded.is_some());
         let loaded_state = loaded.unwrap();
-        assert_eq!(loaded_state.current_term, 5);
-        assert_eq!(loaded_state.voted_for, Some(2));
+        assert_eq!(loaded_state.current_term, Term::new(5));
+        assert_eq!(loaded_state.voted_for, Some(NodeId::new(2)));
         assert_eq!(loaded_state.log.len(), 2);
         assert_eq!(loaded_state.log[0].command, "cmd1");
         assert_eq!(loaded_state.log[1].command, "cmd2");
@@ -208,8 +209,8 @@ mod tests {
         let storage = MemStorage::<String>::default();
 
         let metadata = SnapshotMetadata {
-            last_included_index: 100,
-            last_included_term: 10,
+            last_included_index: LogIndex::new(100),
+            last_included_term: Term::new(10),
         };
         let data = b"snapshot data";
 
@@ -218,8 +219,8 @@ mod tests {
         let loaded = storage.load_snapshot().await.unwrap();
         assert!(loaded.is_some());
         let (loaded_metadata, loaded_data) = loaded.unwrap();
-        assert_eq!(loaded_metadata.last_included_index, 100);
-        assert_eq!(loaded_metadata.last_included_term, 10);
+        assert_eq!(loaded_metadata.last_included_index, LogIndex::new(100));
+        assert_eq!(loaded_metadata.last_included_term, Term::new(10));
         assert_eq!(loaded_data, data);
     }
 
@@ -239,25 +240,25 @@ mod tests {
         let mut storage = MemStorage::<String>::default();
 
         let state1 = PersistentState {
-            current_term: 1,
+            current_term: Term::new(1),
             voted_for: None,
             log: vec![],
         };
         storage.save(&state1).await.unwrap();
 
         let state2 = PersistentState {
-            current_term: 2,
-            voted_for: Some(1),
+            current_term: Term::new(2),
+            voted_for: Some(NodeId::new(1)),
             log: vec![Entry {
-                term: 2,
+                term: Term::new(2),
                 command: "new_cmd".to_string(),
             }],
         };
         storage.save(&state2).await.unwrap();
 
         let loaded = storage.load().await.unwrap().unwrap();
-        assert_eq!(loaded.current_term, 2);
-        assert_eq!(loaded.voted_for, Some(1));
+        assert_eq!(loaded.current_term, Term::new(2));
+        assert_eq!(loaded.voted_for, Some(NodeId::new(1)));
         assert_eq!(loaded.log.len(), 1);
     }
 }

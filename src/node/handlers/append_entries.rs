@@ -1,6 +1,7 @@
 use crate::raft::{self, RaftState};
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
+use crate::types::{LogIndex, NodeId, Term};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -16,8 +17,8 @@ impl From<anyhow::Error> for AppendEntriesError {
 }
 
 async fn validate_term_and_step_down<T, SM>(
-    request_term: u32,
-    sender_id: u32,
+    request_term: Term,
+    sender_id: NodeId,
     state: &mut RaftState<T, SM>,
 ) -> Result<(), AppendEntriesError>
 where
@@ -27,8 +28,8 @@ where
     if request_term < state.persistent.current_term {
         tracing::warn!(
             id=?state.id,
-            req_term=request_term,
-            current_term=state.persistent.current_term,
+            req_term=%request_term,
+            current_term=%state.persistent.current_term,
             "Request rejected: term is older than current term"
         );
         return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
@@ -57,20 +58,20 @@ where
 }
 
 fn verify_log_match<T, SM>(
-    prev_log_index: u32,
-    prev_log_term: u32,
+    prev_log_index: LogIndex,
+    prev_log_term: Term,
     state: &RaftState<T, SM>,
 ) -> Result<(), AppendEntriesError>
 where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
 {
-    if prev_log_index > 0 {
+    if prev_log_index > LogIndex::default() {
         if prev_log_index > state.get_last_log_idx() {
             tracing::warn!(
                 id=?state.id,
-                prev_log_index=prev_log_index,
-                last_log_idx=state.get_last_log_idx(),
+                prev_log_index=%prev_log_index,
+                last_log_idx=%state.get_last_log_idx(),
                 "Request rejected: prev_log_index exceeds log length"
             );
             return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
@@ -80,13 +81,13 @@ where
         }
 
         let prev_log_entry =
-            &state.persistent.log[(prev_log_index - 1) as usize];
+            &state.persistent.log[prev_log_index.checked_prev_usize().unwrap()];
         if prev_log_entry.term != prev_log_term {
             tracing::warn!(
                 id=?state.id,
-                prev_log_index=prev_log_index,
-                prev_log_term=prev_log_term,
-                actual_term=prev_log_entry.term,
+                prev_log_index=%prev_log_index,
+                prev_log_term=%prev_log_term,
+                actual_term=%prev_log_entry.term,
                 "Request rejected: prev_log_term mismatch"
             );
             return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
@@ -101,9 +102,9 @@ where
 
 fn detect_and_truncate_conflicts<T, SM>(
     entries: &[LogEntry],
-    start_index: u32,
+    start_index: LogIndex,
     state: &mut RaftState<T, SM>,
-) -> Option<u32>
+) -> Option<LogIndex>
 where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
@@ -112,16 +113,20 @@ where
         let log_index = start_index + i as u32;
 
         if log_index <= state.get_last_log_idx() {
-            let existing_term =
-                state.persistent.log[(log_index - 1) as usize].term;
+            let existing_term = state.persistent.log
+                [log_index.checked_prev_usize().unwrap()]
+            .term;
 
             if existing_term != entry.term {
-                state.persistent.log.truncate((log_index - 1) as usize);
+                state
+                    .persistent
+                    .log
+                    .truncate(log_index.checked_prev_usize().unwrap());
                 tracing::info!(
                     id=?state.id,
-                    conflict_index=log_index,
-                    old_term=existing_term,
-                    new_term=entry.term,
+                    conflict_index=%log_index,
+                    old_term=%existing_term,
+                    new_term=%entry.term,
                     "Truncated log due to conflict"
                 );
                 return Some(log_index);
@@ -134,8 +139,8 @@ where
 
 fn deserialize_and_append<T, SM>(
     entries: &[LogEntry],
-    start_index: u32,
-    sender_id: u32,
+    start_index: LogIndex,
+    sender_id: NodeId,
     state: &mut RaftState<T, SM>,
 ) -> Result<bool, AppendEntriesError>
 where
@@ -174,8 +179,8 @@ where
     if appended_count > 0 {
         tracing::info!(
             id=?state.id,
-            sender_id=sender_id,
-            start_index=start_index,
+            sender_id=%sender_id,
+            start_index=%start_index,
             entries_received=entries.len(),
             entries_appended=appended_count,
             new_log_len=state.persistent.log.len(),
@@ -188,8 +193,8 @@ where
 
 async fn synchronize_log<T, SM>(
     entries: &[LogEntry],
-    start_index: u32,
-    sender_id: u32,
+    start_index: LogIndex,
+    sender_id: NodeId,
     state: &mut RaftState<T, SM>,
     request_tracker: Option<
         Arc<Mutex<crate::request_tracker::RequestTracker<SM::Response>>>,
@@ -225,7 +230,7 @@ where
 }
 
 async fn advance_commit_index<T, SM>(
-    new_commit_index: u32,
+    new_commit_index: LogIndex,
     state: &mut RaftState<T, SM>,
 ) -> Result<(), AppendEntriesError>
 where
@@ -237,9 +242,9 @@ where
         state.commit_index = new_commit_index.min(state.get_last_log_idx());
         tracing::debug!(
             id=?state.id,
-            old_commit_index=old_commit,
-            new_commit_index=state.commit_index,
-            requested_commit=new_commit_index,
+            old_commit_index=%old_commit,
+            new_commit_index=%state.commit_index,
+            requested_commit=%new_commit_index,
             "Advanced commit index"
         );
     }
@@ -247,8 +252,8 @@ where
     if state.commit_index > state.last_applied {
         tracing::debug!(
             id=?state.id,
-            commit_index=state.commit_index,
-            last_applied=state.last_applied,
+            commit_index=%state.commit_index,
+            last_applied=%state.last_applied,
             "Applying committed entries to state machine"
         );
         state.apply_committed().await?;
@@ -257,7 +262,7 @@ where
     Ok(())
 }
 
-#[tracing::instrument(skip(state, request_tracker), fields(term = req.term, leader_id = req.leader_id, prev_log_index = req.prev_log_index, entries_count = req.entries.len()))]
+#[tracing::instrument(skip(state, request_tracker), fields(term = %req.term, leader_id = %req.leader_id, prev_log_index = %req.prev_log_index, entries_count = req.entries.len()))]
 pub async fn handle_append_entries<T, SM>(
     req: &AppendEntriesRequest,
     state: Arc<Mutex<RaftState<T, SM>>>,
@@ -354,12 +359,12 @@ mod tests {
     async fn test_append_entries_with_higher_term_converts_to_follower()
     -> anyhow::Result<()> {
         let mut initial_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.persistent.current_term = 50;
-        initial_state.persistent.voted_for = Some(1);
+        initial_state.persistent.current_term = Term::new(50);
+        initial_state.persistent.voted_for = Some(NodeId::new(1));
         // Set to Leader role directly for test
         initial_state.role =
             crate::raft::Role::Leader(crate::raft::LeaderState::new(
@@ -370,7 +375,7 @@ mod tests {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(32);
         let (_heartbeat_tx, _heartbeat_rx) =
-            mpsc::unbounded_channel::<(u32, u32)>();
+            mpsc::unbounded_channel::<(Term, NodeId)>();
         let (_client_tx, _client_rx) = mpsc::channel::<bytes::Bytes>(32);
         let state_clone = Arc::clone(&state);
 
@@ -388,12 +393,12 @@ mod tests {
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let req = AppendEntriesRequest {
-            term: 100,
-            leader_id: 99999,
-            prev_log_index: 0,
-            prev_log_term: 0,
+            term: Term::new(100),
+            leader_id: NodeId::new(99999),
+            prev_log_index: LogIndex::new(0),
+            prev_log_term: Term::new(0),
             entries: Vec::new(),
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         cmd_tx
@@ -407,10 +412,10 @@ mod tests {
         let _response = resp_rx.await?;
 
         let final_state = state.lock().await;
-        assert_eq!(final_state.persistent.current_term, 100);
+        assert_eq!(final_state.persistent.current_term, Term::new(100));
         assert!(final_state.role.is_follower());
         assert_eq!(final_state.persistent.voted_for, None);
-        assert_eq!(final_state.leader_id, Some(99999));
+        assert_eq!(final_state.leader_id, Some(NodeId::new(99999)));
 
         Ok(())
     }
@@ -418,37 +423,37 @@ mod tests {
     #[tokio::test]
     async fn test_append_entries_conflict_resolution() -> anyhow::Result<()> {
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 3;
+        follower_state.persistent.current_term = Term::new(3);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd3_old"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd4_old"[..]),
         });
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 3,
-            leader_id: 2,
-            prev_log_index: 2,
-            prev_log_term: 1,
+            term: Term::new(3),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(2),
+            prev_log_term: Term::new(1),
             entries: vec![
                 LogEntry {
-                    term: 3,
+                    term: Term::new(3),
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd3_new"[..],
                     ))
@@ -456,7 +461,7 @@ mod tests {
                     .into(),
                 },
                 LogEntry {
-                    term: 3,
+                    term: Term::new(3),
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd4_new"[..],
                     ))
@@ -464,7 +469,7 @@ mod tests {
                     .into(),
                 },
                 LogEntry {
-                    term: 3,
+                    term: Term::new(3),
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd5_new"[..],
                     ))
@@ -472,13 +477,13 @@ mod tests {
                     .into(),
                 },
             ],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
 
         assert!(response.success);
-        assert_eq!(response.term, 3);
+        assert_eq!(response.term, Term::new(3));
 
         let final_state = state.lock().await;
         assert_eq!(
@@ -487,17 +492,17 @@ mod tests {
             "Log should have 5 entries"
         );
 
-        assert_eq!(final_state.persistent.log[0].term, 1);
+        assert_eq!(final_state.persistent.log[0].term, Term::new(1));
         assert_eq!(final_state.persistent.log[0].command.as_ref(), b"cmd1");
-        assert_eq!(final_state.persistent.log[1].term, 1);
+        assert_eq!(final_state.persistent.log[1].term, Term::new(1));
         assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2");
 
-        assert_eq!(final_state.persistent.log[2].term, 3);
+        assert_eq!(final_state.persistent.log[2].term, Term::new(3));
         assert_eq!(final_state.persistent.log[2].command.as_ref(), b"cmd3_new");
-        assert_eq!(final_state.persistent.log[3].term, 3);
+        assert_eq!(final_state.persistent.log[3].term, Term::new(3));
         assert_eq!(final_state.persistent.log[3].command.as_ref(), b"cmd4_new");
 
-        assert_eq!(final_state.persistent.log[4].term, 3);
+        assert_eq!(final_state.persistent.log[4].term, Term::new(3));
         assert_eq!(final_state.persistent.log[4].command.as_ref(), b"cmd5_new");
 
         Ok(())
@@ -507,29 +512,29 @@ mod tests {
     async fn test_append_entries_no_conflict_append_only() -> anyhow::Result<()>
     {
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 2;
+        follower_state.persistent.current_term = Term::new(2);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 2,
-            leader_id: 2,
-            prev_log_index: 2,
-            prev_log_term: 1,
+            term: Term::new(2),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(2),
+            prev_log_term: Term::new(1),
             entries: vec![
                 LogEntry {
-                    term: 2,
+                    term: Term::new(2),
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd3"[..],
                     ))
@@ -537,7 +542,7 @@ mod tests {
                     .into(),
                 },
                 LogEntry {
-                    term: 2,
+                    term: Term::new(2),
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd4"[..],
                     ))
@@ -545,7 +550,7 @@ mod tests {
                     .into(),
                 },
             ],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
@@ -554,9 +559,9 @@ mod tests {
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.log.len(), 4);
-        assert_eq!(final_state.persistent.log[2].term, 2);
+        assert_eq!(final_state.persistent.log[2].term, Term::new(2));
         assert_eq!(final_state.persistent.log[2].command.as_ref(), b"cmd3");
-        assert_eq!(final_state.persistent.log[3].term, 2);
+        assert_eq!(final_state.persistent.log[3].term, Term::new(2));
         assert_eq!(final_state.persistent.log[3].command.as_ref(), b"cmd4");
 
         Ok(())
@@ -569,39 +574,39 @@ mod tests {
         let applied_commands = state_machine.applied_commands.clone();
 
         let mut follower_state =
-            RaftState::new(1, create_test_storage(), state_machine);
-        follower_state.persistent.current_term = 2;
+            RaftState::new(1u32, create_test_storage(), state_machine);
+        follower_state.persistent.current_term = Term::new(2);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd3"[..]),
         });
-        assert_eq!(follower_state.commit_index, 0);
-        assert_eq!(follower_state.last_applied, 0);
+        assert_eq!(follower_state.commit_index, LogIndex::new(0));
+        assert_eq!(follower_state.last_applied, LogIndex::new(0));
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 2,
-            leader_id: 2,
-            prev_log_index: 3,
-            prev_log_term: 2,
+            term: Term::new(2),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(3),
+            prev_log_term: Term::new(2),
             entries: vec![],
-            leader_commit: 2,
+            leader_commit: LogIndex::new(2),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
-        assert_eq!(final_state.commit_index, 2);
-        assert_eq!(final_state.last_applied, 2);
+        assert_eq!(final_state.commit_index, LogIndex::new(2));
+        assert_eq!(final_state.last_applied, LogIndex::new(2));
 
         let commands = applied_commands.lock().await;
         assert_eq!(commands.len(), 2);
@@ -617,21 +622,21 @@ mod tests {
         use crate::request_tracker::RequestTracker;
 
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 3;
+        follower_state.persistent.current_term = Term::new(3);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd2_old"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd3_old"[..]),
         });
 
@@ -642,26 +647,38 @@ mod tests {
         let (tx3, mut rx3) = tokio::sync::oneshot::channel();
         let timeout =
             std::time::Instant::now() + std::time::Duration::from_secs(30);
-        request_tracker.lock().await.track_write(1, tx1, timeout);
-        request_tracker.lock().await.track_write(2, tx2, timeout);
-        request_tracker.lock().await.track_write(3, tx3, timeout);
+        request_tracker.lock().await.track_write(
+            LogIndex::new(1),
+            tx1,
+            timeout,
+        );
+        request_tracker.lock().await.track_write(
+            LogIndex::new(2),
+            tx2,
+            timeout,
+        );
+        request_tracker.lock().await.track_write(
+            LogIndex::new(3),
+            tx3,
+            timeout,
+        );
 
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 3,
-            leader_id: 2,
-            prev_log_index: 1,
-            prev_log_term: 1,
+            term: Term::new(3),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(1),
+            prev_log_term: Term::new(1),
             entries: vec![LogEntry {
-                term: 3,
+                term: Term::new(3),
                 command: bincode::serialize(&bytes::Bytes::from(
                     &b"cmd2_new"[..],
                 ))
                 .unwrap()
                 .into(),
             }],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let response = handle_append_entries(
@@ -674,7 +691,7 @@ mod tests {
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.log.len(), 2);
-        assert_eq!(final_state.persistent.log[1].term, 3);
+        assert_eq!(final_state.persistent.log[1].term, Term::new(3));
         assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2_new");
         drop(final_state);
 
@@ -702,33 +719,33 @@ mod tests {
     async fn test_append_entries_rejects_prev_log_term_mismatch()
     -> anyhow::Result<()> {
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 3;
+        follower_state.persistent.current_term = Term::new(3);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 3,
-            leader_id: 2,
-            prev_log_index: 2,
-            prev_log_term: 1,
+            term: Term::new(3),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(2),
+            prev_log_term: Term::new(1),
             entries: vec![],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(!response.success);
-        assert_eq!(response.term, 3);
+        assert_eq!(response.term, Term::new(3));
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.log.len(), 2);
@@ -739,28 +756,28 @@ mod tests {
     #[tokio::test]
     async fn test_append_entries_rejects_older_term() -> anyhow::Result<()> {
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 5;
+        follower_state.persistent.current_term = Term::new(5);
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 3,
-            leader_id: 2,
-            prev_log_index: 0,
-            prev_log_term: 0,
+            term: Term::new(3),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(0),
+            prev_log_term: Term::new(0),
             entries: vec![],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(!response.success);
-        assert_eq!(response.term, 5);
+        assert_eq!(response.term, Term::new(5));
 
         let final_state = state.lock().await;
-        assert_eq!(final_state.persistent.current_term, 5);
+        assert_eq!(final_state.persistent.current_term, Term::new(5));
 
         Ok(())
     }
@@ -769,33 +786,33 @@ mod tests {
     async fn test_append_entries_rejects_prev_log_index_exceeds_log_length()
     -> anyhow::Result<()> {
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 3;
+        follower_state.persistent.current_term = Term::new(3);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 3,
-            leader_id: 2,
-            prev_log_index: 5,
-            prev_log_term: 2,
+            term: Term::new(3),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(5),
+            prev_log_term: Term::new(2),
             entries: vec![],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(!response.success);
-        assert_eq!(response.term, 3);
+        assert_eq!(response.term, Term::new(3));
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.log.len(), 2);
@@ -807,35 +824,35 @@ mod tests {
     async fn test_append_entries_commit_index_capped_by_log_length()
     -> anyhow::Result<()> {
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 2;
+        follower_state.persistent.current_term = Term::new(2);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 2,
-            leader_id: 2,
-            prev_log_index: 2,
-            prev_log_term: 2,
+            term: Term::new(2),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(2),
+            prev_log_term: Term::new(2),
             entries: vec![],
-            leader_commit: 999,
+            leader_commit: LogIndex::new(999),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
-        assert_eq!(final_state.commit_index, 2);
+        assert_eq!(final_state.commit_index, LogIndex::new(2));
 
         Ok(())
     }
@@ -847,22 +864,22 @@ mod tests {
         let applied_commands = state_machine.applied_commands.clone();
 
         let mut follower_state =
-            RaftState::new(1, create_test_storage(), state_machine);
-        follower_state.persistent.current_term = 2;
+            RaftState::new(1u32, create_test_storage(), state_machine);
+        follower_state.persistent.current_term = Term::new(2);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd3"[..]),
         });
-        follower_state.commit_index = 1;
-        follower_state.last_applied = 0;
+        follower_state.commit_index = LogIndex::new(1);
+        follower_state.last_applied = LogIndex::new(0);
         follower_state.apply_committed().await?;
 
         assert_eq!(applied_commands.lock().await.len(), 1);
@@ -870,20 +887,20 @@ mod tests {
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 2,
-            leader_id: 2,
-            prev_log_index: 3,
-            prev_log_term: 2,
+            term: Term::new(2),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(3),
+            prev_log_term: Term::new(2),
             entries: vec![],
-            leader_commit: 3,
+            leader_commit: LogIndex::new(3),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(response.success);
 
         let final_state = state.lock().await;
-        assert_eq!(final_state.commit_index, 3);
-        assert_eq!(final_state.last_applied, 3);
+        assert_eq!(final_state.commit_index, LogIndex::new(3));
+        assert_eq!(final_state.last_applied, LogIndex::new(3));
 
         let commands = applied_commands.lock().await;
         assert_eq!(commands.len(), 3);
@@ -901,26 +918,26 @@ mod tests {
         let applied_commands = state_machine.applied_commands.clone();
 
         let mut follower_state =
-            RaftState::new(1, create_test_storage(), state_machine);
-        follower_state.persistent.current_term = 2;
+            RaftState::new(1u32, create_test_storage(), state_machine);
+        follower_state.persistent.current_term = Term::new(2);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 2,
-            leader_id: 2,
-            prev_log_index: 1,
-            prev_log_term: 1,
+            term: Term::new(2),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(1),
+            prev_log_term: Term::new(1),
             entries: vec![LogEntry {
-                term: 2,
+                term: Term::new(2),
                 command: bincode::serialize(&bytes::Bytes::from(&b"cmd2"[..]))
                     .unwrap()
                     .into(),
             }],
-            leader_commit: 2,
+            leader_commit: LogIndex::new(2),
         };
 
         let response1 =
@@ -941,12 +958,12 @@ mod tests {
         {
             let final_state = state.lock().await;
             assert_eq!(final_state.persistent.log.len(), 2);
-            assert_eq!(final_state.persistent.log[0].term, 1);
+            assert_eq!(final_state.persistent.log[0].term, Term::new(1));
             assert_eq!(final_state.persistent.log[0].command.as_ref(), b"cmd1");
-            assert_eq!(final_state.persistent.log[1].term, 2);
+            assert_eq!(final_state.persistent.log[1].term, Term::new(2));
             assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2");
-            assert_eq!(final_state.commit_index, 2);
-            assert_eq!(final_state.last_applied, 2);
+            assert_eq!(final_state.commit_index, LogIndex::new(2));
+            assert_eq!(final_state.last_applied, LogIndex::new(2));
         }
 
         let commands = applied_commands.lock().await;
@@ -959,22 +976,22 @@ mod tests {
     async fn test_append_entries_candidate_receives_same_term_becomes_follower()
     -> anyhow::Result<()> {
         let mut candidate_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        candidate_state.persistent.current_term = 5;
+        candidate_state.persistent.current_term = Term::new(5);
         candidate_state.role = crate::raft::Role::Candidate;
-        candidate_state.persistent.voted_for = Some(1);
+        candidate_state.persistent.voted_for = Some(NodeId::new(1));
         let state = Arc::new(Mutex::new(candidate_state));
 
         let req = AppendEntriesRequest {
-            term: 5,
-            leader_id: 2,
-            prev_log_index: 0,
-            prev_log_term: 0,
+            term: Term::new(5),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(0),
+            prev_log_term: Term::new(0),
             entries: vec![],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
@@ -982,8 +999,8 @@ mod tests {
 
         let final_state = state.lock().await;
         assert!(final_state.role.is_follower());
-        assert_eq!(final_state.persistent.current_term, 5);
-        assert_eq!(final_state.leader_id, Some(2));
+        assert_eq!(final_state.persistent.current_term, Term::new(5));
+        assert_eq!(final_state.leader_id, Some(NodeId::new(2)));
 
         Ok(())
     }
@@ -992,21 +1009,21 @@ mod tests {
     async fn test_append_entries_prev_log_index_zero_success()
     -> anyhow::Result<()> {
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 1;
+        follower_state.persistent.current_term = Term::new(1);
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 1,
-            leader_id: 2,
-            prev_log_index: 0,
-            prev_log_term: 0,
+            term: Term::new(1),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(0),
+            prev_log_term: Term::new(0),
             entries: vec![
                 LogEntry {
-                    term: 1,
+                    term: Term::new(1),
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd1"[..],
                     ))
@@ -1014,7 +1031,7 @@ mod tests {
                     .into(),
                 },
                 LogEntry {
-                    term: 1,
+                    term: Term::new(1),
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd2"[..],
                     ))
@@ -1022,7 +1039,7 @@ mod tests {
                     .into(),
                 },
             ],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
@@ -1030,9 +1047,9 @@ mod tests {
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.log.len(), 2);
-        assert_eq!(final_state.persistent.log[0].term, 1);
+        assert_eq!(final_state.persistent.log[0].term, Term::new(1));
         assert_eq!(final_state.persistent.log[0].command.as_ref(), b"cmd1");
-        assert_eq!(final_state.persistent.log[1].term, 1);
+        assert_eq!(final_state.persistent.log[1].term, Term::new(1));
         assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2");
 
         Ok(())
@@ -1042,41 +1059,41 @@ mod tests {
     async fn test_append_entries_partial_match_overwrites_from_conflict_point()
     -> anyhow::Result<()> {
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 3;
+        follower_state.persistent.current_term = Term::new(3);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd3"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd4_old"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd5_old"[..]),
         });
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 3,
-            leader_id: 2,
-            prev_log_index: 3,
-            prev_log_term: 2,
+            term: Term::new(3),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(3),
+            prev_log_term: Term::new(2),
             entries: vec![
                 LogEntry {
-                    term: 3,
+                    term: Term::new(3),
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd4_new"[..],
                     ))
@@ -1084,7 +1101,7 @@ mod tests {
                     .into(),
                 },
                 LogEntry {
-                    term: 3,
+                    term: Term::new(3),
                     command: bincode::serialize(&bytes::Bytes::from(
                         &b"cmd5_new"[..],
                     ))
@@ -1092,7 +1109,7 @@ mod tests {
                     .into(),
                 },
             ],
-            leader_commit: 0,
+            leader_commit: LogIndex::new(0),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
@@ -1100,15 +1117,15 @@ mod tests {
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.log.len(), 5);
-        assert_eq!(final_state.persistent.log[0].term, 1);
+        assert_eq!(final_state.persistent.log[0].term, Term::new(1));
         assert_eq!(final_state.persistent.log[0].command.as_ref(), b"cmd1");
-        assert_eq!(final_state.persistent.log[1].term, 1);
+        assert_eq!(final_state.persistent.log[1].term, Term::new(1));
         assert_eq!(final_state.persistent.log[1].command.as_ref(), b"cmd2");
-        assert_eq!(final_state.persistent.log[2].term, 2);
+        assert_eq!(final_state.persistent.log[2].term, Term::new(2));
         assert_eq!(final_state.persistent.log[2].command.as_ref(), b"cmd3");
-        assert_eq!(final_state.persistent.log[3].term, 3);
+        assert_eq!(final_state.persistent.log[3].term, Term::new(3));
         assert_eq!(final_state.persistent.log[3].command.as_ref(), b"cmd4_new");
-        assert_eq!(final_state.persistent.log[4].term, 3);
+        assert_eq!(final_state.persistent.log[4].term, Term::new(3));
         assert_eq!(final_state.persistent.log[4].command.as_ref(), b"cmd5_new");
 
         Ok(())
@@ -1118,40 +1135,40 @@ mod tests {
     async fn test_append_entries_rejection_does_not_change_commit_index()
     -> anyhow::Result<()> {
         let mut follower_state = RaftState::new(
-            1,
+            1u32,
             create_test_storage(),
             create_test_state_machine(),
         );
-        follower_state.persistent.current_term = 3;
+        follower_state.persistent.current_term = Term::new(3);
         follower_state.persistent.log.push(raft::Entry {
-            term: 1,
+            term: Term::new(1),
             command: bytes::Bytes::from(&b"cmd1"[..]),
         });
         follower_state.persistent.log.push(raft::Entry {
-            term: 2,
+            term: Term::new(2),
             command: bytes::Bytes::from(&b"cmd2"[..]),
         });
-        follower_state.commit_index = 1;
-        follower_state.last_applied = 1;
+        follower_state.commit_index = LogIndex::new(1);
+        follower_state.last_applied = LogIndex::new(1);
         let state = Arc::new(Mutex::new(follower_state));
 
         let req = AppendEntriesRequest {
-            term: 3,
-            leader_id: 2,
-            prev_log_index: 2,
-            prev_log_term: 1,
+            term: Term::new(3),
+            leader_id: NodeId::new(2),
+            prev_log_index: LogIndex::new(2),
+            prev_log_term: Term::new(1),
             entries: vec![],
-            leader_commit: 5,
+            leader_commit: LogIndex::new(5),
         };
 
         let response = handle_append_entries(&req, state.clone(), None).await?;
         assert!(!response.success);
-        assert_eq!(response.term, 3);
+        assert_eq!(response.term, Term::new(3));
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.log.len(), 2);
-        assert_eq!(final_state.commit_index, 1);
-        assert_eq!(final_state.last_applied, 1);
+        assert_eq!(final_state.commit_index, LogIndex::new(1));
+        assert_eq!(final_state.last_applied, LogIndex::new(1));
 
         Ok(())
     }

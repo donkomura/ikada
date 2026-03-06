@@ -9,6 +9,7 @@ use super::{Node, handlers};
 use crate::network::NetworkFactory;
 use crate::raft::Role;
 use crate::statemachine::StateMachine;
+use crate::types::LogIndex;
 use crate::watchdog::WatchDog;
 use std::net::SocketAddr;
 use tracing::Instrument;
@@ -27,7 +28,7 @@ where
 {
     /// Main event loop that dispatches to role-specific handlers.
     /// Runs indefinitely until an error occurs.
-    #[tracing::instrument(skip(self, servers), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
+    #[tracing::instrument(skip(self, servers), fields(node_id = ?self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn main(
         mut self,
         servers: Vec<SocketAddr>,
@@ -56,7 +57,7 @@ where
     /// Raft Algorithm Step 1: Election Timeout Detection
     /// - Followers wait for heartbeats (AppendEntries) from the leader
     /// - If no heartbeat is received within election_timeout, transition to candidate
-    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
+    #[tracing::instrument(skip(self), fields(node_id = ?self.state.try_lock().ok().map(|s| s.id)))]
     pub async fn run_follower(&mut self) -> anyhow::Result<()> {
         let timeout = self.config.election_timeout;
         let watchdog = WatchDog::default();
@@ -89,7 +90,7 @@ where
 
     /// Runs as candidate, starting elections periodically.
     /// Transitions to follower if a valid leader's heartbeat is received.
-    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
+    #[tracing::instrument(skip(self), fields(node_id = ?self.state.try_lock().ok().map(|s| s.id)))]
     pub async fn run_candidate(&mut self) -> anyhow::Result<()>
     where
         T: Default,
@@ -106,7 +107,7 @@ where
                 break;
             }
             tokio::select! {
-                Some((id, term)) = self.c.heartbeat_rx.recv() => {
+                Some((term, id)) = self.c.heartbeat_rx.recv() => {
                     let current_term = self.state.lock().await.persistent.current_term;
                     if term >= current_term {
                         // Accept heartbeat: requester is the new leader
@@ -215,7 +216,7 @@ where
                             tracing::error!(error = ?e, "Failed to create snapshot");
                         } else {
                             tracing::info!(
-                                last_applied = state.last_applied,
+                                last_applied = %state.last_applied,
                                 remaining_log_entries = state.persistent.log.len(),
                                 "Snapshot created successfully"
                             );
@@ -233,7 +234,7 @@ where
     ///
     /// Batching allows multiple log entries to be replicated together,
     /// reducing network overhead and improving throughput under load.
-    #[tracing::instrument(skip(self, requests), fields(node_id = self.state.try_lock().ok().map(|s| s.id), batch_size = requests.len()))]
+    #[tracing::instrument(skip(self, requests), fields(node_id = ?self.state.try_lock().ok().map(|s| s.id), batch_size = requests.len()))]
     async fn flush_request_batch(
         &mut self,
         requests: &mut Vec<(
@@ -261,7 +262,7 @@ where
 
         // Append to log in one lock/persist, and register RequestTracker entries.
         let mut appended: Vec<(
-            u32,
+            LogIndex,
             tokio::sync::oneshot::Receiver<SM::Response>,
             tokio::sync::oneshot::Sender<crate::rpc::CommandResponse>,
         )> = Vec::new();
@@ -303,7 +304,7 @@ where
             // Build a temporary list of (log_index, resp_tx) for commands we accepted,
             // and respond immediately for invalid requests.
             let mut accepted: Vec<(
-                u32,
+                LogIndex,
                 tokio::sync::oneshot::Sender<crate::rpc::CommandResponse>,
             )> = Vec::new();
 
@@ -329,7 +330,7 @@ where
                     }
                 };
 
-                let log_index = state_guard.persistent.log.len() as u32 + 1;
+                let log_index = state_guard.get_last_log_idx() + 1;
                 state_guard
                     .persistent
                     .log
@@ -391,6 +392,7 @@ where
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::types::{NodeId, Term};
     use std::time::Duration;
 
     fn create_test_state_machine() -> crate::statemachine::NoOpStateMachine {
@@ -481,7 +483,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send((1, 1)).unwrap();
+        heartbeat_tx.send((Term::new(1), NodeId::new(1))).unwrap();
         tokio::task::yield_now().await;
 
         // 2回目: さらに800ms経過後にheartbeat（リセットから800ms）
@@ -489,7 +491,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send((1, 1)).unwrap();
+        heartbeat_tx.send((Term::new(1), NodeId::new(1))).unwrap();
         tokio::task::yield_now().await;
 
         // 3回目: さらに800ms経過後にheartbeat（リセットから800ms）
@@ -497,7 +499,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send((1, 1)).unwrap();
+        heartbeat_tx.send((Term::new(1), NodeId::new(1))).unwrap();
         tokio::task::yield_now().await;
 
         // heartbeat停止: 1100ms経過でタイムアウト
@@ -524,7 +526,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send((1, 1)).unwrap();
+        heartbeat_tx.send((Term::new(1), NodeId::new(1))).unwrap();
         tokio::task::yield_now().await;
 
         // 2回目: さらに800ms経過後にheartbeat（リセットから800ms）
@@ -532,7 +534,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!result.is_finished());
 
-        heartbeat_tx.send((1, 1)).unwrap();
+        heartbeat_tx.send((Term::new(1), NodeId::new(1))).unwrap();
         tokio::task::yield_now().await;
 
         // heartbeat停止: 1100ms経過でタイムアウト

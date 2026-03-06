@@ -1,6 +1,7 @@
 use crate::raft::RaftState;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
+use crate::types::{LogIndex, Term};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -25,7 +26,7 @@ where
 
 async fn wait_for_majority_replication<T, SM>(
     state: Arc<Mutex<RaftState<T, SM>>>,
-    log_index: u32,
+    log_index: LogIndex,
     peer_count: usize,
     timeout: std::time::Duration,
 ) -> Result<(), CommandResponse>
@@ -106,13 +107,16 @@ async fn append_command_to_log<T, SM>(
         Mutex<crate::request_tracker::RequestTracker<SM::Response>>,
     >,
     tracker_timeout: std::time::Duration,
-) -> Result<(u32, tokio::sync::oneshot::Receiver<SM::Response>), CommandResponse>
+) -> Result<
+    (LogIndex, tokio::sync::oneshot::Receiver<SM::Response>),
+    CommandResponse,
+>
 where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
 {
     let term = state.persistent.current_term;
-    let log_index = state.persistent.log.len() as u32 + 1;
+    let log_index = state.get_last_log_idx() + 1;
 
     state.persistent.log.push(crate::raft::Entry {
         term,
@@ -139,9 +143,9 @@ where
     );
 
     tracing::debug!(
-        id = state.id,
-        log_index = log_index,
-        term = term,
+        id = %state.id,
+        log_index = %log_index,
+        term = %term,
         "Leader appended command to log"
     );
 
@@ -200,7 +204,7 @@ where
 /// to the log and registered the `RequestTracker` entry.
 pub async fn wait_for_write_result<T, SM>(
     state: Arc<Mutex<RaftState<T, SM>>>,
-    log_index: u32,
+    log_index: LogIndex,
     peer_count: usize,
     timeout: std::time::Duration,
     result_rx: tokio::sync::oneshot::Receiver<SM::Response>,
@@ -450,7 +454,7 @@ async fn verify_leadership_with_quorum<T, SM>(
     state: Arc<Mutex<RaftState<T, SM>>>,
     peer_count: usize,
     timeout: std::time::Duration,
-    expected_term: u32,
+    expected_term: Term,
 ) -> bool
 where
     T: Send + Sync + Clone,
@@ -483,7 +487,7 @@ where
                     leader_state
                         .match_index
                         .values()
-                        .filter(|&&idx| idx > 0)
+                        .filter(|&&idx| idx > LogIndex::default())
                         .count()
                         + 1
                 } else {

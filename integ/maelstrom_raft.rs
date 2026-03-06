@@ -15,6 +15,7 @@ use ikada::rpc::{
     RequestVoteRequest,
 };
 use ikada::statemachine::{KVCommand, KVResponse, KVStateMachine};
+use ikada::types::{LogIndex, NodeId, Term};
 
 const BASE_PORT: u16 = 1111;
 const FORWARD_MSG_ID_START: u64 = 1000000;
@@ -320,9 +321,9 @@ impl MaelstromRaftNode {
             .collect()
     }
 
-    async fn get_node_id_by_hint(&self, hint: u32) -> Option<String> {
+    async fn get_node_id_by_hint(&self, hint: NodeId) -> Option<String> {
         let info = self.node_info.lock().await;
-        let index = (hint - BASE_PORT as u32) as usize;
+        let index = (hint.as_u32() - BASE_PORT as u32) as usize;
         info.node_ids.get(index).cloned()
     }
 
@@ -928,7 +929,7 @@ impl MaelstromRaftNode {
             .entries
             .iter()
             .filter_map(|e| {
-                let term = e.get("term")?.as_u64()? as u32;
+                let term = Term::new(e.get("term")?.as_u64()? as u32);
                 let command_b64 = e.get("command")?.as_str()?;
                 let command = base64::engine::general_purpose::STANDARD
                     .decode(command_b64)
@@ -941,12 +942,12 @@ impl MaelstromRaftNode {
             .collect();
 
         let req = AppendEntriesRequest {
-            term: body.term,
-            leader_id: body.leader_id,
-            prev_log_index: body.prev_log_index,
-            prev_log_term: body.prev_log_term,
+            term: Term::new(body.term),
+            leader_id: NodeId::new(body.leader_id),
+            prev_log_index: LogIndex::new(body.prev_log_index),
+            prev_log_term: Term::new(body.prev_log_term),
             entries,
-            leader_commit: body.leader_commit,
+            leader_commit: LogIndex::new(body.leader_commit),
         };
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -962,7 +963,7 @@ impl MaelstromRaftNode {
             dest: Some(src),
             body: Body::AppendEntriesOk(AppendEntriesOkBody {
                 in_reply_to: body.msg_id,
-                term: response.term,
+                term: response.term.as_u32(),
                 success: response.success,
             }),
         }))
@@ -982,10 +983,10 @@ impl MaelstromRaftNode {
         };
 
         let req = RequestVoteRequest {
-            term: body.term,
-            candidate_id: body.candidate_id,
-            last_log_index: body.last_log_index,
-            last_log_term: body.last_log_term,
+            term: Term::new(body.term),
+            candidate_id: NodeId::new(body.candidate_id),
+            last_log_index: LogIndex::new(body.last_log_index),
+            last_log_term: Term::new(body.last_log_term),
         };
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -1001,7 +1002,7 @@ impl MaelstromRaftNode {
             dest: Some(src),
             body: Body::RequestVoteOk(RequestVoteOkBody {
                 in_reply_to: body.msg_id,
-                term: response.term,
+                term: response.term.as_u32(),
                 vote_granted: response.vote_granted,
             }),
         }))
