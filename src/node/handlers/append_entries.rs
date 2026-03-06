@@ -67,44 +67,56 @@ where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
 {
-    if prev_log_index > LogIndex::default() {
-        if prev_log_index > state.get_last_log_idx() {
-            tracing::warn!(
-                id=?state.id,
-                prev_log_index=%prev_log_index,
-                last_log_idx=%state.get_last_log_idx(),
-                "Request rejected: prev_log_index exceeds log length"
-            );
-            return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
-                term: state.persistent.current_term,
-                success: false,
-            }));
-        }
+    use crate::core::log::{self, LogMatchError};
 
-        let prev_idx =
-            prev_log_index.checked_prev_usize().ok_or_else(|| {
-                AppendEntriesError::Internal(anyhow::anyhow!(
-                    "prev_log_index {} has no valid array index",
-                    prev_log_index
-                ))
-            })?;
-        let prev_log_entry = &state.persistent.log[prev_idx];
-        if prev_log_entry.term != prev_log_term {
-            tracing::warn!(
-                id=?state.id,
-                prev_log_index=%prev_log_index,
-                prev_log_term=%prev_log_term,
-                actual_term=%prev_log_entry.term,
-                "Request rejected: prev_log_term mismatch"
-            );
-            return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
-                term: state.persistent.current_term,
-                success: false,
-            }));
-        }
-    }
-
-    Ok(())
+    log::verify_log_match(prev_log_index, prev_log_term, &state.persistent.log)
+        .map_err(|e| {
+            match &e {
+                LogMatchError::IndexExceedsLog {
+                    prev_log_index,
+                    log_len,
+                } => {
+                    tracing::warn!(
+                        id=?state.id,
+                        prev_log_index=%prev_log_index,
+                        log_len=%log_len,
+                        "Request rejected: prev_log_index exceeds log length"
+                    );
+                }
+                LogMatchError::TermMismatch {
+                    prev_log_index,
+                    expected_term,
+                    actual_term,
+                } => {
+                    tracing::warn!(
+                        id=?state.id,
+                        prev_log_index=%prev_log_index,
+                        prev_log_term=%expected_term,
+                        actual_term=%actual_term,
+                        "Request rejected: prev_log_term mismatch"
+                    );
+                }
+                LogMatchError::InvalidIndex { prev_log_index } => {
+                    tracing::warn!(
+                        id=?state.id,
+                        prev_log_index=%prev_log_index,
+                        "Request rejected: invalid prev_log_index"
+                    );
+                }
+            }
+            match e {
+                LogMatchError::InvalidIndex { prev_log_index } => {
+                    AppendEntriesError::Internal(anyhow::anyhow!(
+                        "prev_log_index {} has no valid array index",
+                        prev_log_index
+                    ))
+                }
+                _ => AppendEntriesError::Rejected(AppendEntriesResponse {
+                    term: state.persistent.current_term,
+                    success: false,
+                }),
+            }
+        })
 }
 
 fn detect_and_truncate_conflicts<T, SM>(
@@ -116,27 +128,32 @@ where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
 {
-    for (i, entry) in entries.iter().enumerate() {
-        let log_index = start_index + i as u32;
+    let entry_terms: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.term, i))
+        .collect();
 
-        if log_index <= state.get_last_log_idx() {
-            let Some(arr_idx) = log_index.checked_prev_usize() else {
-                continue;
-            };
-            let existing_term = state.persistent.log[arr_idx].term;
+    let conflict = crate::core::log::detect_conflict(
+        &entry_terms,
+        start_index,
+        &state.persistent.log,
+    );
 
-            if existing_term != entry.term {
-                state.persistent.log.truncate(arr_idx);
-                tracing::info!(
-                    id=?state.id,
-                    conflict_index=%log_index,
-                    old_term=%existing_term,
-                    new_term=%entry.term,
-                    "Truncated log due to conflict"
-                );
-                return Some(log_index);
-            }
-        }
+    if let Some((conflict_index, arr_idx)) = conflict {
+        let old_term = state.persistent.log[arr_idx].term;
+        let new_term = entries
+            [conflict_index.as_u32() as usize - start_index.as_u32() as usize]
+            .term;
+        state.persistent.log.truncate(arr_idx);
+        tracing::info!(
+            id=?state.id,
+            conflict_index=%conflict_index,
+            old_term=%old_term,
+            new_term=%new_term,
+            "Truncated log due to conflict"
+        );
+        return Some(conflict_index);
     }
 
     None

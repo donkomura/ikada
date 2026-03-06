@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+pub mod core;
 pub mod error;
 pub mod memcache;
 pub mod network;
