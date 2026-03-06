@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::maelstrom::*;
 use ikada::network::{NetworkError, NetworkFactory};
 use ikada::rpc::*;
+use ikada::types::Term;
 
 pub struct MaelstromNetworkFactory {
     node_id: String,
@@ -168,7 +169,7 @@ impl RaftRpcTrait for MaelstromRpcClient {
             Some(id) => id,
             None => {
                 return Ok(AppendEntriesResponse {
-                    term: 0,
+                    term: Term::new(0),
                     success: false,
                 });
             }
@@ -182,7 +183,7 @@ impl RaftRpcTrait for MaelstromRpcClient {
             .map(|e| {
                 use base64::Engine;
                 serde_json::json!({
-                    "term": e.term,
+                    "term": e.term.as_u32(),
                     "command": base64::engine::general_purpose::STANDARD.encode(&e.command),
                 })
             })
@@ -193,12 +194,12 @@ impl RaftRpcTrait for MaelstromRpcClient {
             dest: Some(dest.clone()),
             body: Body::AppendEntries(AppendEntriesBody {
                 msg_id,
-                term: req.term,
-                leader_id: req.leader_id,
-                prev_log_index: req.prev_log_index,
-                prev_log_term: req.prev_log_term,
+                term: req.term.as_u32(),
+                leader_id: req.leader_id.as_u32(),
+                prev_log_index: req.prev_log_index.as_u32(),
+                prev_log_term: req.prev_log_term.as_u32(),
                 entries,
-                leader_commit: req.leader_commit,
+                leader_commit: req.leader_commit.as_u32(),
             }),
         };
 
@@ -209,11 +210,11 @@ impl RaftRpcTrait for MaelstromRpcClient {
         match self.send_and_wait(msg, msg_id, timeout).await {
             Ok(response) => match response.body {
                 Body::AppendEntriesOk(body) => Ok(AppendEntriesResponse {
-                    term: body.term,
+                    term: Term::new(body.term),
                     success: body.success,
                 }),
                 _ => Ok(AppendEntriesResponse {
-                    term: 0,
+                    term: Term::new(0),
                     success: false,
                 }),
             },
@@ -232,7 +233,7 @@ impl RaftRpcTrait for MaelstromRpcClient {
             Some(id) => id,
             None => {
                 return Ok(RequestVoteResponse {
-                    term: 0,
+                    term: Term::new(0),
                     vote_granted: false,
                 });
             }
@@ -245,10 +246,10 @@ impl RaftRpcTrait for MaelstromRpcClient {
             dest: Some(dest),
             body: Body::RequestVote(RequestVoteBody {
                 msg_id,
-                term: req.term,
-                candidate_id: req.candidate_id,
-                last_log_index: req.last_log_index,
-                last_log_term: req.last_log_term,
+                term: req.term.as_u32(),
+                candidate_id: req.candidate_id.as_u32(),
+                last_log_index: req.last_log_index.as_u32(),
+                last_log_term: req.last_log_term.as_u32(),
             }),
         };
 
@@ -259,11 +260,11 @@ impl RaftRpcTrait for MaelstromRpcClient {
         match self.send_and_wait(msg, msg_id, timeout).await {
             Ok(response) => match response.body {
                 Body::RequestVoteOk(body) => Ok(RequestVoteResponse {
-                    term: body.term,
+                    term: Term::new(body.term),
                     vote_granted: body.vote_granted,
                 }),
                 _ => Ok(RequestVoteResponse {
-                    term: 0,
+                    term: Term::new(0),
                     vote_granted: false,
                 }),
             },
@@ -293,6 +294,6 @@ impl RaftRpcTrait for MaelstromRpcClient {
         _ctx: context::Context,
         _req: InstallSnapshotRequest,
     ) -> anyhow::Result<InstallSnapshotResponse> {
-        Ok(InstallSnapshotResponse { term: 0 })
+        Ok(InstallSnapshotResponse { term: Term::new(0) })
     }
 }

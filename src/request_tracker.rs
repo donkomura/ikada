@@ -1,3 +1,4 @@
+use crate::types::LogIndex;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -10,7 +11,7 @@ pub struct PendingRequest<R> {
 
 /// Bridges cluster-wide log indices with node-local client response channels.
 pub struct RequestTracker<R> {
-    pending_writes: HashMap<u32, PendingRequest<R>>,
+    pending_writes: HashMap<LogIndex, PendingRequest<R>>,
 }
 
 impl<R> RequestTracker<R> {
@@ -22,7 +23,7 @@ impl<R> RequestTracker<R> {
 
     pub fn track_write(
         &mut self,
-        log_index: u32,
+        log_index: LogIndex,
         response_tx: oneshot::Sender<R>,
         timeout: Instant,
     ) {
@@ -35,7 +36,7 @@ impl<R> RequestTracker<R> {
         );
     }
 
-    pub fn complete_write(&mut self, log_index: u32, response: R) -> bool {
+    pub fn complete_write(&mut self, log_index: LogIndex, response: R) -> bool {
         if let Some(PendingRequest { response_tx, .. }) =
             self.pending_writes.remove(&log_index)
         {
@@ -46,11 +47,11 @@ impl<R> RequestTracker<R> {
         }
     }
 
-    pub fn clear_from(&mut self, log_index: u32) {
+    pub fn clear_from(&mut self, log_index: LogIndex) {
         self.pending_writes.retain(|idx, _| *idx < log_index);
     }
 
-    pub fn cleanup_timed_out(&mut self) -> Vec<u32> {
+    pub fn cleanup_timed_out(&mut self) -> Vec<LogIndex> {
         let now = Instant::now();
         let mut timed_out = Vec::new();
 
@@ -83,8 +84,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let timeout = Instant::now() + Duration::from_secs(10);
 
-        tracker.track_write(1, tx, timeout);
-        assert!(tracker.complete_write(1, 42));
+        tracker.track_write(LogIndex::new(1), tx, timeout);
+        assert!(tracker.complete_write(LogIndex::new(1), 42));
 
         assert_eq!(rx.blocking_recv().unwrap(), 42);
     }
@@ -92,7 +93,7 @@ mod tests {
     #[test]
     fn test_complete_nonexistent_write() {
         let mut tracker = RequestTracker::<i32>::new();
-        assert!(!tracker.complete_write(999, 42));
+        assert!(!tracker.complete_write(LogIndex::new(999), 42));
     }
 
     #[test]
@@ -104,14 +105,14 @@ mod tests {
         let past = Instant::now() - Duration::from_secs(1);
         let future = Instant::now() + Duration::from_secs(10);
 
-        tracker.track_write(1, tx1, past);
-        tracker.track_write(2, tx2, future);
+        tracker.track_write(LogIndex::new(1), tx1, past);
+        tracker.track_write(LogIndex::new(2), tx2, future);
 
         let timed_out = tracker.cleanup_timed_out();
         assert_eq!(timed_out.len(), 1);
-        assert_eq!(timed_out[0], 1);
+        assert_eq!(timed_out[0], LogIndex::new(1));
 
-        assert!(!tracker.complete_write(1, 42));
-        assert!(tracker.complete_write(2, 42));
+        assert!(!tracker.complete_write(LogIndex::new(1), 42));
+        assert!(tracker.complete_write(LogIndex::new(2), 42));
     }
 }

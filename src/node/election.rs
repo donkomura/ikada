@@ -31,7 +31,7 @@ where
     ///
     /// Raft Algorithm - Leader Election Step 2:
     /// Step 2: Candidate sends RequestVote RPC to all other nodes in parallel
-    #[tracing::instrument(skip(self), fields(node_id = self.state.try_lock().ok().map(|s| s.id)))]
+    #[tracing::instrument(skip(self), fields(node_id = ?self.state.try_lock().ok().map(|s| s.id)))]
     pub(super) async fn start_election(&mut self) -> anyhow::Result<()>
     where
         T: Default,
@@ -65,7 +65,7 @@ where
 
         if !is_granted {
             tracing::info!(
-                id = candidate_id,
+                id = %candidate_id,
                 "vote not granted, become follower"
             );
             {
@@ -85,7 +85,7 @@ where
         let rpc_timeout = self.config.rpc_timeout;
 
         tracing::info!(
-            candidate_id = candidate_id,
+            candidate_id = %candidate_id,
             peer_count = peers.len(),
             "sending request_vote to peers"
         );
@@ -112,7 +112,7 @@ where
                 }
                 Err(e) => {
                     tracing::warn!(
-                        candidate_id = candidate_id,
+                        candidate_id = %candidate_id,
                         error = ?e,
                         "Failed to send request vote"
                     );
@@ -131,7 +131,7 @@ where
     /// Raft Algorithm - Leader Election Steps 3-4:
     /// Step 3: Each node evaluates the RequestVote and grants vote based on log up-to-dateness
     /// Step 4: Candidate becomes leader if it receives votes from a majority of nodes
-    #[tracing::instrument(skip(self, responses), fields(node_id = self.state.try_lock().ok().map(|s| s.id), response_count = responses.len()))]
+    #[tracing::instrument(skip(self, responses), fields(node_id = ?self.state.try_lock().ok().map(|s| s.id), response_count = responses.len()))]
     async fn handle_election(
         &mut self,
         responses: Vec<RequestVoteResponse>,
@@ -143,14 +143,14 @@ where
             let state = self.state.lock().await;
             (state.id, state.persistent.current_term)
         };
-        tracing::info!(id=id, responses=?responses, "election handled");
+        tracing::info!(id=%id, responses=?responses, "election handled");
 
         let new_terms: Vec<_> =
             responses.iter().filter(|r| r.term > current_term).collect();
         if !new_terms.is_empty() {
             tracing::info!(
-                id = &id,
-                term = &current_term,
+                id = %id,
+                term = %current_term,
                 "newer term was discovered"
             );
             {
@@ -170,7 +170,7 @@ where
 
         if vote_granted {
             tracing::info!(
-                id = id,
+                id = %id,
                 voted_count =
                     responses.iter().filter(|r| r.vote_granted).count(),
                 "vote granted, become leader"
@@ -179,7 +179,7 @@ where
             // Transition to leader role
             {
                 let mut state = self.state.lock().await;
-                tracing::info!(id=?state.id, term=state.persistent.current_term, "BECOMING LEADER");
+                tracing::info!(id=%state.id, term=%state.persistent.current_term, "BECOMING LEADER");
 
                 let peers: Vec<_> = self.peers.keys().copied().collect();
                 state.become_leader(&peers);
@@ -199,7 +199,7 @@ where
 
                 tracing::info!(
                     id = ?state.id,
-                    noop_index = noop_idx,
+                    noop_index = %noop_idx,
                     "Appended no-op entry for ReadIndex"
                 );
             }
@@ -211,7 +211,7 @@ where
     }
 
     /// Sends RequestVote RPC to a single peer.
-    #[tracing::instrument(skip(client, req), fields(peer = ?peer_addr, candidate_id = req.candidate_id, term = req.term))]
+    #[tracing::instrument(skip(client, req), fields(peer = ?peer_addr, candidate_id = %req.candidate_id, term = %req.term))]
     async fn send_request_vote(
         peer_addr: SocketAddr,
         client: Arc<dyn RaftRpcTrait>,
@@ -223,7 +223,7 @@ where
 
         client.request_vote(ctx, req.clone()).await.map_err(|e| {
             tracing::warn!(
-                candidate_id = req.candidate_id,
+                candidate_id = %req.candidate_id,
                 peer_addr = ?peer_addr,
                 error = ?e,
                 "request_vote RPC failed to peer"
@@ -281,7 +281,7 @@ mod tests {
         }
         let state = node.state.lock().await;
         assert!(state.role.is_candidate());
-        assert_eq!(state.persistent.current_term, term + 1);
+        assert_eq!(state.persistent.current_term, term.increment());
         Ok(())
     }
 

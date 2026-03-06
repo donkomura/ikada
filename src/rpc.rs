@@ -1,10 +1,11 @@
+use crate::types::{LogIndex, NodeId, Term};
 use std::sync::Arc;
 use tarpc::serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "tarpc::serde")]
 pub struct LogEntry {
-    pub term: u32,
+    pub term: Term,
     #[serde(with = "arc_bytes")]
     pub command: Arc<[u8]>,
 }
@@ -35,34 +36,34 @@ mod arc_bytes {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "tarpc::serde")]
 pub struct AppendEntriesRequest {
-    pub term: u32,
-    pub leader_id: u32,
-    pub prev_log_index: u32,
-    pub prev_log_term: u32,
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub prev_log_index: LogIndex,
+    pub prev_log_term: Term,
     pub entries: Vec<LogEntry>,
-    pub leader_commit: u32,
+    pub leader_commit: LogIndex,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "tarpc::serde")]
 pub struct AppendEntriesResponse {
-    pub term: u32,
+    pub term: Term,
     pub success: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "tarpc::serde")]
 pub struct RequestVoteRequest {
-    pub term: u32,
-    pub candidate_id: u32,
-    pub last_log_index: u32,
-    pub last_log_term: u32,
+    pub term: Term,
+    pub candidate_id: NodeId,
+    pub last_log_index: LogIndex,
+    pub last_log_term: Term,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "tarpc::serde")]
 pub struct RequestVoteResponse {
-    pub term: u32,
+    pub term: Term,
     pub vote_granted: bool,
 }
 
@@ -98,7 +99,7 @@ impl std::fmt::Display for CommandError {
 #[serde(crate = "tarpc::serde")]
 pub struct CommandResponse {
     pub success: bool,
-    pub leader_hint: Option<u32>,
+    pub leader_hint: Option<NodeId>,
     pub data: Option<Vec<u8>>,
     pub error: Option<CommandError>,
 }
@@ -106,17 +107,17 @@ pub struct CommandResponse {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "tarpc::serde")]
 pub struct InstallSnapshotRequest {
-    pub term: u32,
-    pub leader_id: u32,
-    pub last_included_index: u32,
-    pub last_included_term: u32,
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub last_included_index: LogIndex,
+    pub last_included_term: Term,
     pub data: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "tarpc::serde")]
 pub struct InstallSnapshotResponse {
-    pub term: u32,
+    pub term: Term,
 }
 
 #[tarpc::service]

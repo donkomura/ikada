@@ -16,6 +16,7 @@ use crate::raft::RaftState;
 use crate::request_tracker::RequestTracker;
 use crate::rpc::*;
 use crate::statemachine::StateMachine;
+use crate::types::{NodeId, Term};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,8 +64,8 @@ pub enum Command {
 pub struct Chan {
     /// Heartbeat notification channel (leader_id, term)
     /// Used by all roles to detect leader presence
-    pub heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
-    pub heartbeat_rx: mpsc::UnboundedReceiver<(u32, u32)>,
+    pub heartbeat_tx: mpsc::UnboundedSender<(Term, NodeId)>,
+    pub heartbeat_rx: mpsc::UnboundedReceiver<(Term, NodeId)>,
 
     /// Client write request channel
     /// Used only by Leader role to batch and process client commands
@@ -211,8 +212,8 @@ where
         match state.load_persisted().await {
             Ok(Some(persisted)) => {
                 tracing::info!(
-                    id = id,
-                    term = persisted.current_term,
+                    id = %id,
+                    term = %persisted.current_term,
                     log_len = persisted.log.len(),
                     "Restoring state from storage"
                 );
@@ -221,13 +222,13 @@ where
             }
             Ok(None) => {
                 tracing::info!(
-                    id = id,
+                    id = %id,
                     "No persisted state found, starting fresh"
                 );
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!(id = id, error = ?e, "Failed to load persisted state, starting fresh");
+                tracing::warn!(id = %id, error = ?e, "Failed to load persisted state, starting fresh");
                 Ok(())
             }
         }
@@ -305,7 +306,7 @@ where
     pub(crate) async fn rpc_handler(
         state: Arc<Mutex<RaftState<T, SM>>>,
         mut rx: mpsc::Receiver<Command>,
-        heartbeat_tx: mpsc::UnboundedSender<(u32, u32)>,
+        heartbeat_tx: mpsc::UnboundedSender<(Term, NodeId)>,
         client_request_tx: mpsc::UnboundedSender<(
             CommandRequest,
             oneshot::Sender<CommandResponse>,
@@ -327,7 +328,7 @@ where
                             .unwrap_or_else(|e| {
                                 tracing::error!(error=?e, "Failed to handle AppendEntries");
                                 AppendEntriesResponse {
-                                    term: 0,
+                                    term: Term::new(0),
                                     success: false,
                                 }
                             });
@@ -448,7 +449,7 @@ where
                             .unwrap_or_else(|e| {
                                 tracing::error!(error=?e, "Failed to handle InstallSnapshot");
                                 InstallSnapshotResponse {
-                                    term: 0,
+                                    term: Term::new(0),
                                 }
                             });
 
@@ -482,19 +483,19 @@ where
         &mut self,
         servers: Vec<SocketAddr>,
     ) -> anyhow::Result<()> {
-        let id = self.state.lock().await.id;
+        let id: NodeId = self.state.lock().await.id;
 
         for &addr in &servers {
             // Skip self to avoid connecting to own address
-            if addr.port() as u32 == id {
+            if NodeId::from(addr.port()) == id {
                 continue;
             }
             match self.connect_to_peer(addr).await {
                 Ok(_) => {
-                    tracing::info!(id = id, peer = ?addr, "Connected to peer");
+                    tracing::info!(id = %id, peer = ?addr, "Connected to peer");
                 }
                 Err(e) => {
-                    tracing::warn!(id = id, peer = ?addr, error = ?e, "Failed to connect to peer");
+                    tracing::warn!(id = %id, peer = ?addr, error = ?e, "Failed to connect to peer");
                 }
             }
         }

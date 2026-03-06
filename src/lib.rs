@@ -11,4 +11,5 @@ pub mod snapshot;
 pub mod statemachine;
 pub mod storage;
 pub mod trace;
+pub mod types;
 pub mod watchdog;

@@ -6,6 +6,7 @@
 
 use crate::node::Command;
 use crate::rpc::*;
+use crate::types::Term;
 use futures::{future, prelude::*};
 use std::net::{IpAddr, Ipv4Addr};
 use tarpc::{
@@ -50,7 +51,7 @@ struct RaftServer {
 }
 
 impl RaftRpc for RaftServer {
-    #[tracing::instrument(skip(self, _ctx), fields(term = req.term, leader_id = req.leader_id, entries_count = req.entries.len()))]
+    #[tracing::instrument(skip(self, _ctx), fields(term = %req.term, leader_id = %req.leader_id, entries_count = req.entries.len()))]
     async fn append_entries(
         self,
         _ctx: tarpc::context::Context,
@@ -63,12 +64,12 @@ impl RaftRpc for RaftServer {
             .send(Command::AppendEntries(req, resp_tx, span))
             .await;
         resp_rx.await.unwrap_or(AppendEntriesResponse {
-            term: 0,
+            term: Term::new(0),
             success: false,
         })
     }
 
-    #[tracing::instrument(skip(self, _ctx), fields(term = req.term, candidate_id = req.candidate_id))]
+    #[tracing::instrument(skip(self, _ctx), fields(term = %req.term, candidate_id = %req.candidate_id))]
     async fn request_vote(
         self,
         _ctx: tarpc::context::Context,
@@ -78,7 +79,7 @@ impl RaftRpc for RaftServer {
         let span = tracing::Span::current();
         let _ = self.tx.send(Command::RequestVote(req, resp_tx, span)).await;
         resp_rx.await.unwrap_or(RequestVoteResponse {
-            term: 0,
+            term: Term::new(0),
             vote_granted: false,
         })
     }
@@ -105,7 +106,7 @@ impl RaftRpc for RaftServer {
         })
     }
 
-    #[tracing::instrument(skip(self, _ctx), fields(term = req.term, leader_id = req.leader_id, last_included_index = req.last_included_index))]
+    #[tracing::instrument(skip(self, _ctx), fields(term = %req.term, leader_id = %req.leader_id, last_included_index = %req.last_included_index))]
     async fn install_snapshot(
         self,
         _ctx: tarpc::context::Context,
@@ -117,6 +118,8 @@ impl RaftRpc for RaftServer {
             .tx
             .send(Command::InstallSnapshot(req, resp_tx, span))
             .await;
-        resp_rx.await.unwrap_or(InstallSnapshotResponse { term: 0 })
+        resp_rx
+            .await
+            .unwrap_or(InstallSnapshotResponse { term: Term::new(0) })
     }
 }

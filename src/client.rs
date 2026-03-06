@@ -52,7 +52,7 @@ impl<NF: NetworkFactory> RaftClient<NF> {
                 .data
                 .ok_or_else(|| anyhow::anyhow!("No response data"))
         } else if let Some(leader_id) = response.leader_hint {
-            let leader_port = leader_id as u16;
+            let leader_port = leader_id.as_u32() as u16;
             let leader_addr =
                 SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, leader_port));
 
