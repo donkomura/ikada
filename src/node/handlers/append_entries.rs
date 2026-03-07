@@ -26,32 +26,47 @@ where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
 {
-    if request_term < state.persistent.current_term {
-        tracing::warn!(
-            id=?state.id,
-            req_term=%request_term,
-            current_term=%state.persistent.current_term,
-            "Request rejected: term is older than current term"
-        );
-        return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
-            term: state.persistent.current_term,
-            success: false,
-        }));
-    }
+    use crate::core::term::{TermAction, validate_request_term};
 
-    if request_term > state.persistent.current_term {
-        state.become_follower(request_term, Some(sender_id));
-        if let Err(e) = state.persist().await {
-            tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update");
+    let is_candidate_or_leader =
+        state.role.is_candidate() || state.role.is_leader();
+
+    match validate_request_term(
+        request_term,
+        state.persistent.current_term,
+        sender_id,
+        is_candidate_or_leader,
+    ) {
+        TermAction::Reject => {
+            tracing::warn!(
+                id=?state.id,
+                req_term=%request_term,
+                current_term=%state.persistent.current_term,
+                "Request rejected: term is older than current term"
+            );
             return Err(AppendEntriesError::Rejected(AppendEntriesResponse {
                 term: state.persistent.current_term,
                 success: false,
             }));
         }
-    } else if request_term == state.persistent.current_term {
-        state.leader_id = Some(sender_id);
-        if state.role.is_candidate() || state.role.is_leader() {
-            state.become_follower(request_term, Some(sender_id));
+        TermAction::StepDown {
+            new_term,
+            leader_id,
+        } => {
+            let term_changed = new_term > state.persistent.current_term;
+            state.become_follower(new_term, leader_id);
+            if term_changed && let Err(e) = state.persist().await {
+                tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update");
+                return Err(AppendEntriesError::Rejected(
+                    AppendEntriesResponse {
+                        term: state.persistent.current_term,
+                        success: false,
+                    },
+                ));
+            }
+        }
+        TermAction::Accept => {
+            state.leader_id = Some(sender_id);
         }
     }
 

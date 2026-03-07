@@ -16,7 +16,10 @@ where
     let (current_term, vote_granted) = {
         let mut state = state.lock().await;
 
-        if req.term > state.persistent.current_term {
+        if crate::core::term::should_step_down_on_response(
+            req.term,
+            state.persistent.current_term,
+        ) {
             state.become_follower(req.term, None);
             if let Err(e) = state.persist().await {
                 tracing::error!(id=?state.id, error=?e, "Failed to persist state after term update in RequestVote");

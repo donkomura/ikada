@@ -26,17 +26,30 @@ where
 {
     let mut state = state.lock().await;
 
-    // Reply immediately if term < currentTerm
-    if req.term < state.persistent.current_term {
-        return Ok(InstallSnapshotResponse {
-            term: state.persistent.current_term,
-        });
-    }
+    use crate::core::term::{TermAction, validate_request_term};
 
-    // Update term if necessary (not explicitly in Figure 13, but required by Raft semantics)
-    if req.term > state.persistent.current_term {
-        state.become_follower(req.term, Some(req.leader_id));
-        let _ = state.persist().await;
+    let is_candidate_or_leader =
+        state.role.is_candidate() || state.role.is_leader();
+
+    match validate_request_term(
+        req.term,
+        state.persistent.current_term,
+        req.leader_id,
+        is_candidate_or_leader,
+    ) {
+        TermAction::Reject => {
+            return Ok(InstallSnapshotResponse {
+                term: state.persistent.current_term,
+            });
+        }
+        TermAction::StepDown {
+            new_term,
+            leader_id,
+        } => {
+            state.become_follower(new_term, leader_id);
+            let _ = state.persist().await;
+        }
+        TermAction::Accept => {}
     }
 
     // Apply snapshot to state machine and handle log
