@@ -142,6 +142,11 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
         &mut self.role
     }
 
+    #[cfg(test)]
+    pub fn set_role(&mut self, role: Role) {
+        self.role = role;
+    }
+
     pub async fn persist(&mut self) -> anyhow::Result<()> {
         self.storage
             .save(&self.persistent)
@@ -510,8 +515,10 @@ mod tests {
         )));
         {
             let mut state = old_leader_state.lock().await;
-            state.become_candidate();
-            state.become_leader(&[]);
+            let last_log_idx = state.get_last_log_idx();
+            let id = state.id;
+            state.set_role(Role::Leader(LeaderState::new(&[], last_log_idx)));
+            state.leader_id = Some(id);
             state.persistent.log.push(Entry {
                 term: Term::new(1),
                 command: KVCommand::Set {
@@ -625,8 +632,11 @@ mod tests {
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         );
-        leader_state.become_candidate();
-        leader_state.become_leader(&[]);
+        leader_state.set_role(Role::Leader(LeaderState::new(
+            &[],
+            leader_state.get_last_log_idx(),
+        )));
+        leader_state.leader_id = Some(leader_state.id);
 
         // Leader commits and applies value 1
         leader_state.persistent.log.push(Entry {

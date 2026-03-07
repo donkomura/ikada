@@ -272,8 +272,12 @@ mod tests {
         let node = create_test_node();
         {
             let mut state = node.state.lock().await;
-            state.become_candidate();
-            state.become_leader(&[]);
+            let last_log_idx = state.get_last_log_idx();
+            let id = state.id;
+            state.set_role(crate::raft::Role::Leader(
+                crate::raft::LeaderState::new(&[], last_log_idx),
+            ));
+            state.leader_id = Some(id);
         }
         let state = node.state.lock().await;
         assert!(state.role().is_leader());
@@ -315,8 +319,8 @@ mod tests {
         let mut node = create_test_node();
         {
             let mut state = node.state.lock().await;
-            state.persistent.current_term = Term::new(4);
-            state.become_candidate();
+            state.persistent.current_term = Term::new(5);
+            state.set_role(crate::raft::Role::Candidate);
             state.persist().await?;
         }
 

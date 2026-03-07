@@ -427,7 +427,7 @@ mod tests {
         let mut node = create_test_node(Config::default());
         {
             let mut state = node.state.lock().await;
-            state.become_candidate();
+            state.set_role(crate::raft::Role::Candidate);
             state.persist().await?;
         }
         node.run_candidate().await?;
@@ -461,7 +461,7 @@ mod tests {
         let mut node = create_test_node(config);
         {
             let mut state = node.state.lock().await;
-            state.become_candidate();
+            state.set_role(crate::raft::Role::Candidate);
             state.persist().await?;
         }
         let result = tokio::spawn(async move { node.run_candidate().await });

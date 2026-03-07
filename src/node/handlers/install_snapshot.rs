@@ -96,9 +96,14 @@ mod tests {
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.persistent.current_term = Term::new(4);
-        initial_state.become_candidate();
-        initial_state.become_leader(&[]);
+        initial_state.persistent.current_term = Term::new(5);
+        initial_state.set_role(crate::raft::Role::Leader(
+            crate::raft::LeaderState::new(
+                &[],
+                initial_state.get_last_log_idx(),
+            ),
+        ));
+        initial_state.leader_id = Some(initial_state.id);
         let state = Arc::new(Mutex::new(initial_state));
 
         let req = InstallSnapshotRequest {
@@ -129,8 +134,9 @@ mod tests {
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.persistent.current_term = Term::new(4);
-        initial_state.become_candidate();
+        initial_state.persistent.current_term = Term::new(5);
+        initial_state.set_role(crate::raft::Role::Candidate);
+        initial_state.persistent.voted_for = Some(crate::types::NodeId::new(1));
         let state = Arc::new(Mutex::new(initial_state));
 
         let req = InstallSnapshotRequest {

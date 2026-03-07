@@ -403,9 +403,14 @@ mod tests {
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.persistent.current_term = Term::new(49);
-        initial_state.become_candidate();
-        initial_state.become_leader(&[]);
+        initial_state.persistent.current_term = Term::new(50);
+        initial_state.set_role(crate::raft::Role::Leader(
+            crate::raft::LeaderState::new(
+                &[],
+                initial_state.get_last_log_idx(),
+            ),
+        ));
+        initial_state.leader_id = Some(initial_state.id);
         let state = Arc::new(Mutex::new(initial_state));
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(32);
@@ -463,9 +468,11 @@ mod tests {
             create_test_storage(),
             create_test_state_machine(),
         );
-        leader_state.persistent.current_term = Term::new(4);
-        leader_state.become_candidate();
-        leader_state.become_leader(&[]);
+        leader_state.persistent.current_term = Term::new(5);
+        leader_state.set_role(crate::raft::Role::Leader(
+            crate::raft::LeaderState::new(&[], leader_state.get_last_log_idx()),
+        ));
+        leader_state.leader_id = Some(leader_state.id);
         let state = Arc::new(Mutex::new(leader_state));
 
         let req = AppendEntriesRequest {
@@ -1050,8 +1057,10 @@ mod tests {
             create_test_storage(),
             create_test_state_machine(),
         );
-        candidate_state.persistent.current_term = Term::new(4);
-        candidate_state.become_candidate();
+        candidate_state.persistent.current_term = Term::new(5);
+        candidate_state.set_role(crate::raft::Role::Candidate);
+        candidate_state.persistent.voted_for =
+            Some(crate::types::NodeId::new(1));
         let state = Arc::new(Mutex::new(candidate_state));
 
         let req = AppendEntriesRequest {

@@ -670,9 +670,13 @@ mod tests {
         // ログエントリを追加: 古いterm と 現在のterm
         {
             let mut state = node.state.lock().await;
-            state.persistent.current_term = Term::new(4);
-            state.become_candidate();
-            state.become_leader(&[peer1, peer2]);
+            state.persistent.current_term = Term::new(5);
+            let last_log_idx = state.get_last_log_idx();
+            let id = state.id;
+            state.set_role(crate::raft::Role::Leader(
+                crate::raft::LeaderState::new(&[peer1, peer2], last_log_idx),
+            ));
+            state.leader_id = Some(id);
             state.commit_index = LogIndex::new(0);
 
             // 古いterm=3のエントリ
