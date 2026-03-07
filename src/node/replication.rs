@@ -471,13 +471,15 @@ where
         res: InstallSnapshotResponse,
         last_included_index: LogIndex,
     ) -> anyhow::Result<()> {
-        // Check if we need to step down due to higher term
-        let check_term = {
+        let should_step_down = {
             let state = self.state.lock().await;
-            res.term > state.persistent.current_term
+            crate::core::term::should_step_down_on_response(
+                res.term,
+                state.persistent.current_term,
+            )
         };
 
-        if check_term {
+        if should_step_down {
             {
                 let mut state = self.state.lock().await;
                 state.become_follower(res.term, None);
@@ -527,12 +529,15 @@ where
         res: AppendEntriesResponse,
         sent_up_to_index: LogIndex,
     ) -> anyhow::Result<()> {
-        let check_term = {
+        let should_step_down = {
             let state = self.state.lock().await;
-            res.term > state.persistent.current_term
+            crate::core::term::should_step_down_on_response(
+                res.term,
+                state.persistent.current_term,
+            )
         };
 
-        if check_term {
+        if should_step_down {
             {
                 let mut state = self.state.lock().await;
                 state.become_follower(res.term, None);
