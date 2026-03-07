@@ -438,7 +438,7 @@ impl MaelstromRaftNode {
             .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
         let state_inner = state.lock().await;
 
-        if state_inner.role.is_leader() {
+        if state_inner.role().is_leader() {
             return Ok(None);
         }
 
@@ -814,7 +814,7 @@ impl MaelstromRaftNode {
             .ok_or_else(|| anyhow::anyhow!("Node not initialized"))?;
         let state_inner = state.lock().await;
 
-        Ok(state_inner.role.is_leader())
+        Ok(state_inner.role().is_leader())
     }
 
     fn fix_cas_reply_to(&self, body: &mut Body, msg_id: u64) {

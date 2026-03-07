@@ -52,13 +52,13 @@ where
         let (leader_term, leader_id, leader_commit, log_data, peer_plan) = {
             let state = self.state.lock().await;
 
-            if !state.role.is_leader() {
+            if !state.role().is_leader() {
                 return Ok(false);
             }
 
             // Copy log and peer state data
             let log_entries = state.persistent.log.clone();
-            let Some(leader_state) = state.role.leader_state() else {
+            let Some(leader_state) = state.role().leader_state() else {
                 return Ok(false);
             };
             let plan: Vec<(SocketAddr, LogIndex, usize)> = self.peers
@@ -174,7 +174,7 @@ where
                             {
                                 let mut state = self.state.lock().await;
                                 if let Some(leader_state) =
-                                    state.role.leader_state_mut()
+                                    state.role_mut().leader_state_mut()
                                 {
                                     leader_state
                                         .inflight_snapshot
@@ -247,7 +247,9 @@ where
 
                 if !entries.is_empty() {
                     let mut state = self.state.lock().await;
-                    if let Some(leader_state) = state.role.leader_state_mut() {
+                    if let Some(leader_state) =
+                        state.role_mut().leader_state_mut()
+                    {
                         leader_state
                             .inflight_append
                             .entry(addr)
@@ -334,7 +336,7 @@ where
 
                     let still_leader = {
                         let state = self.state.lock().await;
-                        state.role.is_leader()
+                        state.role().is_leader()
                     };
 
                     if !still_leader {
@@ -404,13 +406,13 @@ where
         let mut state = self.state.lock().await;
 
         // Only leaders can update commit_index this way
-        if !state.role.is_leader() {
+        if !state.role().is_leader() {
             return Ok(());
         }
 
         let current_commit_index = state.commit_index;
         let new_commit_index =
-            if let Some(leader_state) = state.role.leader_state() {
+            if let Some(leader_state) = state.role().leader_state() {
                 crate::core::log::new_commit_index(
                     state.commit_index,
                     state.persistent.current_term,
@@ -447,7 +449,7 @@ where
         let mut state = self.state.lock().await;
 
         // Only leaders should call this
-        if !state.role.is_leader() {
+        if !state.role().is_leader() {
             return Ok(());
         }
 
@@ -492,7 +494,7 @@ where
         // Update replication indices to reflect successful snapshot installation
         let notifier = {
             let mut state = self.state.lock().await;
-            if let Some(leader_state) = state.role.leader_state_mut() {
+            if let Some(leader_state) = state.role_mut().leader_state_mut() {
                 leader_state.match_index.insert(addr, last_included_index);
                 leader_state
                     .next_index
@@ -551,7 +553,7 @@ where
             let state = self.state.lock().await;
             (
                 state.id,
-                state.role.is_leader(),
+                state.role().is_leader(),
                 state.persistent.current_term,
             )
         };
@@ -562,7 +564,7 @@ where
         // Step 6-7: Update replication state based on follower's response
         let notifier = {
             let mut state = self.state.lock().await;
-            if let Some(leader_state) = state.role.leader_state_mut() {
+            if let Some(leader_state) = state.role_mut().leader_state_mut() {
                 if res.success {
                     let current_match = leader_state
                         .match_index
@@ -669,10 +671,12 @@ mod tests {
         {
             let mut state = node.state.lock().await;
             state.persistent.current_term = Term::new(5);
-            state.role = raft::Role::Leader(raft::LeaderState::new(
-                &[peer1, peer2],
-                state.get_last_log_idx(),
+            let last_log_idx = state.get_last_log_idx();
+            let id = state.id;
+            state.set_role(crate::raft::Role::Leader(
+                crate::raft::LeaderState::new(&[peer1, peer2], last_log_idx),
             ));
+            state.leader_id = Some(id);
             state.commit_index = LogIndex::new(0);
 
             // 古いterm=3のエントリ
@@ -696,7 +700,7 @@ mod tests {
             });
 
             // match_indexを設定: すべてのエントリが過半数に複製されている
-            if let Some(leader_state) = state.role.leader_state_mut() {
+            if let Some(leader_state) = state.role_mut().leader_state_mut() {
                 leader_state.match_index.insert(peer1, LogIndex::new(4));
                 leader_state.match_index.insert(peer2, LogIndex::new(4));
             }
@@ -704,7 +708,7 @@ mod tests {
 
         let new_commit_index = {
             let state = node.state.lock().await;
-            if let Some(leader_state) = state.role.leader_state() {
+            if let Some(leader_state) = state.role().leader_state() {
                 crate::core::log::new_commit_index(
                     state.commit_index,
                     state.persistent.current_term,

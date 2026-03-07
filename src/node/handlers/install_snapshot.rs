@@ -29,7 +29,7 @@ where
     use crate::core::term::{TermAction, validate_leader_rpc_term};
 
     let is_candidate_or_leader =
-        state.role.is_candidate() || state.role.is_leader();
+        state.role().is_candidate() || state.role().is_leader();
 
     match validate_leader_rpc_term(
         req.term,
@@ -97,11 +97,13 @@ mod tests {
             create_test_state_machine(),
         );
         initial_state.persistent.current_term = Term::new(5);
-        initial_state.role =
-            crate::raft::Role::Leader(crate::raft::LeaderState::new(
+        initial_state.set_role(crate::raft::Role::Leader(
+            crate::raft::LeaderState::new(
                 &[],
                 initial_state.get_last_log_idx(),
-            ));
+            ),
+        ));
+        initial_state.leader_id = Some(initial_state.id);
         let state = Arc::new(Mutex::new(initial_state));
 
         let req = InstallSnapshotRequest {
@@ -116,7 +118,7 @@ mod tests {
 
         assert_eq!(response.term, Term::new(10));
         let final_state = state.lock().await;
-        assert!(final_state.role.is_follower());
+        assert!(final_state.role().is_follower());
         assert_eq!(final_state.persistent.current_term, Term::new(10));
         assert_eq!(final_state.leader_id, Some(NodeId::new(2)));
         assert_eq!(final_state.persistent.voted_for, None);
@@ -133,8 +135,8 @@ mod tests {
             create_test_state_machine(),
         );
         initial_state.persistent.current_term = Term::new(5);
-        initial_state.role = crate::raft::Role::Candidate;
-        initial_state.persistent.voted_for = Some(NodeId::new(1));
+        initial_state.set_role(crate::raft::Role::Candidate);
+        initial_state.persistent.voted_for = Some(crate::types::NodeId::new(1));
         let state = Arc::new(Mutex::new(initial_state));
 
         let req = InstallSnapshotRequest {
@@ -149,7 +151,7 @@ mod tests {
 
         assert_eq!(response.term, Term::new(5));
         let final_state = state.lock().await;
-        assert!(final_state.role.is_follower());
+        assert!(final_state.role().is_follower());
         assert_eq!(final_state.persistent.current_term, Term::new(5));
         assert_eq!(final_state.leader_id, Some(NodeId::new(3)));
 

@@ -94,7 +94,7 @@ pub struct RaftState<T: Send + Sync, SM: StateMachine<Command = T>> {
     pub commit_index: LogIndex,
     pub last_applied: LogIndex,
 
-    pub role: Role,
+    role: Role,
 
     pub leader_id: Option<NodeId>,
     pub id: NodeId,
@@ -132,6 +132,19 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
             replication_notifier: Arc::new(Notify::new()),
             last_applied_notifier: Arc::new(Notify::new()),
         }
+    }
+
+    pub fn role(&self) -> &Role {
+        &self.role
+    }
+
+    pub fn role_mut(&mut self) -> &mut Role {
+        &mut self.role
+    }
+
+    #[cfg(test)]
+    pub fn set_role(&mut self, role: Role) {
+        self.role = role;
     }
 
     pub async fn persist(&mut self) -> anyhow::Result<()> {
@@ -220,6 +233,11 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
 
     #[tracing::instrument(skip(self), fields(node_id = %self.id, new_term = %self.persistent.current_term.increment()))]
     pub fn become_candidate(&mut self) {
+        debug_assert!(
+            self.role.is_follower(),
+            "become_candidate() called from {:?}, expected Follower",
+            self.role
+        );
         self.persistent.current_term = self.persistent.current_term.increment();
         self.persistent.voted_for = Some(self.id);
         self.role = Role::Candidate;
@@ -228,6 +246,11 @@ impl<T: Send + Sync + Clone, SM: StateMachine<Command = T>> RaftState<T, SM> {
 
     #[tracing::instrument(skip(self, peers), fields(node_id = %self.id, peer_count = peers.len()))]
     pub fn become_leader(&mut self, peers: &[SocketAddr]) {
+        debug_assert!(
+            self.role.is_candidate(),
+            "become_leader() called from {:?}, expected Candidate",
+            self.role
+        );
         let last_log_index = self.get_last_log_idx();
         let leader_state = LeaderState::new(peers, last_log_index);
         self.role = Role::Leader(leader_state);
@@ -492,9 +515,10 @@ mod tests {
         )));
         {
             let mut state = old_leader_state.lock().await;
-            state.persistent.current_term = Term::new(1);
-            state.role =
-                Role::Leader(LeaderState::new(&[], state.get_last_log_idx()));
+            let last_log_idx = state.get_last_log_idx();
+            let id = state.id;
+            state.set_role(Role::Leader(LeaderState::new(&[], last_log_idx)));
+            state.leader_id = Some(id);
             state.persistent.log.push(Entry {
                 term: Term::new(1),
                 command: KVCommand::Set {
@@ -552,7 +576,7 @@ mod tests {
         {
             let state = old_leader_state.lock().await;
             assert!(
-                state.role.is_follower(),
+                state.role().is_follower(),
                 "Old leader should have stepped down to follower"
             );
             assert_eq!(
@@ -608,11 +632,11 @@ mod tests {
             Box::new(MemStorage::default()),
             KVStateMachine::default(),
         );
-        leader_state.persistent.current_term = Term::new(1);
-        leader_state.role = Role::Leader(LeaderState::new(
+        leader_state.set_role(Role::Leader(LeaderState::new(
             &[],
             leader_state.get_last_log_idx(),
-        ));
+        )));
+        leader_state.leader_id = Some(leader_state.id);
 
         // Leader commits and applies value 1
         leader_state.persistent.log.push(Entry {
@@ -878,5 +902,82 @@ mod tests {
         assert_eq!(state.commit_index, LogIndex::new(0));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_role_accessor_returns_current_role() {
+        let state = RaftState::new(
+            1u32,
+            Box::new(MemStorage::default()),
+            NoOpStateMachine::default(),
+        );
+        assert!(state.role().is_follower());
+    }
+
+    #[test]
+    fn test_normal_transition_follower_candidate_leader_follower() {
+        let mut state = RaftState::new(
+            1u32,
+            Box::new(MemStorage::default()),
+            NoOpStateMachine::default(),
+        );
+
+        assert!(state.role().is_follower());
+
+        state.become_candidate();
+        assert!(state.role().is_candidate());
+
+        state.become_leader(&[]);
+        assert!(state.role().is_leader());
+
+        state.become_follower(Term::new(2), None);
+        assert!(state.role().is_follower());
+    }
+
+    #[test]
+    fn test_become_follower_from_any_role() {
+        let mut state = RaftState::new(
+            1u32,
+            Box::new(MemStorage::default()),
+            NoOpStateMachine::default(),
+        );
+
+        state.become_follower(Term::new(1), None);
+        assert!(state.role().is_follower());
+
+        state.become_candidate();
+        state.become_follower(Term::new(2), None);
+        assert!(state.role().is_follower());
+
+        state.become_candidate();
+        state.become_leader(&[]);
+        state.become_follower(Term::new(3), None);
+        assert!(state.role().is_follower());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn test_become_candidate_from_leader_panics() {
+        let mut state = RaftState::new(
+            1u32,
+            Box::new(MemStorage::default()),
+            NoOpStateMachine::default(),
+        );
+        state.become_candidate();
+        state.become_leader(&[]);
+        state.become_candidate();
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn test_become_leader_from_follower_panics() {
+        let mut state = RaftState::new(
+            1u32,
+            Box::new(MemStorage::default()),
+            NoOpStateMachine::default(),
+        );
+        state.become_leader(&[]);
     }
 }

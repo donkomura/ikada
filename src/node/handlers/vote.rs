@@ -124,11 +124,13 @@ mod tests {
             create_test_state_machine(),
         );
         initial_state.persistent.current_term = Term::new(50);
-        initial_state.role =
-            crate::raft::Role::Leader(crate::raft::LeaderState::new(
+        initial_state.set_role(crate::raft::Role::Leader(
+            crate::raft::LeaderState::new(
                 &[],
                 initial_state.get_last_log_idx(),
-            ));
+            ),
+        ));
+        initial_state.leader_id = Some(initial_state.id);
         let state = Arc::new(Mutex::new(initial_state));
 
         let req = RequestVoteRequest {
@@ -142,7 +144,7 @@ mod tests {
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.current_term, Term::new(100));
-        assert!(final_state.role.is_follower());
+        assert!(final_state.role().is_follower());
 
         Ok(())
     }
