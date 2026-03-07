@@ -365,7 +365,7 @@ where
                             // Check if this node is the leader
                             let is_leader = {
                                 let state = state_clone.lock().await;
-                                state.role.is_leader()
+                                state.role().is_leader()
                             };
 
                             if is_leader {
@@ -398,7 +398,7 @@ where
                             // Check if this node is the leader
                             let is_leader = {
                                 let state = state_clone.lock().await;
-                                state.role.is_leader()
+                                state.role().is_leader()
                             };
 
                             if is_leader {
@@ -406,7 +406,7 @@ where
                                 let peer_count = {
                                     let state = state_clone.lock().await;
                                     state
-                                        .role
+                                        .role()
                                         .leader_state()
                                         .map(|ls| ls.match_index.len())
                                         .unwrap_or(0)

@@ -29,7 +29,7 @@ where
     use crate::core::term::{TermAction, validate_leader_rpc_term};
 
     let is_candidate_or_leader =
-        state.role.is_candidate() || state.role.is_leader();
+        state.role().is_candidate() || state.role().is_leader();
 
     match validate_leader_rpc_term(
         request_term,
@@ -403,14 +403,9 @@ mod tests {
             create_test_storage(),
             create_test_state_machine(),
         );
-        initial_state.persistent.current_term = Term::new(50);
-        initial_state.persistent.voted_for = Some(NodeId::new(1));
-        // Set to Leader role directly for test
-        initial_state.role =
-            crate::raft::Role::Leader(crate::raft::LeaderState::new(
-                &[],
-                initial_state.get_last_log_idx(),
-            ));
+        initial_state.persistent.current_term = Term::new(49);
+        initial_state.become_candidate();
+        initial_state.become_leader(&[]);
         let state = Arc::new(Mutex::new(initial_state));
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(32);
@@ -453,7 +448,7 @@ mod tests {
 
         let final_state = state.lock().await;
         assert_eq!(final_state.persistent.current_term, Term::new(100));
-        assert!(final_state.role.is_follower());
+        assert!(final_state.role().is_follower());
         assert_eq!(final_state.persistent.voted_for, None);
         assert_eq!(final_state.leader_id, Some(NodeId::new(99999)));
 
@@ -468,11 +463,9 @@ mod tests {
             create_test_storage(),
             create_test_state_machine(),
         );
-        leader_state.persistent.current_term = Term::new(5);
-        leader_state.persistent.voted_for = Some(NodeId::new(1));
-        leader_state.role = crate::raft::Role::Leader(
-            crate::raft::LeaderState::new(&[], leader_state.get_last_log_idx()),
-        );
+        leader_state.persistent.current_term = Term::new(4);
+        leader_state.become_candidate();
+        leader_state.become_leader(&[]);
         let state = Arc::new(Mutex::new(leader_state));
 
         let req = AppendEntriesRequest {
@@ -489,7 +482,7 @@ mod tests {
         assert_eq!(response.term, Term::new(8));
 
         let final_state = state.lock().await;
-        assert!(final_state.role.is_follower());
+        assert!(final_state.role().is_follower());
         assert_eq!(final_state.persistent.current_term, Term::new(8));
         assert_eq!(final_state.leader_id, Some(NodeId::new(3)));
         assert_eq!(final_state.persistent.voted_for, None);
@@ -1057,9 +1050,8 @@ mod tests {
             create_test_storage(),
             create_test_state_machine(),
         );
-        candidate_state.persistent.current_term = Term::new(5);
-        candidate_state.role = crate::raft::Role::Candidate;
-        candidate_state.persistent.voted_for = Some(NodeId::new(1));
+        candidate_state.persistent.current_term = Term::new(4);
+        candidate_state.become_candidate();
         let state = Arc::new(Mutex::new(candidate_state));
 
         let req = AppendEntriesRequest {
@@ -1075,7 +1067,7 @@ mod tests {
         assert!(response.success);
 
         let final_state = state.lock().await;
-        assert!(final_state.role.is_follower());
+        assert!(final_state.role().is_follower());
         assert_eq!(final_state.persistent.current_term, Term::new(5));
         assert_eq!(final_state.leader_id, Some(NodeId::new(2)));
 

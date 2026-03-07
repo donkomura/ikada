@@ -196,7 +196,9 @@ where
                     };
                     state.persistent.log.push(noop_entry);
                     let noop_idx = state.get_last_log_idx();
-                    if let Some(leader_state) = state.role.leader_state_mut() {
+                    if let Some(leader_state) =
+                        state.role_mut().leader_state_mut()
+                    {
                         leader_state.noop_index = Some(noop_idx);
                     }
                     state.persist().await.context(
@@ -270,11 +272,11 @@ mod tests {
         let node = create_test_node();
         {
             let mut state = node.state.lock().await;
-            let peers: Vec<_> = vec![];
-            state.become_leader(&peers);
+            state.become_candidate();
+            state.become_leader(&[]);
         }
         let state = node.state.lock().await;
-        assert!(state.role.is_leader());
+        assert!(state.role().is_leader());
         assert_eq!(state.leader_id, Some(state.id));
         Ok(())
     }
@@ -288,7 +290,7 @@ mod tests {
             state.become_candidate();
         }
         let state = node.state.lock().await;
-        assert!(state.role.is_candidate());
+        assert!(state.role().is_candidate());
         assert_eq!(state.persistent.current_term, term.increment());
         Ok(())
     }
@@ -302,7 +304,7 @@ mod tests {
             state.become_follower(current_term, None);
         }
         let state = node.state.lock().await;
-        assert!(state.role.is_follower());
+        assert!(state.role().is_follower());
         Ok(())
     }
 
@@ -313,8 +315,8 @@ mod tests {
         let mut node = create_test_node();
         {
             let mut state = node.state.lock().await;
-            state.persistent.current_term = Term::new(5);
-            state.role = crate::raft::Role::Candidate;
+            state.persistent.current_term = Term::new(4);
+            state.become_candidate();
             state.persist().await?;
         }
 
@@ -326,7 +328,7 @@ mod tests {
         node.handle_election(responses).await?;
 
         let state = node.state.lock().await;
-        assert!(state.role.is_follower());
+        assert!(state.role().is_follower());
         assert_eq!(state.persistent.current_term, Term::new(10));
 
         drop(state);

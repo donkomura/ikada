@@ -12,7 +12,7 @@ where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
 {
-    if !state.role.is_leader() {
+    if !state.role().is_leader() {
         return Err(CommandResponse {
             success: false,
             leader_hint: state.leader_id,
@@ -56,7 +56,7 @@ where
         let is_replicated = {
             let state_guard = state.lock().await;
 
-            if !state_guard.role.is_leader() {
+            if !state_guard.role().is_leader() {
                 return Err(CommandResponse {
                     success: false,
                     leader_hint: state_guard.leader_id,
@@ -69,7 +69,7 @@ where
             let majority = total_nodes / 2;
             let mut count = 1;
 
-            if let Some(leader_state) = state_guard.role.leader_state() {
+            if let Some(leader_state) = state_guard.role().leader_state() {
                 for match_idx in leader_state.match_index.values() {
                     if *match_idx >= log_index {
                         count += 1;
@@ -325,8 +325,10 @@ where
         }
 
         let current_term = state_guard.persistent.current_term;
-        let noop_index =
-            state_guard.role.leader_state().and_then(|ls| ls.noop_index);
+        let noop_index = state_guard
+            .role()
+            .leader_state()
+            .and_then(|ls| ls.noop_index);
         let commit_index = state_guard.commit_index;
 
         let noop_committed = if let Some(noop_idx) = noop_index {
@@ -483,7 +485,7 @@ where
             }
 
             let confirmed =
-                if let Some(leader_state) = state_guard.role.leader_state() {
+                if let Some(leader_state) = state_guard.role().leader_state() {
                     leader_state
                         .match_index
                         .values()
