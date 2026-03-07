@@ -145,69 +145,72 @@ where
         };
         tracing::info!(id=%id, responses=?responses, "election handled");
 
-        let new_terms: Vec<_> =
-            responses.iter().filter(|r| r.term > current_term).collect();
-        if !new_terms.is_empty() {
-            tracing::info!(
-                id = %id,
-                term = %current_term,
-                "newer term was discovered"
-            );
-            {
-                let mut state = self.state.lock().await;
-                let new_term = new_terms[0].term;
-                state.persistent.current_term = new_term;
-                state.become_follower(new_term, None);
-            }
-            self.heartbeat_failure_count = 0;
-            return Ok(());
-        }
-
-        // Check for majority: (peers + self)
+        let votes: Vec<_> =
+            responses.iter().map(|r| (r.term, r.vote_granted)).collect();
         let total_nodes = self.peers.len() + 1;
-        let vote_granted = responses.iter().filter(|r| r.vote_granted).count()
-            > total_nodes / 2;
 
-        if vote_granted {
-            tracing::info!(
-                id = %id,
-                voted_count =
-                    responses.iter().filter(|r| r.vote_granted).count(),
-                "vote granted, become leader"
-            );
+        let result = crate::core::election::evaluate_election(
+            &votes,
+            current_term,
+            total_nodes,
+        );
 
-            // Transition to leader role
-            {
-                let mut state = self.state.lock().await;
-                tracing::info!(id=%state.id, term=%state.persistent.current_term, "BECOMING LEADER");
-
-                let peers: Vec<_> = self.peers.keys().copied().collect();
-                state.become_leader(&peers);
-
-                // Append no-op entry for ReadIndex optimization
-                let current_term = state.persistent.current_term;
-                let noop_entry = crate::raft::Entry {
-                    term: current_term,
-                    command: T::default(),
-                };
-                state.persistent.log.push(noop_entry);
-                let noop_idx = state.get_last_log_idx();
-                if let Some(leader_state) = state.role.leader_state_mut() {
-                    leader_state.noop_index = Some(noop_idx);
-                }
-                state
-                    .persist()
-                    .await
-                    .context("failed to persist state after leader election")?;
-
+        match result {
+            crate::core::election::ElectionResult::NewerTermDiscovered {
+                term,
+            } => {
                 tracing::info!(
-                    id = ?state.id,
-                    noop_index = %noop_idx,
-                    "Appended no-op entry for ReadIndex"
+                    id = %id,
+                    term = %current_term,
+                    new_term = %term,
+                    "newer term was discovered"
                 );
+                {
+                    let mut state = self.state.lock().await;
+                    state.persistent.current_term = term;
+                    state.become_follower(term, None);
+                }
+                self.heartbeat_failure_count = 0;
             }
+            crate::core::election::ElectionResult::Won => {
+                let voted_count = votes.iter().filter(|(_, v)| *v).count();
+                tracing::info!(
+                    id = %id,
+                    voted_count = voted_count,
+                    "vote granted, become leader"
+                );
 
-            self.heartbeat_failure_count = 0;
+                {
+                    let mut state = self.state.lock().await;
+                    tracing::info!(id=%state.id, term=%state.persistent.current_term, "BECOMING LEADER");
+
+                    let peers: Vec<_> = self.peers.keys().copied().collect();
+                    state.become_leader(&peers);
+
+                    let current_term = state.persistent.current_term;
+                    let noop_entry = crate::raft::Entry {
+                        term: current_term,
+                        command: T::default(),
+                    };
+                    state.persistent.log.push(noop_entry);
+                    let noop_idx = state.get_last_log_idx();
+                    if let Some(leader_state) = state.role.leader_state_mut() {
+                        leader_state.noop_index = Some(noop_idx);
+                    }
+                    state.persist().await.context(
+                        "failed to persist state after leader election",
+                    )?;
+
+                    tracing::info!(
+                        id = ?state.id,
+                        noop_index = %noop_idx,
+                        "Appended no-op entry for ReadIndex"
+                    );
+                }
+
+                self.heartbeat_failure_count = 0;
+            }
+            crate::core::election::ElectionResult::Lost => {}
         }
 
         Ok(())

@@ -29,38 +29,23 @@ where
 
         tracing::info!(id=?state.id, request.body=?req, "Command::RequestVote");
 
-        let vote_granted = if req.term < state.persistent.current_term {
-            tracing::warn!(
-                id=?state.id,
-                candidate_id=%req.candidate_id,
-                req_term=%req.term,
-                current_term=%state.persistent.current_term,
-                "RequestVote rejected: candidate term is older"
-            );
-            false
-        } else if state
-            .persistent
-            .voted_for
-            .is_some_and(|v| v != req.candidate_id)
-        {
-            tracing::warn!(
-                id=?state.id,
-                candidate_id=%req.candidate_id,
-                voted_for=?state.persistent.voted_for,
-                "RequestVote rejected: already voted for another candidate"
-            );
-            false
-        } else {
-            let last_log_term = state.get_last_log_term();
-            let last_log_idx = state.get_last_log_idx();
-
-            let log_is_up_to_date = if req.last_log_term != last_log_term {
-                req.last_log_term > last_log_term
-            } else {
-                req.last_log_index >= last_log_idx
+        let vote_granted = {
+            let vote_req = crate::core::election::VoteRequest {
+                request_term: req.term,
+                candidate_id: req.candidate_id,
+                candidate_last_log_term: req.last_log_term,
+                candidate_last_log_index: req.last_log_index,
             };
+            let voter = crate::core::election::VoterState {
+                current_term: state.persistent.current_term,
+                voted_for: state.persistent.voted_for,
+                last_log_term: state.get_last_log_term(),
+                last_log_index: state.get_last_log_idx(),
+            };
+            let grant =
+                crate::core::election::should_grant_vote(&vote_req, &voter);
 
-            if log_is_up_to_date {
+            if grant {
                 state.persistent.voted_for = Some(req.candidate_id);
                 if let Err(e) = state.persist().await {
                     tracing::error!(id=?state.id, error=?e, "Failed to persist state after voting");
@@ -69,19 +54,38 @@ where
                         vote_granted: false,
                     };
                 }
-                true
+            } else if req.term < state.persistent.current_term {
+                tracing::warn!(
+                    id=?state.id,
+                    candidate_id=%req.candidate_id,
+                    req_term=%req.term,
+                    current_term=%state.persistent.current_term,
+                    "RequestVote rejected: candidate term is older"
+                );
+            } else if state
+                .persistent
+                .voted_for
+                .is_some_and(|v| v != req.candidate_id)
+            {
+                tracing::warn!(
+                    id=?state.id,
+                    candidate_id=%req.candidate_id,
+                    voted_for=?state.persistent.voted_for,
+                    "RequestVote rejected: already voted for another candidate"
+                );
             } else {
                 tracing::warn!(
                     id=?state.id,
                     candidate_id=%req.candidate_id,
                     req_last_log_term=%req.last_log_term,
                     req_last_log_index=%req.last_log_index,
-                    last_log_term=%last_log_term,
-                    last_log_idx=%last_log_idx,
+                    last_log_term=%state.get_last_log_term(),
+                    last_log_idx=%state.get_last_log_idx(),
                     "RequestVote rejected: candidate's log is not up-to-date"
                 );
-                false
             }
+
+            grant
         };
 
         (state.persistent.current_term, vote_granted)
