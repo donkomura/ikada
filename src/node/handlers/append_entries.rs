@@ -26,12 +26,12 @@ where
     T: Send + Sync + Clone,
     SM: StateMachine<Command = T>,
 {
-    use crate::core::term::{TermAction, validate_request_term};
+    use crate::core::term::{TermAction, validate_leader_rpc_term};
 
     let is_candidate_or_leader =
         state.role.is_candidate() || state.role.is_leader();
 
-    match validate_request_term(
+    match validate_leader_rpc_term(
         request_term,
         state.persistent.current_term,
         sender_id,
@@ -456,6 +456,43 @@ mod tests {
         assert!(final_state.role.is_follower());
         assert_eq!(final_state.persistent.voted_for, None);
         assert_eq!(final_state.leader_id, Some(NodeId::new(99999)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_entries_higher_term_leader_steps_down_and_persists_term()
+    -> anyhow::Result<()> {
+        let mut leader_state = RaftState::new(
+            1u32,
+            create_test_storage(),
+            create_test_state_machine(),
+        );
+        leader_state.persistent.current_term = Term::new(5);
+        leader_state.persistent.voted_for = Some(NodeId::new(1));
+        leader_state.role = crate::raft::Role::Leader(
+            crate::raft::LeaderState::new(&[], leader_state.get_last_log_idx()),
+        );
+        let state = Arc::new(Mutex::new(leader_state));
+
+        let req = AppendEntriesRequest {
+            term: Term::new(8),
+            leader_id: NodeId::new(3),
+            prev_log_index: LogIndex::new(0),
+            prev_log_term: Term::new(0),
+            entries: vec![],
+            leader_commit: LogIndex::new(0),
+        };
+
+        let response = handle_append_entries(&req, state.clone(), None).await?;
+        assert!(response.success);
+        assert_eq!(response.term, Term::new(8));
+
+        let final_state = state.lock().await;
+        assert!(final_state.role.is_follower());
+        assert_eq!(final_state.persistent.current_term, Term::new(8));
+        assert_eq!(final_state.leader_id, Some(NodeId::new(3)));
+        assert_eq!(final_state.persistent.voted_for, None);
 
         Ok(())
     }

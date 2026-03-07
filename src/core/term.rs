@@ -10,7 +10,7 @@ pub enum TermAction {
     Accept,
 }
 
-pub fn validate_request_term(
+pub fn validate_leader_rpc_term(
     request_term: Term,
     current_term: Term,
     sender_id: NodeId,
@@ -48,11 +48,11 @@ pub fn should_step_down_on_response(
 mod tests {
     use super::*;
 
-    // --- validate_request_term ---
+    // --- validate_leader_rpc_term ---
 
     #[test]
     fn reject_when_request_term_is_older() {
-        let action = validate_request_term(
+        let action = validate_leader_rpc_term(
             Term::new(3),
             Term::new(5),
             NodeId::new(2),
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn reject_when_request_term_is_older_regardless_of_role() {
-        let action = validate_request_term(
+        let action = validate_leader_rpc_term(
             Term::new(1),
             Term::new(10),
             NodeId::new(2),
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn step_down_when_request_term_is_newer_as_follower() {
-        let action = validate_request_term(
+        let action = validate_leader_rpc_term(
             Term::new(10),
             Term::new(5),
             NodeId::new(2),
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn step_down_when_request_term_is_newer_as_candidate() {
-        let action = validate_request_term(
+        let action = validate_leader_rpc_term(
             Term::new(10),
             Term::new(5),
             NodeId::new(3),
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn step_down_when_request_term_is_newer_as_leader() {
-        let action = validate_request_term(
+        let action = validate_leader_rpc_term(
             Term::new(100),
             Term::new(50),
             NodeId::new(99),
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn accept_when_same_term_as_follower() {
-        let action = validate_request_term(
+        let action = validate_leader_rpc_term(
             Term::new(5),
             Term::new(5),
             NodeId::new(2),
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn step_down_when_same_term_as_candidate() {
-        let action = validate_request_term(
+        let action = validate_leader_rpc_term(
             Term::new(5),
             Term::new(5),
             NodeId::new(2),
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn step_down_when_same_term_as_leader() {
-        let action = validate_request_term(
+        let action = validate_leader_rpc_term(
             Term::new(5),
             Term::new(5),
             NodeId::new(3),
