@@ -167,8 +167,10 @@ where
                 );
                 {
                     let mut state = self.state.lock().await;
-                    state.persistent.current_term = term;
                     state.become_follower(term, None);
+                    state.persist().await.context(
+                        "failed to persist state after discovering newer term in election",
+                    )?;
                 }
                 self.heartbeat_failure_count = 0;
             }
@@ -301,6 +303,43 @@ mod tests {
         }
         let state = node.state.lock().await;
         assert!(state.role.is_follower());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_election_newer_term_persists_state() -> anyhow::Result<()> {
+        use crate::types::Term;
+
+        let mut node = create_test_node();
+        {
+            let mut state = node.state.lock().await;
+            state.persistent.current_term = Term::new(5);
+            state.role = crate::raft::Role::Candidate;
+            state.persist().await?;
+        }
+
+        let responses = vec![RequestVoteResponse {
+            term: Term::new(10),
+            vote_granted: false,
+        }];
+
+        node.handle_election(responses).await?;
+
+        let state = node.state.lock().await;
+        assert!(state.role.is_follower());
+        assert_eq!(state.persistent.current_term, Term::new(10));
+
+        drop(state);
+
+        let persisted = node.state.lock().await.load_persisted().await?.expect(
+            "persisted state should exist after stepping down on newer term",
+        );
+        assert_eq!(
+            persisted.current_term,
+            Term::new(10),
+            "Persisted term should be updated to the newer term"
+        );
+
         Ok(())
     }
 }
