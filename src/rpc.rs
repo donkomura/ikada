@@ -129,6 +129,8 @@ pub struct InstallSnapshotResponse {
     pub term: Term,
 }
 
+/// Trait for Raft RPC client abstraction.
+/// This is dyn-compatible, unlike framework-specific generated traits.
 #[async_trait::async_trait]
 pub trait RaftRpcTrait: Send + Sync {
     async fn append_entries(

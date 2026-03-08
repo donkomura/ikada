@@ -19,6 +19,8 @@ pub fn init_tracing(
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(1.0);
 
+    // ParentBased sampler: follows parent span's sampling decision if present,
+    // otherwise uses TraceIdRatioBased sampling
     let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
         sampling_ratio,
     )));
@@ -80,6 +82,8 @@ pub fn init_tracing_stderr(
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.1);
 
+    // ParentBased sampler: follows parent span's sampling decision if present,
+    // otherwise uses TraceIdRatioBased sampling
     let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
         sampling_ratio,
     )));

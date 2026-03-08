@@ -16,19 +16,20 @@ nom = "7"
 opentelemetry = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
 opentelemetry_sdk = "0.31.0"
-prost = "0.13"
+prost = "0.14"
+tonic-prost = "0.14"
 rand = "0.9.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0.17"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "test-util", "fs"] }
-tonic = "0.12"
+tonic = "0.14"
 tracing = { version = "0.1.41", features = ["attributes"] }
 tracing-opentelemetry = "0.32.0"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [[bin]]
 name = "maelstrom-ikada"

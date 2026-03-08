@@ -359,6 +359,7 @@ where
         Ok(has_majority)
     }
 
+    /// Sends AppendEntries RPC to a single follower.
     async fn send_heartbeat(
         server: SocketAddr,
         client: Arc<dyn RaftRpcTrait>,
@@ -375,6 +376,7 @@ where
         ))
     }
 
+    /// Sends InstallSnapshot RPC to a single follower.
     async fn send_install_snapshot(
         server: SocketAddr,
         client: Arc<dyn RaftRpcTrait>,
