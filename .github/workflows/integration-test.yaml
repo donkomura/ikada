@@ -30,6 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: arduino/setup-protoc@v3
       - name: Build maelstrom-ikada binary
         run: cargo build --release --bin maelstrom-ikada
       - name: Upload binary
