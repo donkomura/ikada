@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tarpc::{client, tokio_serde::formats::Json};
+use tarpc::{client, tokio_serde::formats::Bincode};
 
 use crate::rpc::{RaftRpcClient, RaftRpcTrait};
 
@@ -59,7 +59,7 @@ impl NetworkFactory for TarpcNetworkFactory {
         addr: SocketAddr,
     ) -> Result<Arc<dyn RaftRpcTrait>, NetworkError> {
         let transport =
-            tarpc::serde_transport::tcp::connect(addr, Json::default)
+            tarpc::serde_transport::tcp::connect(addr, Bincode::default)
                 .await
                 .map_err(|e| {
                     NetworkError::ConnectionFailed(format!(
@@ -245,10 +245,10 @@ pub mod mock {
                     Arc::clone(client)
                 } else {
                     use tarpc::client;
-                    use tarpc::tokio_serde::formats::Json;
+                    use tarpc::tokio_serde::formats::Bincode;
                     let transport = tarpc::serde_transport::tcp::connect(
                         addr,
-                        Json::default,
+                        Bincode::default,
                     )
                     .await
                     .map_err(|e| {
