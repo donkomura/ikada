@@ -228,7 +228,7 @@ where
         req: RequestVoteRequest,
         rpc_timeout: Duration,
     ) -> anyhow::Result<RequestVoteResponse> {
-        let ctx = crate::rpc::RpcContext::current()
+        let ctx = crate::rpc::RpcContext::background()
             .with_deadline(Instant::now() + rpc_timeout);
 
         client.request_vote(ctx, req.clone()).await.map_err(|e| {

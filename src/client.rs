@@ -38,7 +38,7 @@ impl<NF: NetworkFactory> RaftClient<NF> {
     ) -> anyhow::Result<Vec<u8>> {
         const TIMEOUT: Duration = Duration::from_secs(10);
 
-        let ctx = RpcContext::current().with_timeout(TIMEOUT);
+        let ctx = RpcContext::background().with_timeout(TIMEOUT);
 
         let request = CommandRequest {
             command: command.clone(),

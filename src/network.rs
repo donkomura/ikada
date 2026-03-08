@@ -63,13 +63,9 @@ impl RaftRpcTrait for TonicRpcClient {
         req: crate::rpc::AppendEntriesRequest,
     ) -> anyhow::Result<crate::rpc::AppendEntriesResponse> {
         let mut client = self.inner.clone();
-        let proto_req: proto::AppendEntriesRequest = (&req).into();
-        let mut request = tonic::Request::new(proto_req);
-        if let Some(timeout) = ctx.timeout() {
-            request.set_timeout(timeout);
-        }
-        let response = client.append_entries(request).await?;
-        Ok(response.into_inner().into())
+        let request =
+            ctx.into_tonic_request(proto::AppendEntriesRequest::from(&req));
+        Ok(client.append_entries(request).await?.into_inner().into())
     }
 
     async fn request_vote(
@@ -78,13 +74,9 @@ impl RaftRpcTrait for TonicRpcClient {
         req: crate::rpc::RequestVoteRequest,
     ) -> anyhow::Result<crate::rpc::RequestVoteResponse> {
         let mut client = self.inner.clone();
-        let proto_req: proto::RequestVoteRequest = (&req).into();
-        let mut request = tonic::Request::new(proto_req);
-        if let Some(timeout) = ctx.timeout() {
-            request.set_timeout(timeout);
-        }
-        let response = client.request_vote(request).await?;
-        Ok(response.into_inner().into())
+        let request =
+            ctx.into_tonic_request(proto::RequestVoteRequest::from(&req));
+        Ok(client.request_vote(request).await?.into_inner().into())
     }
 
     async fn client_request(
@@ -93,13 +85,8 @@ impl RaftRpcTrait for TonicRpcClient {
         req: crate::rpc::CommandRequest,
     ) -> anyhow::Result<crate::rpc::CommandResponse> {
         let mut client = self.inner.clone();
-        let proto_req: proto::CommandRequest = (&req).into();
-        let mut request = tonic::Request::new(proto_req);
-        if let Some(timeout) = ctx.timeout() {
-            request.set_timeout(timeout);
-        }
-        let response = client.client_request(request).await?;
-        Ok(response.into_inner().into())
+        let request = ctx.into_tonic_request(proto::CommandRequest::from(&req));
+        Ok(client.client_request(request).await?.into_inner().into())
     }
 
     async fn install_snapshot(
@@ -108,13 +95,9 @@ impl RaftRpcTrait for TonicRpcClient {
         req: crate::rpc::InstallSnapshotRequest,
     ) -> anyhow::Result<crate::rpc::InstallSnapshotResponse> {
         let mut client = self.inner.clone();
-        let proto_req: proto::InstallSnapshotRequest = (&req).into();
-        let mut request = tonic::Request::new(proto_req);
-        if let Some(timeout) = ctx.timeout() {
-            request.set_timeout(timeout);
-        }
-        let response = client.install_snapshot(request).await?;
-        Ok(response.into_inner().into())
+        let request =
+            ctx.into_tonic_request(proto::InstallSnapshotRequest::from(&req));
+        Ok(client.install_snapshot(request).await?.into_inner().into())
     }
 }
 

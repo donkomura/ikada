@@ -9,7 +9,7 @@ pub struct RpcContext {
 }
 
 impl RpcContext {
-    pub fn current() -> Self {
+    pub fn background() -> Self {
         Self { deadline: None }
     }
 
@@ -154,6 +154,16 @@ pub trait RaftRpcTrait: Send + Sync {
         ctx: RpcContext,
         req: InstallSnapshotRequest,
     ) -> anyhow::Result<InstallSnapshotResponse>;
+}
+
+impl RpcContext {
+    pub fn into_tonic_request<T>(self, message: T) -> tonic::Request<T> {
+        let mut req = tonic::Request::new(message);
+        if let Some(timeout) = self.timeout() {
+            req.set_timeout(timeout);
+        }
+        req
+    }
 }
 
 pub mod proto {
@@ -402,7 +412,7 @@ mod tests {
 
     #[test]
     fn rpc_context_with_timeout() {
-        let ctx = RpcContext::current().with_timeout(Duration::from_secs(5));
+        let ctx = RpcContext::background().with_timeout(Duration::from_secs(5));
         assert!(ctx.deadline.is_some());
         let timeout = ctx.timeout().unwrap();
         assert!(timeout <= Duration::from_secs(5));
@@ -411,7 +421,7 @@ mod tests {
 
     #[test]
     fn rpc_context_no_deadline() {
-        let ctx = RpcContext::current();
+        let ctx = RpcContext::background();
         assert!(ctx.deadline.is_none());
         assert!(ctx.timeout().is_none());
     }

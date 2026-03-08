@@ -366,7 +366,7 @@ where
         sent_up_to_index: LogIndex,
         rpc_timeout: Duration,
     ) -> anyhow::Result<(SocketAddr, ReplicationResponse)> {
-        let ctx = crate::rpc::RpcContext::current()
+        let ctx = crate::rpc::RpcContext::background()
             .with_deadline(Instant::now() + rpc_timeout);
         let res = client.append_entries(ctx, req.clone()).await?;
         Ok((
@@ -381,7 +381,7 @@ where
         req: crate::rpc::InstallSnapshotRequest,
         rpc_timeout: Duration,
     ) -> anyhow::Result<(SocketAddr, ReplicationResponse)> {
-        let ctx = crate::rpc::RpcContext::current()
+        let ctx = crate::rpc::RpcContext::background()
             .with_deadline(Instant::now() + rpc_timeout);
         let last_included_index = req.last_included_index;
         let res = client.install_snapshot(ctx, req).await?;
@@ -810,7 +810,7 @@ mod tests {
         };
 
         let result = client
-            .append_entries(RpcContext::current(), req.clone())
+            .append_entries(RpcContext::background(), req.clone())
             .await;
         assert!(
             result.is_ok(),
@@ -824,7 +824,7 @@ mod tests {
         .await;
 
         let result = client
-            .append_entries(RpcContext::current(), req.clone())
+            .append_entries(RpcContext::background(), req.clone())
             .await;
         assert!(
             result.is_err(),
@@ -843,7 +843,7 @@ mod tests {
         )
         .await;
 
-        let result = client.append_entries(RpcContext::current(), req).await;
+        let result = client.append_entries(RpcContext::background(), req).await;
         assert!(
             result.is_ok(),
             "Expected success after healing, got error: {:?}",
