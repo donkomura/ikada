@@ -69,37 +69,33 @@ async fn run() -> anyhow::Result<()> {
 
     let bind_addr: SocketAddr = format!("{}:{}", host, port).parse()?;
 
-    let network_factory = TarpcNetworkFactory::new();
-
     let timeout_ms = rand::rng().random_range(
         args.election_timeout_min_ms..=args.election_timeout_max_ms,
     );
 
-    let config = Config {
-        heartbeat_interval: tokio::time::Duration::from_millis(
+    let config = Config::builder()
+        .heartbeat_interval(tokio::time::Duration::from_millis(
             args.heartbeat_interval_ms,
-        ),
-        election_timeout: tokio::time::Duration::from_millis(timeout_ms),
-        rpc_timeout: std::time::Duration::from_millis(args.rpc_timeout_ms),
-        heartbeat_failure_retry_limit: 5,
-        batch_window: tokio::time::Duration::from_millis(args.batch_window_ms),
-        max_batch_size: args.max_batch_size,
-        replication_max_inflight: args.replication_max_inflight,
-        replication_max_entries_per_rpc: args.replication_max_entries_per_rpc,
-        snapshot_threshold: args.snapshot_threshold,
-        read_index_timeout: std::time::Duration::from_millis(100),
-        storage_dir: args.storage_dir.clone(),
-    };
+        ))
+        .election_timeout(tokio::time::Duration::from_millis(timeout_ms))
+        .rpc_timeout(std::time::Duration::from_millis(args.rpc_timeout_ms))
+        .heartbeat_failure_retry_limit(5)
+        .batch_window(tokio::time::Duration::from_millis(args.batch_window_ms))
+        .max_batch_size(args.max_batch_size)
+        .replication_max_inflight(args.replication_max_inflight)
+        .replication_max_entries_per_rpc(args.replication_max_entries_per_rpc)
+        .snapshot_threshold(args.snapshot_threshold)
+        .read_index_timeout(std::time::Duration::from_millis(100))
+        .storage_dir(args.storage_dir.clone())
+        .build();
 
     use ikada::storage::FileStorage;
-    let storage = Box::new(FileStorage::new(args.storage_dir));
-    let mut node = Node::new(
-        port,
-        config,
-        KVStateMachine::default(),
-        network_factory,
-        storage,
-    );
+    let mut node = Node::builder(port)
+        .config(config)
+        .state_machine(KVStateMachine::default())
+        .network_factory(TarpcNetworkFactory::new())
+        .storage(Box::new(FileStorage::new(args.storage_dir)))
+        .build();
 
     node.restore().await?;
 
