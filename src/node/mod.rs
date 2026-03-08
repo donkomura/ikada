@@ -24,6 +24,26 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
+fn notify_heartbeat(
+    req_term: Term,
+    leader_id: NodeId,
+    current_term: Term,
+    heartbeat_tx: &mpsc::UnboundedSender<(Term, NodeId)>,
+) {
+    if req_term >= current_term {
+        let _ = heartbeat_tx.send((req_term, leader_id));
+    }
+}
+
+fn not_leader_response(leader_id: Option<NodeId>) -> CommandResponse {
+    CommandResponse {
+        success: false,
+        leader_hint: leader_id,
+        data: None,
+        error: Some(CommandError::NotLeader),
+    }
+}
+
 /// Command represents RPC requests with response channels.
 /// This enum exists to bridge the RPC server (which receives requests)
 /// and the consensus logic (which processes them asynchronously).
@@ -114,6 +134,59 @@ pub struct Node<
     pub request_tracker: Arc<Mutex<RequestTracker<SM::Response>>>,
 }
 
+pub struct NodeBuilder<
+    T: Send + Sync,
+    SM: StateMachine<Command = T>,
+    NF: NetworkFactory,
+> {
+    port: u16,
+    config: Option<Config>,
+    state_machine: Option<SM>,
+    network_factory: Option<NF>,
+    storage: Option<Box<dyn crate::storage::Storage<T>>>,
+}
+
+impl<T, SM, NF> NodeBuilder<T, SM, NF>
+where
+    T: Send
+        + Sync
+        + Clone
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + 'static,
+    SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
+    NF: NetworkFactory + Clone + 'static,
+{
+    pub fn config(mut self, val: Config) -> Self {
+        self.config = Some(val);
+        self
+    }
+
+    pub fn state_machine(mut self, val: SM) -> Self {
+        self.state_machine = Some(val);
+        self
+    }
+
+    pub fn network_factory(mut self, val: NF) -> Self {
+        self.network_factory = Some(val);
+        self
+    }
+
+    pub fn storage(mut self, val: Box<dyn crate::storage::Storage<T>>) -> Self {
+        self.storage = Some(val);
+        self
+    }
+
+    pub fn build(self) -> Node<T, SM, NF> {
+        let sm = self.state_machine.expect("state_machine is required");
+        let nf = self.network_factory.expect("network_factory is required");
+        let storage = self.storage.expect("storage is required");
+        let config = self.config.unwrap_or_default();
+        Node::new(self.port, config, sm, nf, storage)
+    }
+}
+
 impl<T, SM, NF> Node<T, SM, NF>
 where
     T: Send
@@ -126,6 +199,16 @@ where
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
     NF: NetworkFactory + Clone + 'static,
 {
+    pub fn builder(port: u16) -> NodeBuilder<T, SM, NF> {
+        NodeBuilder {
+            port,
+            config: None,
+            state_machine: None,
+            network_factory: None,
+            storage: None,
+        }
+    }
+
     /// Creates a new Raft node.
     /// Port is used as node ID for simplicity in testing/demo scenarios.
     pub fn new(
@@ -334,13 +417,7 @@ where
                             });
 
                         let _ = resp_tx.send(resp.clone());
-
-                        // Reset election timeout if we received AppendEntries from current or higher term leader
-                        // This prevents unnecessary elections even when log consistency checks fail
-                        if req.term >= current_term {
-                            let _ =
-                                heartbeat_tx.send((req.term, req.leader_id));
-                        }
+                        notify_heartbeat(req.term, req.leader_id, current_term, &heartbeat_tx);
                     }.instrument(span));
                 }
                 Command::RequestVote(req, resp_tx, span) => {
@@ -362,30 +439,17 @@ where
                     let client_request_tx_clone = client_request_tx.clone();
                     tokio::spawn(
                         async move {
-                            // Check if this node is the leader
-                            let is_leader = {
+                            let (is_leader, leader_id) = {
                                 let state = state_clone.lock().await;
-                                state.role().is_leader()
+                                (state.role().is_leader(), state.leader_id)
                             };
 
                             if is_leader {
-                                // Send to leader loop for processing
                                 let _ = client_request_tx_clone
                                     .send((req, resp_tx));
                             } else {
-                                // Not a leader, return error with leader hint
-                                let leader_hint = {
-                                    let state = state_clone.lock().await;
-                                    state.leader_id
-                                };
-                                let _ = resp_tx.send(CommandResponse {
-                                    success: false,
-                                    leader_hint,
-                                    data: None,
-                                    error: Some(
-                                        crate::rpc::CommandError::NotLeader,
-                                    ),
-                                });
+                                let _ = resp_tx
+                                    .send(not_leader_response(leader_id));
                             }
                         }
                         .instrument(span),
@@ -395,14 +459,12 @@ where
                     let state_clone = Arc::clone(&state);
                     tokio::spawn(
                         async move {
-                            // Check if this node is the leader
-                            let is_leader = {
+                            let (is_leader, leader_id) = {
                                 let state = state_clone.lock().await;
-                                state.role().is_leader()
+                                (state.role().is_leader(), state.leader_id)
                             };
 
                             if is_leader {
-                                // Use ReadIndex optimization for reads
                                 let peer_count = {
                                     let state = state_clone.lock().await;
                                     state
@@ -420,19 +482,8 @@ where
                                 .await;
                                 let _ = resp_tx.send(resp);
                             } else {
-                                // Not a leader, return error with leader hint
-                                let leader_hint = {
-                                    let state = state_clone.lock().await;
-                                    state.leader_id
-                                };
-                                let _ = resp_tx.send(CommandResponse {
-                                    success: false,
-                                    leader_hint,
-                                    data: None,
-                                    error: Some(
-                                        crate::rpc::CommandError::NotLeader,
-                                    ),
-                                });
+                                let _ = resp_tx
+                                    .send(not_leader_response(leader_id));
                             }
                         }
                         .instrument(span),
@@ -454,12 +505,7 @@ where
                             });
 
                         let _ = resp_tx.send(resp.clone());
-
-                        // Reset election timeout if we received InstallSnapshot from current or higher term leader
-                        if req.term >= current_term {
-                            let _ =
-                                heartbeat_tx.send((req.term, req.leader_id));
-                        }
+                        notify_heartbeat(req.term, req.leader_id, current_term, &heartbeat_tx);
                     }.instrument(span));
                 }
             }
@@ -502,5 +548,116 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::mock::MockNetworkFactory;
+    use crate::statemachine::NoOpStateMachine;
+    use crate::storage::MemStorage;
+
+    #[test]
+    fn test_notify_heartbeat_sends_when_term_gte() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let leader_id = NodeId::new(1);
+
+        notify_heartbeat(Term::new(5), leader_id, Term::new(5), &tx);
+        assert!(rx.try_recv().is_ok());
+
+        notify_heartbeat(Term::new(6), leader_id, Term::new(5), &tx);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_notify_heartbeat_skips_when_term_lt() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let leader_id = NodeId::new(1);
+
+        notify_heartbeat(Term::new(3), leader_id, Term::new(5), &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_not_leader_response() {
+        let leader_id = Some(NodeId::new(42));
+        let resp = not_leader_response(leader_id);
+
+        assert!(!resp.success);
+        assert_eq!(resp.leader_hint, Some(NodeId::new(42)));
+        assert!(resp.data.is_none());
+        assert_eq!(resp.error, Some(CommandError::NotLeader));
+    }
+
+    #[test]
+    fn test_not_leader_response_no_leader() {
+        let resp = not_leader_response(None);
+
+        assert!(!resp.success);
+        assert!(resp.leader_hint.is_none());
+        assert_eq!(resp.error, Some(CommandError::NotLeader));
+    }
+
+    #[tokio::test]
+    async fn test_node_builder_complete() {
+        let config = Config::builder()
+            .heartbeat_interval(tokio::time::Duration::from_millis(500))
+            .build();
+        let node = Node::builder(8080)
+            .config(config)
+            .state_machine(NoOpStateMachine::default())
+            .network_factory(MockNetworkFactory::new())
+            .storage(Box::new(MemStorage::<bytes::Bytes>::default()))
+            .build();
+
+        assert_eq!(
+            node.config.heartbeat_interval,
+            tokio::time::Duration::from_millis(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_node_builder_default_config() {
+        let node = Node::builder(8080)
+            .state_machine(NoOpStateMachine::default())
+            .network_factory(MockNetworkFactory::new())
+            .storage(Box::new(MemStorage::<bytes::Bytes>::default()))
+            .build();
+
+        assert_eq!(
+            node.config.heartbeat_interval,
+            tokio::time::Duration::from_millis(1000)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "state_machine is required")]
+    fn test_node_builder_missing_state_machine() {
+        let _node: Node<bytes::Bytes, NoOpStateMachine, MockNetworkFactory> =
+            Node::builder(8080)
+                .network_factory(MockNetworkFactory::new())
+                .storage(Box::new(MemStorage::<bytes::Bytes>::default()))
+                .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "network_factory is required")]
+    fn test_node_builder_missing_network_factory() {
+        let _node: Node<bytes::Bytes, NoOpStateMachine, MockNetworkFactory> =
+            Node::builder(8080)
+                .state_machine(NoOpStateMachine::default())
+                .storage(Box::new(MemStorage::<bytes::Bytes>::default()))
+                .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "storage is required")]
+    fn test_node_builder_missing_storage() {
+        let _node: Node<bytes::Bytes, NoOpStateMachine, MockNetworkFactory> =
+            Node::builder(8080)
+                .state_machine(NoOpStateMachine::default())
+                .network_factory(MockNetworkFactory::new())
+                .build();
     }
 }
