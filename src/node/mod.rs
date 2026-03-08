@@ -24,7 +24,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-fn notify_heartbeat(
+pub(crate) fn notify_heartbeat(
     req_term: Term,
     leader_id: NodeId,
     current_term: Term,
@@ -35,7 +35,9 @@ fn notify_heartbeat(
     }
 }
 
-fn not_leader_response(leader_id: Option<NodeId>) -> CommandResponse {
+pub(crate) fn not_leader_response(
+    leader_id: Option<NodeId>,
+) -> CommandResponse {
     CommandResponse {
         success: false,
         leader_hint: leader_id,
@@ -317,29 +319,39 @@ where
         }
     }
 
-    /// Starts the Raft node and runs until error or shutdown.
-    /// Spawns three tasks: main loop, RPC handler, and RPC server.
     #[tracing::instrument(skip(self, servers), fields(port = port))]
     pub async fn run(
-        self,
+        mut self,
         port: u16,
         servers: Vec<SocketAddr>,
     ) -> anyhow::Result<()>
     where
         T: Default,
+        SM::Response: Clone + serde::Serialize,
     {
         use tracing::Instrument;
 
-        let (tx, rx) = mpsc::channel::<Command>(32);
+        self.setup(servers).await?;
+
+        let state = Arc::clone(&self.state);
+        let request_tracker = Arc::clone(&self.request_tracker);
+        let heartbeat_tx = self.c.heartbeat_tx.clone();
+        let client_request_tx = self.c.client_request_tx.clone();
+        let config = self.config.clone();
+
         let mut workers = JoinSet::new();
         workers.spawn(
-            self.run_with_handler(servers, rx)
-                .instrument(tracing::Span::current()),
+            crate::server::rpc_server(
+                state,
+                request_tracker,
+                heartbeat_tx,
+                client_request_tx,
+                config,
+                port,
+            )
+            .instrument(tracing::Span::current()),
         );
-        workers.spawn(
-            crate::server::rpc_server(tx, port)
-                .instrument(tracing::Span::current()),
-        );
+        workers.spawn(self.main(vec![]).instrument(tracing::Span::current()));
 
         if let Some(res) = workers.join_next().await {
             res??;

@@ -1,30 +1,46 @@
-//! RPC server setup and RaftRpc trait implementation.
-//!
-//! This module provides:
-//! - RPC server based on tarpc with TCP transport
-//! - RaftServer that converts RPC requests into Command enum and sends via channel
-
-use crate::node::Command;
+use crate::config::Config;
+use crate::node::handlers;
+use crate::node::{not_leader_response, notify_heartbeat};
+use crate::raft::RaftState;
+use crate::request_tracker::RequestTracker;
 use crate::rpc::*;
-use crate::types::Term;
+use crate::statemachine::StateMachine;
+use crate::types::{NodeId, Term};
 use anyhow::Context;
 use futures::{future, prelude::*};
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use tarpc::{
     server::{self, Channel, incoming::Incoming},
-    tokio_serde::formats::Json,
+    tokio_serde::formats::Bincode,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
-/// Starts the RPC server on the specified port.
-/// Listens for incoming tarpc connections and dispatches to RaftServer handlers.
-pub async fn rpc_server(
-    tx: mpsc::Sender<Command>,
+pub async fn rpc_server<T, SM>(
+    state: Arc<Mutex<RaftState<T, SM>>>,
+    request_tracker: Arc<Mutex<RequestTracker<SM::Response>>>,
+    heartbeat_tx: mpsc::UnboundedSender<(Term, NodeId)>,
+    client_request_tx: mpsc::UnboundedSender<(
+        CommandRequest,
+        oneshot::Sender<CommandResponse>,
+    )>,
+    config: Config,
     port: u16,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    T: Send
+        + Sync
+        + Clone
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + 'static,
+    SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
+    SM::Response: Clone + serde::Serialize,
+{
     let addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let mut listener =
-        tarpc::serde_transport::tcp::listen(&addr, Json::default)
+        tarpc::serde_transport::tcp::listen(&addr, Bincode::default)
             .await
             .context("failed to start RPC server")?;
     listener.config_mut().max_frame_length(usize::MAX);
@@ -37,42 +53,91 @@ pub async fn rpc_server(
                 .map(|a| a.ip())
                 .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
         })
-        .for_each_concurrent(10, |channel| async {
-            let server = RaftServer { tx: tx.clone() };
-            channel
-                .execute(server.serve())
-                .for_each(|response| async move {
-                    tokio::spawn(response);
-                })
-                .await
+        .for_each_concurrent(10, |channel| {
+            let server = RaftServer {
+                state: Arc::clone(&state),
+                request_tracker: Arc::clone(&request_tracker),
+                heartbeat_tx: heartbeat_tx.clone(),
+                client_request_tx: client_request_tx.clone(),
+                config: config.clone(),
+            };
+            async {
+                channel
+                    .execute(server.serve())
+                    .for_each(|response| async move {
+                        tokio::spawn(response);
+                    })
+                    .await
+            }
         })
         .await;
     Ok(())
 }
 
-/// RPC server implementation that forwards requests to the node via channels.
-#[derive(Clone)]
-struct RaftServer {
-    tx: mpsc::Sender<Command>,
+struct RaftServer<T: Send + Sync, SM: StateMachine<Command = T>> {
+    state: Arc<Mutex<RaftState<T, SM>>>,
+    request_tracker: Arc<Mutex<RequestTracker<SM::Response>>>,
+    heartbeat_tx: mpsc::UnboundedSender<(Term, NodeId)>,
+    client_request_tx: mpsc::UnboundedSender<(
+        CommandRequest,
+        oneshot::Sender<CommandResponse>,
+    )>,
+    config: Config,
 }
 
-impl RaftRpc for RaftServer {
+impl<T: Send + Sync, SM: StateMachine<Command = T>> Clone
+    for RaftServer<T, SM>
+{
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            request_tracker: Arc::clone(&self.request_tracker),
+            heartbeat_tx: self.heartbeat_tx.clone(),
+            client_request_tx: self.client_request_tx.clone(),
+            config: self.config.clone(),
+        }
+    }
+}
+
+impl<T, SM> RaftRpc for RaftServer<T, SM>
+where
+    T: Send
+        + Sync
+        + Clone
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + 'static,
+    SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
+    SM::Response: Clone + serde::Serialize,
+{
     #[tracing::instrument(skip(self, _ctx), fields(term = %req.term, leader_id = %req.leader_id, entries_count = req.entries.len()))]
     async fn append_entries(
         self,
         _ctx: tarpc::context::Context,
         req: AppendEntriesRequest,
     ) -> AppendEntriesResponse {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let span = tracing::Span::current();
-        let _ = self
-            .tx
-            .send(Command::AppendEntries(req, resp_tx, span))
-            .await;
-        resp_rx.await.unwrap_or(AppendEntriesResponse {
-            term: Term::new(0),
-            success: false,
-        })
+        let current_term = self.state.lock().await.persistent.current_term;
+        let resp = handlers::handle_append_entries(
+            &req,
+            Arc::clone(&self.state),
+            Some(Arc::clone(&self.request_tracker)),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error=?e, "Failed to handle AppendEntries");
+            AppendEntriesResponse {
+                term: Term::new(0),
+                success: false,
+            }
+        });
+        notify_heartbeat(
+            req.term,
+            req.leader_id,
+            current_term,
+            &self.heartbeat_tx,
+        );
+        resp
     }
 
     #[tracing::instrument(skip(self, _ctx), fields(term = %req.term, candidate_id = %req.candidate_id))]
@@ -81,13 +146,7 @@ impl RaftRpc for RaftServer {
         _ctx: tarpc::context::Context,
         req: RequestVoteRequest,
     ) -> RequestVoteResponse {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let span = tracing::Span::current();
-        let _ = self.tx.send(Command::RequestVote(req, resp_tx, span)).await;
-        resp_rx.await.unwrap_or(RequestVoteResponse {
-            term: Term::new(0),
-            vote_granted: false,
-        })
+        handlers::handle_request_vote(&req, Arc::clone(&self.state)).await
     }
 
     #[tracing::instrument(skip(self, _ctx, req))]
@@ -96,12 +155,17 @@ impl RaftRpc for RaftServer {
         _ctx: tarpc::context::Context,
         req: CommandRequest,
     ) -> CommandResponse {
+        let (is_leader, leader_id) = {
+            let state = self.state.lock().await;
+            (state.role().is_leader(), state.leader_id)
+        };
+
+        if !is_leader {
+            return not_leader_response(leader_id);
+        }
+
         let (resp_tx, resp_rx) = oneshot::channel();
-        let span = tracing::Span::current();
-        let _ = self
-            .tx
-            .send(Command::ClientRequest(req, resp_tx, span))
-            .await;
+        let _ = self.client_request_tx.send((req, resp_tx));
         resp_rx.await.unwrap_or(CommandResponse {
             success: false,
             leader_hint: None,
@@ -118,14 +182,22 @@ impl RaftRpc for RaftServer {
         _ctx: tarpc::context::Context,
         req: InstallSnapshotRequest,
     ) -> InstallSnapshotResponse {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let span = tracing::Span::current();
-        let _ = self
-            .tx
-            .send(Command::InstallSnapshot(req, resp_tx, span))
-            .await;
-        resp_rx
-            .await
-            .unwrap_or(InstallSnapshotResponse { term: Term::new(0) })
+        let current_term = self.state.lock().await.persistent.current_term;
+        let resp = handlers::handle_install_snapshot(
+            &req,
+            Arc::clone(&self.state),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error=?e, "Failed to handle InstallSnapshot");
+            InstallSnapshotResponse { term: Term::new(0) }
+        });
+        notify_heartbeat(
+            req.term,
+            req.leader_id,
+            current_term,
+            &self.heartbeat_tx,
+        );
+        resp
     }
 }
