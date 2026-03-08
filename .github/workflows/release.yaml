@@ -49,6 +49,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - uses: arduino/setup-protoc@v3
+
       - name: Upload Rust binary
         uses: taiki-e/upload-rust-binary-action@v1
         with:

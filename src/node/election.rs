@@ -228,8 +228,8 @@ where
         req: RequestVoteRequest,
         rpc_timeout: Duration,
     ) -> anyhow::Result<RequestVoteResponse> {
-        let mut ctx = tarpc::context::Context::current();
-        ctx.deadline = Instant::now() + rpc_timeout;
+        let ctx = crate::rpc::RpcContext::background()
+            .with_deadline(Instant::now() + rpc_timeout);
 
         client.request_vote(ctx, req.clone()).await.map_err(|e| {
             tracing::warn!(

@@ -7,14 +7,10 @@ use crate::rpc::*;
 use crate::statemachine::StateMachine;
 use crate::types::{NodeId, Term};
 use anyhow::Context;
-use futures::{future, prelude::*};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tarpc::{
-    server::{self, Channel, incoming::Incoming},
-    tokio_serde::formats::Bincode,
-};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tonic::{Request, Response, Status, transport::Server};
 
 pub async fn rpc_server<T, SM>(
     state: Arc<Mutex<RaftState<T, SM>>>,
@@ -38,39 +34,24 @@ where
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
     SM::Response: Clone + serde::Serialize,
 {
-    let addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let mut listener =
-        tarpc::serde_transport::tcp::listen(&addr, Bincode::default)
-            .await
-            .context("failed to start RPC server")?;
-    listener.config_mut().max_frame_length(usize::MAX);
-    listener
-        .filter_map(|r| future::ready(r.ok()))
-        .map(server::BaseChannel::with_defaults)
-        .max_channels_per_key(10, |t| {
-            t.transport()
-                .peer_addr()
-                .map(|a| a.ip())
-                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-        })
-        .for_each_concurrent(10, |channel| {
-            let server = RaftServer {
-                state: Arc::clone(&state),
-                request_tracker: Arc::clone(&request_tracker),
-                heartbeat_tx: heartbeat_tx.clone(),
-                client_request_tx: client_request_tx.clone(),
-                config: config.clone(),
-            };
-            async {
-                channel
-                    .execute(server.serve())
-                    .for_each(|response| async move {
-                        tokio::spawn(response);
-                    })
-                    .await
-            }
-        })
-        .await;
+    let addr: SocketAddr = format!("0.0.0.0:{}", port)
+        .parse()
+        .context("failed to parse server address")?;
+
+    let server = RaftServer {
+        state,
+        request_tracker,
+        heartbeat_tx,
+        client_request_tx,
+        config,
+    };
+
+    Server::builder()
+        .add_service(proto::raft_rpc_server::RaftRpcServer::new(server))
+        .serve(addr)
+        .await
+        .context("failed to serve gRPC server")?;
+
     Ok(())
 }
 
@@ -99,7 +80,8 @@ impl<T: Send + Sync, SM: StateMachine<Command = T>> Clone
     }
 }
 
-impl<T, SM> RaftRpc for RaftServer<T, SM>
+#[tonic::async_trait]
+impl<T, SM> proto::raft_rpc_server::RaftRpc for RaftServer<T, SM>
 where
     T: Send
         + Sync
@@ -111,12 +93,14 @@ where
     SM: StateMachine<Command = T> + std::fmt::Debug + 'static,
     SM::Response: Clone + serde::Serialize,
 {
-    #[tracing::instrument(skip(self, _ctx), fields(term = %req.term, leader_id = %req.leader_id, entries_count = req.entries.len()))]
+    #[tracing::instrument(skip(self, request), fields(term = %Term::new(request.get_ref().term), leader_id = %NodeId::new(request.get_ref().leader_id), entries_count = request.get_ref().entries.len()))]
     async fn append_entries(
-        self,
-        _ctx: tarpc::context::Context,
-        req: AppendEntriesRequest,
-    ) -> AppendEntriesResponse {
+        &self,
+        request: Request<proto::AppendEntriesRequest>,
+    ) -> Result<Response<proto::AppendEntriesResponse>, Status> {
+        let proto_req = request.into_inner();
+        let req: AppendEntriesRequest = proto_req.into();
+
         let current_term = self.state.lock().await.persistent.current_term;
         let resp = handlers::handle_append_entries(
             &req,
@@ -137,51 +121,68 @@ where
             current_term,
             &self.heartbeat_tx,
         );
-        resp
+
+        let proto_resp: proto::AppendEntriesResponse = (&resp).into();
+        Ok(Response::new(proto_resp))
     }
 
-    #[tracing::instrument(skip(self, _ctx), fields(term = %req.term, candidate_id = %req.candidate_id))]
+    #[tracing::instrument(skip(self, request), fields(term = %Term::new(request.get_ref().term), candidate_id = %NodeId::new(request.get_ref().candidate_id)))]
     async fn request_vote(
-        self,
-        _ctx: tarpc::context::Context,
-        req: RequestVoteRequest,
-    ) -> RequestVoteResponse {
-        handlers::handle_request_vote(&req, Arc::clone(&self.state)).await
+        &self,
+        request: Request<proto::RequestVoteRequest>,
+    ) -> Result<Response<proto::RequestVoteResponse>, Status> {
+        let proto_req = request.into_inner();
+        let req: RequestVoteRequest = proto_req.into();
+
+        let resp =
+            handlers::handle_request_vote(&req, Arc::clone(&self.state)).await;
+
+        let proto_resp: proto::RequestVoteResponse = (&resp).into();
+        Ok(Response::new(proto_resp))
     }
 
-    #[tracing::instrument(skip(self, _ctx, req))]
+    #[tracing::instrument(skip(self, request))]
     async fn client_request(
-        self,
-        _ctx: tarpc::context::Context,
-        req: CommandRequest,
-    ) -> CommandResponse {
+        &self,
+        request: Request<proto::CommandRequest>,
+    ) -> Result<Response<proto::CommandResponse>, Status> {
+        let proto_req = request.into_inner();
+        let req: CommandRequest = proto_req.into();
+
         let (is_leader, leader_id) = {
             let state = self.state.lock().await;
             (state.role().is_leader(), state.leader_id)
         };
 
         if !is_leader {
-            return not_leader_response(leader_id);
+            let resp = not_leader_response(leader_id);
+            let proto_resp: proto::CommandResponse = (&resp).into();
+            return Ok(Response::new(proto_resp));
         }
 
         let (resp_tx, resp_rx) = oneshot::channel();
         let _ = self.client_request_tx.send((req, resp_tx));
-        resp_rx.await.unwrap_or(CommandResponse {
+        let resp = resp_rx.await.unwrap_or(CommandResponse {
             success: false,
             leader_hint: None,
             data: None,
             error: Some(crate::rpc::CommandError::Other(
                 "Failed to process client request".to_string(),
             )),
-        })
+        });
+
+        let proto_resp: proto::CommandResponse = (&resp).into();
+        Ok(Response::new(proto_resp))
     }
 
-    #[tracing::instrument(skip(self, _ctx), fields(term = %req.term, leader_id = %req.leader_id, last_included_index = %req.last_included_index))]
+    #[tracing::instrument(skip(self, request), fields(term = %Term::new(request.get_ref().term), leader_id = %NodeId::new(request.get_ref().leader_id), last_included_index = %crate::types::LogIndex::new(request.get_ref().last_included_index)))]
     async fn install_snapshot(
-        self,
-        _ctx: tarpc::context::Context,
-        req: InstallSnapshotRequest,
-    ) -> InstallSnapshotResponse {
+        &self,
+        request: Request<proto::InstallSnapshotRequest>,
+    ) -> Result<Response<proto::InstallSnapshotResponse>, Status> {
+        let proto_req = request.into_inner();
+        let req: InstallSnapshotRequest = proto_req.into();
+
         let current_term = self.state.lock().await.persistent.current_term;
         let resp = handlers::handle_install_snapshot(
             &req,
@@ -198,6 +199,8 @@ where
             current_term,
             &self.heartbeat_tx,
         );
-        resp
+
+        let proto_resp: proto::InstallSnapshotResponse = (&resp).into();
+        Ok(Response::new(proto_resp))
     }
 }

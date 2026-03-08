@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use tracing::Instrument;
 
 use ikada::config::Config;
-use ikada::network::TarpcNetworkFactory;
+use ikada::network::TonicNetworkFactory;
 use ikada::node::Node;
 use ikada::statemachine::KVStateMachine;
 use ikada::trace::init_tracing;
@@ -93,7 +93,7 @@ async fn run() -> anyhow::Result<()> {
     let mut node = Node::builder(port)
         .config(config)
         .state_machine(KVStateMachine::default())
-        .network_factory(TarpcNetworkFactory::new())
+        .network_factory(TonicNetworkFactory::new())
         .storage(Box::new(FileStorage::new(args.storage_dir)))
         .build();
 
