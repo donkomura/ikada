@@ -1,9 +1,8 @@
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tarpc::{client, tokio_serde::formats::Bincode};
 
-use crate::rpc::{RaftRpcClient, RaftRpcTrait};
+use crate::rpc::{RaftRpcTrait, RpcContext, proto};
 
 #[async_trait]
 pub trait NetworkFactory: Send + Sync {
@@ -38,40 +37,112 @@ impl From<anyhow::Error> for NetworkError {
 }
 
 #[derive(Clone)]
-pub struct TarpcNetworkFactory;
+pub struct TonicNetworkFactory;
 
-impl TarpcNetworkFactory {
+impl TonicNetworkFactory {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl Default for TarpcNetworkFactory {
+impl Default for TonicNetworkFactory {
     fn default() -> Self {
         Self::new()
     }
 }
 
+struct TonicRpcClient {
+    inner: proto::raft_rpc_client::RaftRpcClient<tonic::transport::Channel>,
+}
+
 #[async_trait]
-impl NetworkFactory for TarpcNetworkFactory {
+impl RaftRpcTrait for TonicRpcClient {
+    async fn append_entries(
+        &self,
+        ctx: RpcContext,
+        req: crate::rpc::AppendEntriesRequest,
+    ) -> anyhow::Result<crate::rpc::AppendEntriesResponse> {
+        let mut client = self.inner.clone();
+        let proto_req: proto::AppendEntriesRequest = (&req).into();
+        let mut request = tonic::Request::new(proto_req);
+        if let Some(timeout) = ctx.timeout() {
+            request.set_timeout(timeout);
+        }
+        let response = client.append_entries(request).await?;
+        Ok(response.into_inner().into())
+    }
+
+    async fn request_vote(
+        &self,
+        ctx: RpcContext,
+        req: crate::rpc::RequestVoteRequest,
+    ) -> anyhow::Result<crate::rpc::RequestVoteResponse> {
+        let mut client = self.inner.clone();
+        let proto_req: proto::RequestVoteRequest = (&req).into();
+        let mut request = tonic::Request::new(proto_req);
+        if let Some(timeout) = ctx.timeout() {
+            request.set_timeout(timeout);
+        }
+        let response = client.request_vote(request).await?;
+        Ok(response.into_inner().into())
+    }
+
+    async fn client_request(
+        &self,
+        ctx: RpcContext,
+        req: crate::rpc::CommandRequest,
+    ) -> anyhow::Result<crate::rpc::CommandResponse> {
+        let mut client = self.inner.clone();
+        let proto_req: proto::CommandRequest = (&req).into();
+        let mut request = tonic::Request::new(proto_req);
+        if let Some(timeout) = ctx.timeout() {
+            request.set_timeout(timeout);
+        }
+        let response = client.client_request(request).await?;
+        Ok(response.into_inner().into())
+    }
+
+    async fn install_snapshot(
+        &self,
+        ctx: RpcContext,
+        req: crate::rpc::InstallSnapshotRequest,
+    ) -> anyhow::Result<crate::rpc::InstallSnapshotResponse> {
+        let mut client = self.inner.clone();
+        let proto_req: proto::InstallSnapshotRequest = (&req).into();
+        let mut request = tonic::Request::new(proto_req);
+        if let Some(timeout) = ctx.timeout() {
+            request.set_timeout(timeout);
+        }
+        let response = client.install_snapshot(request).await?;
+        Ok(response.into_inner().into())
+    }
+}
+
+#[async_trait]
+impl NetworkFactory for TonicNetworkFactory {
     async fn connect(
         &self,
         addr: SocketAddr,
     ) -> Result<Arc<dyn RaftRpcTrait>, NetworkError> {
-        let transport =
-            tarpc::serde_transport::tcp::connect(addr, Bincode::default)
-                .await
+        let endpoint =
+            tonic::transport::Endpoint::from_shared(format!("http://{}", addr))
                 .map_err(|e| {
                     NetworkError::ConnectionFailed(format!(
-                        "Failed to connect to {}: {}",
+                        "Invalid endpoint {}: {}",
                         addr, e
                     ))
                 })?;
 
-        let client =
-            RaftRpcClient::new(client::Config::default(), transport).spawn();
+        let channel = endpoint.connect().await.map_err(|e| {
+            NetworkError::ConnectionFailed(format!(
+                "Failed to connect to {}: {}",
+                addr, e
+            ))
+        })?;
 
-        Ok(Arc::new(client))
+        let client = proto::raft_rpc_client::RaftRpcClient::new(channel);
+
+        Ok(Arc::new(TonicRpcClient { inner: client }))
     }
 }
 
@@ -94,7 +165,7 @@ pub mod mock {
     impl RaftRpcTrait for PartitionableRpcClient {
         async fn append_entries(
             &self,
-            ctx: tarpc::context::Context,
+            ctx: RpcContext,
             req: AppendEntriesRequest,
         ) -> anyhow::Result<AppendEntriesResponse> {
             let partitions = self.partitions.lock().await;
@@ -111,7 +182,7 @@ pub mod mock {
 
         async fn request_vote(
             &self,
-            ctx: tarpc::context::Context,
+            ctx: RpcContext,
             req: RequestVoteRequest,
         ) -> anyhow::Result<RequestVoteResponse> {
             let partitions = self.partitions.lock().await;
@@ -128,7 +199,7 @@ pub mod mock {
 
         async fn client_request(
             &self,
-            ctx: tarpc::context::Context,
+            ctx: RpcContext,
             req: CommandRequest,
         ) -> anyhow::Result<CommandResponse> {
             let partitions = self.partitions.lock().await;
@@ -145,7 +216,7 @@ pub mod mock {
 
         async fn install_snapshot(
             &self,
-            ctx: tarpc::context::Context,
+            ctx: RpcContext,
             req: InstallSnapshotRequest,
         ) -> anyhow::Result<InstallSnapshotResponse> {
             let partitions = self.partitions.lock().await;
@@ -244,27 +315,27 @@ pub mod mock {
                 if let Some(client) = clients.get(&addr) {
                     Arc::clone(client)
                 } else {
-                    use tarpc::client;
-                    use tarpc::tokio_serde::formats::Bincode;
-                    let transport = tarpc::serde_transport::tcp::connect(
-                        addr,
-                        Bincode::default,
+                    let endpoint = tonic::transport::Endpoint::from_shared(
+                        format!("http://{}", addr),
                     )
-                    .await
                     .map_err(|e| {
+                        NetworkError::ConnectionFailed(format!(
+                            "Invalid endpoint {}: {}",
+                            addr, e
+                        ))
+                    })?;
+
+                    let channel = endpoint.connect().await.map_err(|e| {
                         NetworkError::ConnectionFailed(format!(
                             "Failed to connect to {}: {}",
                             addr, e
                         ))
                     })?;
 
-                    let client = RaftRpcClient::new(
-                        client::Config::default(),
-                        transport,
-                    )
-                    .spawn();
+                    let client =
+                        proto::raft_rpc_client::RaftRpcClient::new(channel);
 
-                    Arc::new(client)
+                    Arc::new(TonicRpcClient { inner: client })
                 }
             };
 

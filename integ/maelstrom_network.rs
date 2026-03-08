@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tarpc::context;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::maelstrom::*;
@@ -162,7 +161,7 @@ impl MaelstromRpcClient {
 impl RaftRpcTrait for MaelstromRpcClient {
     async fn append_entries(
         &self,
-        ctx: context::Context,
+        ctx: RpcContext,
         req: AppendEntriesRequest,
     ) -> anyhow::Result<AppendEntriesResponse> {
         let dest = match self.node_id_to_string(self.node_id).await {
@@ -203,9 +202,8 @@ impl RaftRpcTrait for MaelstromRpcClient {
             }),
         };
 
-        let timeout = ctx
-            .deadline
-            .saturating_duration_since(std::time::Instant::now());
+        let timeout =
+            ctx.timeout().unwrap_or(std::time::Duration::from_secs(5));
 
         match self.send_and_wait(msg, msg_id, timeout).await {
             Ok(response) => match response.body {
@@ -226,7 +224,7 @@ impl RaftRpcTrait for MaelstromRpcClient {
 
     async fn request_vote(
         &self,
-        ctx: context::Context,
+        ctx: RpcContext,
         req: RequestVoteRequest,
     ) -> anyhow::Result<RequestVoteResponse> {
         let dest = match self.node_id_to_string(self.node_id).await {
@@ -253,9 +251,8 @@ impl RaftRpcTrait for MaelstromRpcClient {
             }),
         };
 
-        let timeout = ctx
-            .deadline
-            .saturating_duration_since(std::time::Instant::now());
+        let timeout =
+            ctx.timeout().unwrap_or(std::time::Duration::from_secs(5));
 
         match self.send_and_wait(msg, msg_id, timeout).await {
             Ok(response) => match response.body {
@@ -276,7 +273,7 @@ impl RaftRpcTrait for MaelstromRpcClient {
 
     async fn client_request(
         &self,
-        _ctx: context::Context,
+        _ctx: RpcContext,
         _req: CommandRequest,
     ) -> anyhow::Result<CommandResponse> {
         Ok(CommandResponse {
@@ -291,7 +288,7 @@ impl RaftRpcTrait for MaelstromRpcClient {
 
     async fn install_snapshot(
         &self,
-        _ctx: context::Context,
+        _ctx: RpcContext,
         _req: InstallSnapshotRequest,
     ) -> anyhow::Result<InstallSnapshotResponse> {
         Ok(InstallSnapshotResponse { term: Term::new(0) })

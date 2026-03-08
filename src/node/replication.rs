@@ -359,7 +359,6 @@ where
         Ok(has_majority)
     }
 
-    /// Sends AppendEntries RPC to a single follower.
     async fn send_heartbeat(
         server: SocketAddr,
         client: Arc<dyn RaftRpcTrait>,
@@ -367,10 +366,8 @@ where
         sent_up_to_index: LogIndex,
         rpc_timeout: Duration,
     ) -> anyhow::Result<(SocketAddr, ReplicationResponse)> {
-        use crate::trace::TraceContextInjector;
-
-        let mut ctx = tarpc::context::Context::current().with_current_trace();
-        ctx.deadline = Instant::now() + rpc_timeout;
+        let ctx = crate::rpc::RpcContext::current()
+            .with_deadline(Instant::now() + rpc_timeout);
         let res = client.append_entries(ctx, req.clone()).await?;
         Ok((
             server,
@@ -378,15 +375,14 @@ where
         ))
     }
 
-    /// Sends InstallSnapshot RPC to a single follower.
     async fn send_install_snapshot(
         server: SocketAddr,
         client: Arc<dyn RaftRpcTrait>,
         req: crate::rpc::InstallSnapshotRequest,
         rpc_timeout: Duration,
     ) -> anyhow::Result<(SocketAddr, ReplicationResponse)> {
-        let mut ctx = tarpc::context::current();
-        ctx.deadline = Instant::now() + rpc_timeout;
+        let ctx = crate::rpc::RpcContext::current()
+            .with_deadline(Instant::now() + rpc_timeout);
         let last_included_index = req.last_included_index;
         let res = client.install_snapshot(ctx, req).await?;
         Ok((
@@ -750,7 +746,7 @@ mod tests {
         impl RaftRpcTrait for MockRpcClient {
             async fn append_entries(
                 &self,
-                _ctx: tarpc::context::Context,
+                _ctx: RpcContext,
                 _req: AppendEntriesRequest,
             ) -> anyhow::Result<AppendEntriesResponse> {
                 Ok(AppendEntriesResponse {
@@ -761,7 +757,7 @@ mod tests {
 
             async fn request_vote(
                 &self,
-                _ctx: tarpc::context::Context,
+                _ctx: RpcContext,
                 _req: RequestVoteRequest,
             ) -> anyhow::Result<RequestVoteResponse> {
                 Ok(RequestVoteResponse {
@@ -772,7 +768,7 @@ mod tests {
 
             async fn client_request(
                 &self,
-                _ctx: tarpc::context::Context,
+                _ctx: RpcContext,
                 _req: CommandRequest,
             ) -> anyhow::Result<CommandResponse> {
                 Ok(CommandResponse {
@@ -785,7 +781,7 @@ mod tests {
 
             async fn install_snapshot(
                 &self,
-                _ctx: tarpc::context::Context,
+                _ctx: RpcContext,
                 _req: InstallSnapshotRequest,
             ) -> anyhow::Result<InstallSnapshotResponse> {
                 Ok(InstallSnapshotResponse { term: Term::new(1) })
@@ -814,7 +810,7 @@ mod tests {
         };
 
         let result = client
-            .append_entries(tarpc::context::current(), req.clone())
+            .append_entries(RpcContext::current(), req.clone())
             .await;
         assert!(
             result.is_ok(),
@@ -828,7 +824,7 @@ mod tests {
         .await;
 
         let result = client
-            .append_entries(tarpc::context::current(), req.clone())
+            .append_entries(RpcContext::current(), req.clone())
             .await;
         assert!(
             result.is_err(),
@@ -847,8 +843,7 @@ mod tests {
         )
         .await;
 
-        let result =
-            client.append_entries(tarpc::context::current(), req).await;
+        let result = client.append_entries(RpcContext::current(), req).await;
         assert!(
             result.is_ok(),
             "Expected success after healing, got error: {:?}",

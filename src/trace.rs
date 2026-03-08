@@ -1,51 +1,7 @@
-use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::Sampler};
 use tracing_subscriber::{fmt::format::FmtSpan, prelude::*};
-
-/// Trait for RPC context types that can be enriched with distributed tracing information.
-///
-/// This trait provides a type-safe way to propagate OpenTelemetry trace context
-/// to various RPC frameworks without coupling the tracing logic to a specific framework.
-pub trait TraceContextInjector: Sized {
-    /// Injects the current OpenTelemetry span context into this RPC context.
-    fn with_current_trace(self) -> Self;
-}
-
-/// Implementation for tarpc's Context type.
-impl TraceContextInjector for tarpc::context::Context {
-    fn with_current_trace(mut self) -> Self {
-        // Get the current OpenTelemetry span context
-        let otel_ctx = tracing_opentelemetry::OpenTelemetrySpanExt::context(
-            &tracing::Span::current(),
-        );
-        let span_ref = otel_ctx.span();
-        let span_ctx = span_ref.span_context();
-
-        // Only propagate if the span context is valid (not a no-op span)
-        if span_ctx.is_valid() {
-            let trace_id = span_ctx.trace_id();
-            let span_id = span_ctx.span_id();
-            let is_sampled = span_ctx.trace_flags().is_sampled();
-
-            self.trace_context = tarpc::trace::Context {
-                trace_id: tarpc::trace::TraceId::from(u128::from_be_bytes(
-                    trace_id.to_bytes(),
-                )),
-                span_id: tarpc::trace::SpanId::from(u64::from_be_bytes(
-                    span_id.to_bytes(),
-                )),
-                sampling_decision: if is_sampled {
-                    tarpc::trace::SamplingDecision::Sampled
-                } else {
-                    tarpc::trace::SamplingDecision::Unsampled
-                },
-            };
-        }
-
-        self
-    }
-}
 
 pub fn init_tracing(
     service_name: &'static str,
@@ -63,8 +19,6 @@ pub fn init_tracing(
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(1.0);
 
-    // ParentBased sampler: follows parent span's sampling decision if present,
-    // otherwise uses TraceIdRatioBased sampling
     let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
         sampling_ratio,
     )));
@@ -126,8 +80,6 @@ pub fn init_tracing_stderr(
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.1);
 
-    // ParentBased sampler: follows parent span's sampling decision if present,
-    // otherwise uses TraceIdRatioBased sampling
     let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
         sampling_ratio,
     )));

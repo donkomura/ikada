@@ -1,5 +1,5 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use tarpc::serde::{Deserialize, Serialize};
 
 #[derive(
     Debug,
@@ -14,7 +14,6 @@ use tarpc::serde::{Deserialize, Serialize};
     Serialize,
     Deserialize,
 )]
-#[serde(crate = "tarpc::serde")]
 pub struct Term(u32);
 
 impl Term {
@@ -56,7 +55,6 @@ impl From<u32> for Term {
     Serialize,
     Deserialize,
 )]
-#[serde(crate = "tarpc::serde")]
 pub struct NodeId(u32);
 
 impl NodeId {
@@ -100,7 +98,6 @@ impl From<u16> for NodeId {
     Serialize,
     Deserialize,
 )]
-#[serde(crate = "tarpc::serde")]
 pub struct LogIndex(u32);
 
 impl LogIndex {

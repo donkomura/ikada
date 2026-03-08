@@ -1,10 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tarpc::context;
 
-use crate::network::{NetworkFactory, TarpcNetworkFactory};
-use crate::rpc::{CommandRequest, RaftRpcTrait};
+use crate::network::{NetworkFactory, TonicNetworkFactory};
+use crate::rpc::{CommandRequest, RaftRpcTrait, RpcContext};
 use crate::statemachine::{KVCommand, KVResponse};
 
 pub struct RaftClient<NF: NetworkFactory> {
@@ -39,8 +38,7 @@ impl<NF: NetworkFactory> RaftClient<NF> {
     ) -> anyhow::Result<Vec<u8>> {
         const TIMEOUT: Duration = Duration::from_secs(10);
 
-        let mut ctx = context::current();
-        ctx.deadline = std::time::Instant::now() + TIMEOUT;
+        let ctx = RpcContext::current().with_timeout(TIMEOUT);
 
         let request = CommandRequest {
             command: command.clone(),
@@ -74,8 +72,8 @@ impl<NF: NetworkFactory> RaftClient<NF> {
 
 pub struct KVStore {
     cluster_addrs: Vec<SocketAddr>,
-    current_client: Option<RaftClient<TarpcNetworkFactory>>,
-    network_factory: TarpcNetworkFactory,
+    current_client: Option<RaftClient<TonicNetworkFactory>>,
+    network_factory: TonicNetworkFactory,
     current_addr_index: usize,
 }
 
@@ -83,7 +81,7 @@ impl KVStore {
     pub async fn connect(
         cluster_addrs: Vec<SocketAddr>,
     ) -> anyhow::Result<Self> {
-        let network_factory = TarpcNetworkFactory::new();
+        let network_factory = TonicNetworkFactory::new();
         let mut store = Self {
             cluster_addrs,
             current_client: None,
